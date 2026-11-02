@@ -24,7 +24,7 @@
 
 ```bash
 cd AstrBot/data/plugins/
-git clone https://github.com/Natsu/astrbot_plugin_hermes_core.git
+git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 ```
 
 然后在 WebUI → 插件管理 → 重载，并确保已配置至少一个 LLM Provider（总结功能复用它）。
