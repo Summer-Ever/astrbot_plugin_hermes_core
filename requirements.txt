@@ -1,0 +1,1 @@
+# 无第三方依赖：仅使用 AstrBot 运行环境自带的 sqlite3 / asyncio

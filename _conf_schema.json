@@ -1,0 +1,48 @@
+{
+  "memory_injection": {
+    "type": "bool",
+    "default": true,
+    "description": "每次 LLM 请求前自动检索并注入相关记忆与历史片段",
+    "hint": "关闭后仅可手动 /hermes 总结，模型仍可用记忆工具"
+  },
+  "inject_memories_topk": {
+    "type": "int",
+    "default": 5,
+    "description": "每次注入的记忆条数上限"
+  },
+  "inject_history_topk": {
+    "type": "int",
+    "default": 3,
+    "description": "每次注入的相关历史对话条数上限"
+  },
+  "auto_summarize": {
+    "type": "bool",
+    "default": true,
+    "description": "后台定时把新对话总结为记忆条目（Hermes 式 nudge）"
+  },
+  "summarize_interval_minutes": {
+    "type": "int",
+    "default": 30,
+    "description": "总结循环的间隔（分钟）"
+  },
+  "min_new_messages": {
+    "type": "int",
+    "default": 8,
+    "description": "至少积累多少条新消息才触发一次总结"
+  },
+  "auto_skill": {
+    "type": "bool",
+    "default": true,
+    "description": "总结时允许模型提炼可复用技能（Markdown Skill）并自动保存"
+  },
+  "skill_notify_admin": {
+    "type": "bool",
+    "default": true,
+    "description": "新技能生成时主动通知管理员"
+  },
+  "summary_prompt": {
+    "type": "text",
+    "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"scope\": \"global|user|session\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
+    "description": "总结器使用的提示词"
+  }
+}
