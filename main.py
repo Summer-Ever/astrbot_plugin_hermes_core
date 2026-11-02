@@ -88,6 +88,8 @@ try:
 except ImportError:
     Image = None
 
+PLUGIN_VERSION = "0.5.1"
+
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
     "list_skills(查看已学会的技能)、read_skill(读取技能全文)、save_skill(把可复用流程存为技能)、"
@@ -96,7 +98,7 @@ SYSTEM_MEMORY_HINT = (
 )
 
 
-@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.5.0")
+@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", PLUGIN_VERSION)
 class HermesCore(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -106,6 +108,7 @@ class HermesCore(Star):
         self._last_origin: str | None = None  # 最近活跃会话，用于技能生成通知
 
     async def initialize(self):
+        self._write_build_stamp()
         logger.info(f"[hermes_core] 已加载，FTS5: {'开启' if self.db.fts_enabled else '不可用(退化为 LIKE)'}")
         self._migrate_watermarks()
         self._check_memory_conflicts()
@@ -135,6 +138,41 @@ class HermesCore(Star):
             return self.config.get(key, default)
         except Exception:
             return default
+
+    # ============ 构建戳：确认热重载后跑的是哪份代码 ============
+
+    def _build_hash(self) -> str:
+        """对插件目录下所有 .py 内容取短哈希，用于比对磁盘代码与运行中代码。"""
+        h = hashlib.md5()
+        base = os.path.dirname(os.path.abspath(__file__))
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "renderer")]
+            for fn in sorted(files):
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(root, fn)
+                h.update(os.path.relpath(path, base).replace("\\", "/").encode())
+                try:
+                    with open(path, "rb") as fh:
+                        h.update(fh.read())
+                except OSError:
+                    pass
+        return h.hexdigest()[:10]
+
+    def _write_build_stamp(self) -> None:
+        try:
+            info = {
+                "version": PLUGIN_VERSION,
+                "code_hash": self._build_hash(),
+                "loaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "pid": os.getpid(),
+            }
+            path = os.path.join(_default_data_dir(), "build_stamp.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(info, f, ensure_ascii=False, indent=2)
+            logger.info(f"[hermes_core] 已加载 v{PLUGIN_VERSION} code={info['code_hash']}")
+        except Exception:
+            logger.warning(f"[hermes_core] 写入构建戳失败:\n{traceback.format_exc()}")
 
     # ============ 钩子：请求前注入记忆 ============
 
@@ -489,6 +527,7 @@ class HermesCore(Star):
                      if pending else "无")
         yield event.plain_result(
             f"[Hermes 记忆系统]\n"
+            f"版本: v{PLUGIN_VERSION} (code {self._build_hash()})\n"
             f"对话消息: {s['messages']} 条 / {s['sessions']} 个会话\n"
             f"长期记忆: {s['memories']} 条\n"
             f"技能: {s['skills']} 个\n"
