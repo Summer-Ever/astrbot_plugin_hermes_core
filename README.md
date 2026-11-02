@@ -49,8 +49,9 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 
 ## QQ 官方机器人注意事项
 
-- QQ 官方 API 仅支持纯文本回复，所有输出已按纯文本设计
-- 官方 bot 为被动回复模式，技能生成通知会发到最近活跃的会话，可能受平台频控影响
+- AstrBot 的 QQ 官方适配器（v4.19.6+）支持收发文本、图片、语音、视频、文件（大文件自动分块上传），主动消息推送也已支持——但主动消息受 QQ 官方平台频控/额度限制，被动回复有响应时限
+- 本插件输出以纯文本为主（记忆列表、技能全文等）；超长文本可能受单条消息长度限制被截断，技能全文建议优先用 `/hermes 技能 <名称>` 单条查看
+- 建议在 QQ 群设置里把机器人「可访问消息」设为全部群消息、并开启「主动说话」，总结循环的技能通知才能正常送达
 - 消息、记忆、技能数据存于 AstrBot `data/plugin_data/astrbot_plugin_hermes_core/hermes.db`
 
 ## 与 Hermes 的差异
