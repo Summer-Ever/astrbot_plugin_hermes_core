@@ -84,6 +84,20 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 - `/hermes 我的ID` — 查看当前平台的 sender_id / 归属 ID / 群 ID / umo（排查隔离问题）
 - `/hermes 绑定 <ID>` — 把一个别名 ID 归并到当前身份（跨群、跨私聊合并记忆）
 - `/hermes 身份` — 查看所有身份绑定；`/hermes 解绑 <ID>` 取消绑定
+- `/hermes 清空记录` — 清空对话上下文但**保留记忆与技能**：先预演条数，再加 `全群 确认`（管理员，会同时清 AstrBot 原生会话）或 `我 确认`（仅自己的消息记录）
+
+## 清上下文 vs 清记忆：两套独立存储
+
+很容易混淆的一点：**上下文和记忆在物理上是分开存的**。
+
+| | 存在哪 | 清掉会怎样 |
+|---|---|---|
+| 对话上下文 | AstrBot `conversations` 表 + 插件 `messages` 表 | 模型忘记刚才聊了什么，但记忆不受影响 |
+| 长期记忆 | 插件 `memories` 表 | 人格画像丢失，但当前对话还在 |
+
+关键结论：**清空上下文不会改变你的会话身份 ID**。`unified_msg_origin` 是由平台事件实时拼出来的确定性字符串（`平台:消息类型:group_openid/user_openid`），不来自数据库，删表也不会变；重新开会话只会生成新的 `conversation_id`（UUID），插件不依赖这个 UUID，只依赖 openid，所以记忆照常召回。
+
+真正会让 ID 变化、导致记忆变成孤儿的情况只有三种：换机器人 AppID（openid 命名空间随 bot 变化）、换适配器（`qq_official` ↔ `aiocqhttp/NapCat`，后者返回真实 QQ 号）、用户换号。这三种都无法自动迁移，需要重新建立记忆或做数据映射。
 
 ## 配置（WebUI 可视化）
 

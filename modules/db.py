@@ -127,6 +127,40 @@ class HermesDB:
             self.conn.commit()
             return cur.lastrowid
 
+    @staticmethod
+    def _msg_where(session_id: str | None, sender_id: str | None) -> tuple[str, list]:
+        conds: list[str] = []
+        args: list = []
+        if session_id is not None:
+            conds.append("session_id = ?")
+            args.append(session_id)
+        if sender_id is not None:
+            conds.append("sender_id = ?")
+            args.append(sender_id)
+        return ((" WHERE " + " AND ".join(conds)) if conds else ""), args
+
+    def count_messages(self, session_id: str | None = None,
+                       sender_id: str | None = None) -> int:
+        where, args = self._msg_where(session_id, sender_id)
+        row = self.conn.execute(f"SELECT COUNT(*) FROM messages{where}", args).fetchone()
+        return int(row[0]) if row else 0
+
+    def clear_messages(self, session_id: str | None = None,
+                       sender_id: str | None = None) -> int:
+        """删除对话消息及对应 FTS 索引；memories / skills / identities 不受影响。"""
+        where, args = self._msg_where(session_id, sender_id)
+        with self._lock:
+            ids = [r[0] for r in self.conn.execute(
+                f"SELECT id FROM messages{where}", args).fetchall()]
+            if not ids:
+                return 0
+            if self._fts_enabled:
+                self.conn.executemany(
+                    "DELETE FROM messages_fts WHERE rowid = ?", [(i,) for i in ids])
+            self.conn.execute(f"DELETE FROM messages{where}", args)
+            self.conn.commit()
+            return len(ids)
+
     def search_messages(self, query: str, limit: int = 5,
                         session_id: str | None = None,
                         sender_id: str | None = None) -> list[dict]:

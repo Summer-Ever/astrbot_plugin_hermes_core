@@ -54,7 +54,7 @@ SYSTEM_MEMORY_HINT = (
 )
 
 
-@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.3.0")
+@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.3.1")
 class HermesCore(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -536,6 +536,70 @@ class HermesCore(Star):
     async def hermes_unbind(self, event: AstrMessageEvent, alias_id: str = ""):
         ok = self.db.delete_alias(alias_id.strip()) if alias_id.strip() else False
         yield event.plain_result(f"已解绑 {alias_id}" if ok else "解绑失败：没找到该绑定。")
+
+    @hermes.command("清空记录")
+    async def hermes_clear_records(self, event: AstrMessageEvent,
+                                   target: str = "", confirm: str = ""):
+        """清空对话上下文但保留长期记忆与技能。
+
+        /hermes 清空记录                 → 预演，只显示条数
+        /hermes 清空记录 全群 确认       → 清空本会话所有上下文（管理员）
+        /hermes 清空记录 我 确认         → 只清自己的消息记录（任何人）
+        """
+        sc = self._scope_keys(event)
+        valid_targets = ("我", "自己", "me", "全群", "全部", "所有")
+        if target and target not in valid_targets:
+            # 容错：用户直接发 /hermes 清空记录 确认
+            confirm, target = target, ""
+
+        sid = sc["sid"]
+        total = self.db.count_messages(session_id=sid)
+        mine = self.db.count_messages(session_id=sid, sender_id=sc["raw_id"])
+        stats = self.db.stats()
+
+        if confirm != "确认":
+            yield event.plain_result(
+                f"[清空对话记录]\n"
+                f"本会话上下文：{total} 条（其中你的 {mine} 条）\n"
+                f"长期记忆：{stats['memories']} 条 / 技能：{stats['skills']} 个（不会被删）\n\n"
+                f"· 清空本会话全部上下文：/hermes 清空记录 全群 确认\n"
+                f"· 只清自己的消息记录：  /hermes 清空记录 我 确认\n"
+                f"（会话身份 ID 不会变化，清空后记忆仍可正常召回）"
+            )
+            return
+
+        if target in ("我", "自己", "me"):
+            n = self.db.clear_messages(session_id=sid, sender_id=sc["raw_id"])
+            yield event.plain_result(
+                f"已清除你在本会话的 {n} 条消息记录。\n"
+                f"（AstrBot 的原生会话是全群共享的，未改动；长期记忆完整保留）")
+            return
+
+        try:
+            is_admin = bool(event.is_admin())
+        except Exception:
+            is_admin = True
+        if not is_admin:
+            yield event.plain_result(
+                "清空整个会话的上下文需要管理员权限。\n"
+                "你可以只清自己的：/hermes 清空记录 我 确认")
+            return
+
+        n = self.db.clear_messages(session_id=sid)
+        native = ""
+        try:
+            cm = getattr(self.context, "conversation_manager", None)
+            if cm is not None:
+                await cm.delete_conversations_by_user_id(sid)
+                native = "AstrBot 原生对话上下文已一并清除。"
+            else:
+                native = "未找到 conversation_manager，AstrBot 原生对话请到 WebUI 手动删除。"
+        except Exception:
+            native = "AstrBot 原生对话清除失败，请到 WebUI → 会话管理手动删除。"
+        yield event.plain_result(
+            f"已清除本会话 {n} 条消息记录。{native}\n"
+            f"长期记忆 {stats['memories']} 条、技能 {stats['skills']} 个均保留，"
+            f"下一次对话会照常召回。")
 
     async def terminate(self):
         if self._bg_task:
