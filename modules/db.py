@@ -72,6 +72,15 @@ class HermesDB:
             )
         except sqlite3.OperationalError:
             fts_ok = False
+        # v0.2.0 迁移：记忆多用户隔离（老库自动补列）
+        for ddl in (
+            "ALTER TABLE memories ADD COLUMN owner_id TEXT DEFAULT ''",
+            "ALTER TABLE memories ADD COLUMN session_id TEXT DEFAULT ''",
+        ):
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         c.commit()
         return fts_ok
 
@@ -98,32 +107,38 @@ class HermesDB:
             return cur.lastrowid
 
     def search_messages(self, query: str, limit: int = 5,
-                        session_id: str | None = None) -> list[dict]:
-        """优先 FTS5 trigram 匹配，失败/无结果时退回 LIKE。"""
+                        session_id: str | None = None,
+                        sender_id: str | None = None) -> list[dict]:
+        """优先 FTS5 trigram 匹配，失败/无结果时退回 LIKE。可按会话和发言人过滤。"""
+        extra_sql = ""
+        extra_args: list = []
+        if session_id is not None:
+            extra_sql += " AND m.session_id = ?"
+            extra_args.append(session_id)
+        if sender_id is not None:
+            extra_sql += " AND m.sender_id = ?"
+            extra_args.append(sender_id)
         if self._fts_enabled:
             try:
                 q = query.strip().replace('"', ' ')
                 if len(q) >= 3:
                     rows = self.conn.execute(
                         "SELECT m.* FROM messages_fts f JOIN messages m ON m.id = f.rowid"
-                        " WHERE messages_fts MATCH ?"
-                        + (" AND m.session_id = ?" if session_id else "")
-                        + " ORDER BY m.id DESC LIMIT ?",
-                        (f'"{q}"', session_id, limit) if session_id else (f'"{q}"', limit),
+                        " WHERE messages_fts MATCH ?" + extra_sql +
+                        " ORDER BY m.id DESC LIMIT ?",
+                        (f'"{q}"', *extra_args, limit),
                     ).fetchall()
                     if rows:
                         return [dict(r) for r in rows]
             except sqlite3.OperationalError:
                 pass
         like = f"%{query.strip()[:100]}%"
-        sql = "SELECT * FROM messages WHERE content LIKE ?"
-        args: list = [like]
-        if session_id:
-            sql += " AND session_id = ?"
-            args.append(session_id)
-        sql += " ORDER BY id DESC LIMIT ?"
-        args.append(limit)
-        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+        rows = self.conn.execute(
+            "SELECT * FROM messages m WHERE m.content LIKE ?" + extra_sql +
+            " ORDER BY m.id DESC LIMIT ?",
+            (like, *extra_args, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def recent_messages(self, session_id: str, limit: int = 20) -> list[dict]:
         rows = self.conn.execute(
@@ -148,21 +163,55 @@ class HermesDB:
 
     # ---------- memories ----------
 
-    def add_memory(self, kind: str, content: str, scope: str = "global", source: str = "") -> int:
+    def add_memory(self, kind: str, content: str, scope: str = "global",
+                   source: str = "", owner_id: str = "", session_id: str = "") -> int:
         with self._lock:
             cur = self.conn.execute(
-                "INSERT INTO memories(ts, kind, scope, content, source) VALUES(?,?,?,?,?)",
-                (time.time(), kind, scope, content, source),
+                "INSERT INTO memories(ts, kind, scope, content, source, owner_id, session_id)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (time.time(), kind, scope, content, source, owner_id or "", session_id or ""),
             )
             self.conn.commit()
             return cur.lastrowid
 
-    def search_memories(self, query: str, limit: int = 5) -> list[dict]:
-        # 记忆条目量小，LIKE 检索性能足够，不额外建 FTS 表
+    def search_memories(self, query: str, limit: int = 5,
+                        owner_id: str | None = None,
+                        session_id: str | None = None) -> list[dict]:
+        """记忆检索，支持三级作用域隔离（优先级：用户 > 会话/群 > 全局）。
+
+        - owner_id + session_id 都给出：召回本人记忆、本群公共记忆、全局记忆
+        - 仅 session_id：召回本群公共记忆 + 全局记忆
+        - 仅 owner_id：召回本人记忆 + 全局记忆
+        - 都不传：全局检索（旧行为）
+        """
+        conds: list[str] = []
+        args: list = []
+        if owner_id is not None and session_id is not None:
+            conds.append("(owner_id = ? OR (session_id = ? AND owner_id = '')"
+                         " OR (owner_id = '' AND session_id = ''))")
+            args += [owner_id, session_id]
+            order = ("ORDER BY CASE WHEN owner_id = ? THEN 0"
+                     " WHEN session_id = ? THEN 1 ELSE 2 END, id DESC")
+            order_args = [owner_id, session_id]
+        elif session_id is not None:
+            conds.append("(session_id = ? OR (owner_id = '' AND session_id = ''))")
+            args.append(session_id)
+            order = "ORDER BY id DESC"
+            order_args = []
+        elif owner_id is not None:
+            conds.append("(owner_id = ? OR (owner_id = '' AND session_id = ''))")
+            args.append(owner_id)
+            order = "ORDER BY id DESC"
+            order_args = []
+        else:
+            order = "ORDER BY id DESC"
+            order_args = []
         like = f"%{query.strip()[:100]}%"
         rows = self.conn.execute(
-            "SELECT * FROM memories WHERE content LIKE ? ORDER BY id DESC LIMIT ?",
-            (like, limit),
+            f"SELECT * FROM memories WHERE content LIKE ?"
+            + (" AND " + " AND ".join(conds) if conds else "")
+            + f" {order} LIMIT ?",
+            (like, *args, *order_args, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 

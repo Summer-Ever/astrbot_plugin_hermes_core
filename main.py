@@ -54,7 +54,7 @@ SYSTEM_MEMORY_HINT = (
 )
 
 
-@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.1.0")
+@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.2.0")
 class HermesCore(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -65,6 +65,7 @@ class HermesCore(Star):
 
     async def initialize(self):
         logger.info(f"[hermes_core] 已加载，FTS5: {'开启' if self.db.fts_enabled else '不可用(退化为 LIKE)'}")
+        self._check_memory_conflicts()
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
 
@@ -77,6 +78,10 @@ class HermesCore(Star):
             return default
 
     # ============ 钩子：请求前注入记忆 ============
+
+    def _scope_keys(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """返回 (owner_id, session_id)。owner_id 为发言人 ID，session_id 为会话（群）ID。"""
+        return str(event.get_sender_id() or ""), event.unified_msg_origin
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -101,20 +106,30 @@ class HermesCore(Star):
 
     def _build_context_block(self, event: AstrMessageEvent, query: str) -> str:
         lines: list[str] = []
-        sid = event.unified_msg_origin
+        owner_id, sid = self._scope_keys(event)
         mem_k = int(self._get_cfg("inject_memories_topk", 5))
         hist_k = int(self._get_cfg("inject_history_topk", 3))
+        scope = str(self._get_cfg("memory_scope", "user"))
+        per_user_hist = bool(self._get_cfg("per_user_history", True))
 
-        memories = self.db.search_memories(query, limit=mem_k)
+        # 记忆：user 模式按 用户>群>全局 三级召回；group 模式按 群>全局；global 模式全量
+        if scope == "user":
+            memories = self.db.search_memories(query, limit=mem_k, owner_id=owner_id, session_id=sid)
+        elif scope == "group":
+            memories = self.db.search_memories(query, limit=mem_k, session_id=sid)
+        else:
+            memories = self.db.search_memories(query, limit=mem_k)
         if memories:
             lines.append("[长期记忆参考]")
             lines += [f"- ({m['kind']}) {m['content']}" for m in memories]
 
-        history = self.db.search_messages(query, limit=hist_k, session_id=sid)
+        # 历史：默认只看本人在本群的历史，避免混入其他群友的对话
+        sender_filter = owner_id if (scope == "user" and per_user_hist) else None
+        history = self.db.search_messages(query, limit=hist_k, session_id=sid, sender_id=sender_filter)
         if history:
             lines.append("[相关历史对话]")
             for h in reversed(history):
-                who = "用户" if h["role"] == "user" else "你"
+                who = "你" if h["role"] == "user" else "你之前回复"
                 text = h["content"][:200]
                 lines.append(f"- {who}: {text}")
 
@@ -156,12 +171,13 @@ class HermesCore(Star):
 
     @filter.llm_tool(name="search_memory")
     async def tool_search_memory(self, event: AstrMessageEvent, query: str) -> str:
-        """按关键词检索长期记忆与历史对话。当需要回忆用户偏好、之前聊过的内容时调用。
+        """按关键词检索长期记忆与历史对话。当需要回忆当前用户偏好、之前聊过的内容时调用。
         Args:
             query: 检索关键词
         """
-        mems = self.db.search_memories(query, limit=5)
-        msgs = self.db.search_messages(query, limit=5, session_id=event.unified_msg_origin)
+        owner_id, sid = self._scope_keys(event)
+        mems = self.db.search_memories(query, limit=5, owner_id=owner_id, session_id=sid)
+        msgs = self.db.search_messages(query, limit=5, session_id=sid, sender_id=owner_id)
         out = []
         if mems:
             out.append("[记忆] " + " | ".join(f"{m['content']}" for m in mems))
@@ -172,12 +188,14 @@ class HermesCore(Star):
     @filter.llm_tool(name="save_memory")
     async def tool_save_memory(self, event: AstrMessageEvent, content: str,
                                kind: str = "fact") -> str:
-        """把值得长期记住的信息保存为记忆。用户偏好、重要事实、项目背景等都应保存。
+        """把值得长期记住的信息保存为记忆（自动归属到当前发言用户）。用户偏好、重要事实、项目背景等都应保存。
         Args:
             content: 记忆内容（简洁的一句话）
             kind: 类型，fact/preference/profile/summary 之一
         """
-        mid = self.db.add_memory(kind or "fact", content, scope="global", source="llm_tool")
+        owner_id, sid = self._scope_keys(event)
+        mid = self.db.add_memory(kind or "fact", content, scope="user",
+                                 source="llm_tool", owner_id=owner_id, session_id=sid)
         return f"已保存记忆 #{mid}。"
 
     @filter.llm_tool(name="list_skills")
@@ -233,18 +251,27 @@ class HermesCore(Star):
         if new_count < min_new:
             return f"新消息仅 {new_count} 条（阈值 {min_new}），跳过。"
 
-        # 按会话分组拼接记录
+        # 按会话分组拼接记录；带发言人 ID，便于模型把记忆归属到具体的人
         by_session: dict[str, list[dict]] = {}
         for m in msgs:
             by_session.setdefault(m["session_id"], []).append(m)
+        known_ids: set[str] = set()
         transcript_parts = []
         for sid, group in by_session.items():
-            lines = [f"用户{g['sender_name'] or g['sender_id']}: {g['content'][:300]}"
-                     if g["role"] == "user" else f"助手: {g['content'][:300]}" for g in group]
+            lines = []
+            for g in group:
+                if g["role"] == "user":
+                    known_ids.add(str(g["sender_id"] or ""))
+                    lines.append(f"[用户 {g['sender_id'] or '未知'}({g['sender_name'] or '匿名'})]: {g['content'][:300]}")
+                else:
+                    lines.append(f"助手: {g['content'][:300]}")
             transcript_parts.append(f"== 会话 {sid} ==\n" + "\n".join(lines))
         transcript = "\n\n".join(transcript_parts)[:12000]
 
-        prompt = self._get_cfg("summary_prompt", "") + "\n\n对话记录：\n" + transcript
+        prompt = (self._get_cfg("summary_prompt", "")
+                  + "\n\n对话中每位用户都带有 [用户 ID(昵称)] 标记。"
+                    "若某条记忆只属于某个特定用户，请在该项追加 \"owner\": \"该用户的ID\"；"
+                    "属于整段对话/全体时省略 owner。\n\n对话记录：\n" + transcript)
         resp = await provider.text_chat(prompt=prompt, session_id=None)
         text = ""
         try:
@@ -262,9 +289,15 @@ class HermesCore(Star):
                     self.db.upsert_skill(name, str(item.get("trigger", "")), str(item["content"]))
                     made_skill += 1
             elif item.get("content"):
+                owner = str(item.get("owner", "")).strip()
+                if owner not in known_ids:
+                    owner = ""  # 归属不明 → 降级为群公共记忆
+                sid_of_item = next((s for s, grp in by_session.items()
+                                    if any(str(g["sender_id"] or "") == owner for g in grp)), "") if owner else ""
                 self.db.add_memory(
                     str(item.get("kind", "fact")), str(item["content"]),
-                    scope=str(item.get("scope", "global")), source="auto_summary",
+                    scope="user" if owner else "group", source="auto_summary",
+                    owner_id=owner, session_id=sid_of_item,
                 )
                 made_mem += 1
         self.db.set_meta("last_summarized_id", str(msgs[-1]["id"]))
@@ -324,7 +357,9 @@ class HermesCore(Star):
         if not content.strip():
             yield event.plain_result("用法：/hermes 记住 <内容>")
             return
-        mid = self.db.add_memory("fact", content.strip(), source="manual")
+        owner_id, sid = self._scope_keys(event)
+        mid = self.db.add_memory("fact", content.strip(), scope="user",
+                                 source="manual", owner_id=owner_id, session_id=sid)
         yield event.plain_result(f"已记住（#{mid}）：{content.strip()}")
 
     @hermes.command("忘记")
@@ -364,6 +399,64 @@ class HermesCore(Star):
         with open(path, "w", encoding="utf-8") as f:
             f.write(md)
         yield event.plain_result(f"已导出到插件数据目录 MEMORY.md（{len(md)} 字符）。")
+
+    # ============ 接管系统级记忆 ============
+
+    @hermes.command("导入历史")
+    async def hermes_import_history(self, event: AstrMessageEvent):
+        """把 AstrBot 原生对话历史导入本插件记忆库，实现无缝接管。"""
+        imported = await self._import_native_history(event.unified_msg_origin)
+        yield event.plain_result(imported)
+
+    async def _import_native_history(self, umo: str) -> str:
+        cm = getattr(self.context, "conversation_manager", None)
+        if cm is None:
+            return "当前 AstrBot 版本没有 conversation_manager，无法导入。"
+        try:
+            count = 0
+            convs = await cm.get_conversations(umo)
+            for conv in convs or []:
+                history = conv.history
+                if isinstance(history, str):
+                    try:
+                        history = json.loads(history)
+                    except Exception:
+                        continue
+                for h in history or []:
+                    if not isinstance(h, dict):
+                        continue
+                    role = str(h.get("role", ""))
+                    content = str(h.get("content", "")).strip()
+                    if not content or role not in ("user", "assistant"):
+                        continue
+                    self.db.add_message(umo, role, content[:2000])
+                    count += 1
+            return f"导入完成：{count} 条原生对话记录已并入记忆库。"
+        except Exception:
+            logger.error(f"[hermes_core] 导入历史失败:\n{traceback.format_exc()}")
+            return "导入失败，详见后台日志。"
+
+    def _check_memory_conflicts(self):
+        """接管模式下的防双重注入检查：提醒关闭原生长期记忆与其他记忆插件。"""
+        if not self._get_cfg("exclusive_memory", True):
+            return
+        try:
+            plugins = getattr(self.context, "get_all_stars", lambda: [])() or []
+            names = [getattr(p, "name", "") for p in plugins]
+            conflicts = [n for n in names if n and any(
+                k in n.lower() for k in ("memory", "livingmemory", "hindsight", "记忆"))]
+            conflicts = [n for n in conflicts if n != "astrbot_plugin_hermes_core"]
+            if conflicts:
+                logger.warning(
+                    f"[hermes_core] 检测到其他记忆插件: {conflicts}。"
+                    "为避免记忆双重注入，建议在 WebUI 禁用它们（本插件已独占记忆链路）。"
+                )
+            logger.info(
+                "[hermes_core] 接管模式：请确认 AstrBot 内置长期记忆（试验性功能）已关闭，"
+                "路径：WebUI → 配置 → AI 相关选项。"
+            )
+        except Exception:
+            pass
 
     async def terminate(self):
         if self._bg_task:

@@ -15,6 +15,28 @@
 | 技能自动生成（Markdown Skill） | 总结时一并提炼技能；模型也可通过 `save_skill` 工具主动沉淀，同名自动更新 |
 | 工具化记忆检索 | 5 个 llm_tool：`search_memory` / `save_memory` / `list_skills` / `read_skill` / `save_skill` |
 | 定时任务 | 复用插件后台 asyncio 循环（默认 30 分钟，可配置） |
+| （本插件扩展）多用户隔离 | 记忆按 `用户 > 群 > 全局` 三级作用域存储与召回，群聊中不同群友互不污染 |
+| （本插件扩展）接管 AstrBot 记忆 | 原生对话历史一键导入 + 内置记忆/其他记忆插件冲突检测 |
+
+## 记忆隔离：群聊多人使用不串味
+
+Hermes 本身是单用户私人助理，没有多用户概念；本插件为此增加了作用域层：
+
+- `memory_scope=user`（默认）：记忆归属到具体发言人，召回时按 **本人 → 本群公共 → 全局** 优先级排序；群友 A 的偏好不会注入给群友 B
+- `memory_scope=group`：以群/会话为单位共享记忆，适合"群规、群项目"这类公共知识
+- `memory_scope=global`：全机器人共享（等同旧版行为，不建议群聊开启）
+- `per_user_history=true`（默认）：历史检索增加 `sender_id` 过滤，不会把同群其他人的对话当上下文注入
+- 技能库全机器人共享——技能是"能力"而非隐私，这也是 Hermes 的设计
+- 总结器会收到带 `[用户 ID(昵称)]` 标记的对话，产出记忆时自动归属到对应人；归属不明的降级为群公共记忆
+
+## 接管 AstrBot 的记忆体系
+
+本插件在 `on_llm_request` / `on_llm_response` 两个官方钩子上完成"注入 + 落库"，因此可以把 AstrBot 的记忆职责完全收拢过来：
+
+1. **关闭其他记忆来源**（避免双重注入）：WebUI 停用其他记忆类插件（如 livingmemory、hindsight 等）；若你的版本内置了试验性长期记忆，在 配置 → AI 相关选项 中关闭
+2. **导入原生历史**：在需要的会话里执行 `/hermes 导入历史`，把 AstrBot 原有对话记录并入本插件记忆库，切换无感
+3. **冲突自检**：`exclusive_memory=true`（默认）时，插件启动会在日志里列出检测到的其他记忆插件并提醒
+4. **统一管理入口**：此后记忆的查看、删除、导出、总结、技能全部走 `/hermes` 命令组
 
 ## 安装
 
@@ -38,9 +60,13 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 - `/hermes 忘记 <id>` — 删除某条记忆
 - `/hermes 技能` — 列出技能；`/hermes 技能 <名称>` 查看全文
 - `/hermes 导出` — 导出 MEMORY.md 到插件数据目录
+- `/hermes 导入历史` — 导入 AstrBot 原生对话历史（接管记忆时用）
 
 ## 配置（WebUI 可视化）
 
+- `memory_scope`：`user` / `group` / `global`，记忆隔离级别
+- `per_user_history`：历史检索按发言人过滤
+- `exclusive_memory`：独占记忆模式，启动时检测其他记忆插件
 - `memory_injection`：开关请求前记忆注入
 - `inject_memories_topk` / `inject_history_topk`：注入条数
 - `auto_summarize` + `summarize_interval_minutes` + `min_new_messages`：自动总结节奏

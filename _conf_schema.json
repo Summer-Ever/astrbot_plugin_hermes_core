@@ -1,4 +1,21 @@
 {
+  "memory_scope": {
+    "type": "string",
+    "default": "user",
+    "description": "记忆隔离级别：user=按用户隔离（推荐群聊）、group=按群/会话隔离、global=全机器人共享",
+    "options": ["user", "group", "global"]
+  },
+  "per_user_history": {
+    "type": "bool",
+    "default": true,
+    "description": "历史对话检索只匹配当前发言人，避免注入同群其他人的对话",
+    "hint": "仅在 memory_scope=user 时生效"
+  },
+  "exclusive_memory": {
+    "type": "bool",
+    "default": true,
+    "description": "独占记忆模式：启动时检查并提醒关闭其他记忆插件与内置长期记忆，避免双重注入"
+  },
   "memory_injection": {
     "type": "bool",
     "default": true,
@@ -38,11 +55,11 @@
   "skill_notify_admin": {
     "type": "bool",
     "default": true,
-    "description": "新技能生成时主动通知管理员"
+    "description": "新技能生成时主动通知最近活跃会话"
   },
   "summary_prompt": {
     "type": "text",
-    "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"scope\": \"global|user|session\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
+    "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
     "description": "总结器使用的提示词"
   }
 }
