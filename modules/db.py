@@ -209,6 +209,50 @@ class HermesDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ---------- 按会话的总结水位 ----------
+
+    def get_watermark(self, session_id: str, default: int = 0) -> int:
+        try:
+            return int(self.get_meta(f"summarized:{session_id}", str(default)) or default)
+        except (TypeError, ValueError):
+            return default
+
+    def set_watermark(self, session_id: str, msg_id: int) -> None:
+        self.set_meta(f"summarized:{session_id}", str(int(msg_id)))
+
+    def all_session_ids(self) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT session_id FROM messages").fetchall()
+        return [r[0] for r in rows]
+
+    def max_message_id(self) -> int:
+        row = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()
+        return int(row[0]) if row else 0
+
+    def unsummarized_by_session(self) -> list[dict]:
+        """每个会话待总结的消息统计（各自独立水位，互不影响）。"""
+        out: list[dict] = []
+        for sid in self.all_session_ids():
+            wm = self.get_watermark(sid)
+            row = self.conn.execute(
+                "SELECT COUNT(*) c, MIN(ts) o, MAX(id) m FROM messages"
+                " WHERE session_id = ? AND id > ?",
+                (sid, wm),
+            ).fetchone()
+            if row and row["c"]:
+                out.append({"session_id": sid, "count": int(row["c"]),
+                            "oldest": row["o"], "max_id": row["m"], "watermark": wm})
+        return out
+
+    def session_batch(self, session_id: str, watermark: int,
+                      limit: int = 200) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? AND id > ?"
+            " ORDER BY id ASC LIMIT ?",
+            (session_id, watermark, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def stats(self) -> dict:
         m = self.conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
         mem = self.conn.execute("SELECT COUNT(*) c FROM memories").fetchone()["c"]

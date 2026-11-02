@@ -40,12 +40,19 @@
   "summarize_interval_minutes": {
     "type": "int",
     "default": 30,
-    "description": "总结循环的间隔（分钟）"
+    "description": "总结检查间隔（分钟）。到点后逐个会话判断是否需要总结，不是到点就强制总结",
+    "hint": "只是闹钟，真正触发条件见下面两项"
   },
   "min_new_messages": {
     "type": "int",
     "default": 8,
-    "description": "至少积累多少条新消息才触发一次总结"
+    "description": "单个会话至少积累多少条新消息才总结（按会话独立计数，不是全局合计）"
+  },
+  "summarize_grace_hours": {
+    "type": "int",
+    "default": 6,
+    "description": "时间兜底：某个会话的消息超过这么多小时还没被总结，即使不足条数也强制总结，避免低频场景永远不产生记忆",
+    "hint": "设为 0 关闭兜底（则只按条数触发）"
   },
   "auto_skill": {
     "type": "bool",

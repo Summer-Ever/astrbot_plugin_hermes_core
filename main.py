@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import traceback
 
 from astrbot.api import logger
@@ -70,7 +71,7 @@ SYSTEM_MEMORY_HINT = (
 )
 
 
-@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.3.2")
+@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.4.0")
 class HermesCore(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -81,9 +82,26 @@ class HermesCore(Star):
 
     async def initialize(self):
         logger.info(f"[hermes_core] 已加载，FTS5: {'开启' if self.db.fts_enabled else '不可用(退化为 LIKE)'}")
+        self._migrate_watermarks()
         self._check_memory_conflicts()
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
+
+    def _migrate_watermarks(self):
+        """v0.4 起总结水位按会话独立。老库只有全局 last_summarized_id，
+        升级时把它一次性写入各会话，避免重复总结已处理过的消息。"""
+        try:
+            if self.db.get_meta("watermark_migrated", "0") == "1":
+                return
+            legacy = int(self.db.get_meta("last_summarized_id", "0") or 0)
+            if legacy > 0:
+                for sid in self.db.all_session_ids():
+                    if self.db.get_watermark(sid) == 0:
+                        self.db.set_watermark(sid, legacy)
+                logger.info(f"[hermes_core] 已将全局水位 {legacy} 迁移到按会话水位")
+            self.db.set_meta("watermark_migrated", "1")
+        except Exception:
+            logger.error(f"[hermes_core] 水位迁移失败:\n{traceback.format_exc()}")
 
     def _get_cfg(self, key: str, default):
         if self.config is None:
@@ -281,36 +299,77 @@ class HermesCore(Star):
             except Exception:
                 logger.error(f"[hermes_core] 总结循环异常:\n{traceback.format_exc()}")
 
-    async def _summarize(self) -> str:
+    async def _summarize(self, force: bool = False) -> str:
+        """按会话独立判断是否值得总结：各自攒够条数、或超时兜底、或手动强制。
+
+        每个会话有自己的水位（meta 键 summarized:<sid>），互不干扰，避免
+        "全局凑够 8 条"导致的低频会话永远不总结、以及跨会话打包串味。
+        """
         provider = self.context.get_using_provider()
         if provider is None:
             return "未配置 LLM Provider，无法总结。"
-        min_new = int(self._get_cfg("min_new_messages", 8))
-        last_id = int(self.db.get_meta("last_summarized_id", "0"))
-        msgs = self.db.messages_since(last_id)
-        new_count = len(msgs)
-        if new_count < min_new:
-            return f"新消息仅 {new_count} 条（阈值 {min_new}），跳过。"
 
-        # 按会话分组拼接记录；带发言人 ID，便于模型把记忆归属到具体的人
-        by_session: dict[str, list[dict]] = {}
-        for m in msgs:
-            by_session.setdefault(m["session_id"], []).append(m)
+        min_new = max(1, int(self._get_cfg("min_new_messages", 8)))
+        grace_h = float(self._get_cfg("summarize_grace_hours", 6))
+        now = time.time()
+
+        pending = self.db.unsummarized_by_session()
+        due: list[tuple[dict, str]] = []
+        for st in pending:
+            if force:
+                due.append((st, "手动触发"))
+            elif st["count"] >= min_new:
+                due.append((st, f"{st['count']} 条达标"))
+            elif grace_h > 0 and st["oldest"] and (now - st["oldest"]) >= grace_h * 3600:
+                due.append((st, f"超 {grace_h:g} 小时兜底"))
+
+        if not due:
+            total = sum(st["count"] for st in pending)
+            return (f"暂无需总结：{len(pending)} 个会话共 {total} 条新消息，"
+                    f"均未达 {min_new} 条且未超 {grace_h:g} 小时兜底。")
+
+        made_mem = made_skill = done_msgs = 0
+        details: list[str] = []
+        for st, reason in due:
+            batch = self.db.session_batch(st["session_id"], st["watermark"], limit=200)
+            if not batch:
+                continue
+            mem, sk = await self._summarize_session(provider, batch, st["session_id"])
+            made_mem += mem
+            made_skill += sk
+            done_msgs += len(batch)
+            # 只推进到本批最后一条：积压超 200 条时下一轮继续处理
+            self.db.set_watermark(st["session_id"], batch[-1]["id"])
+            details.append(f"{st['session_id'][:36]}：{len(batch)} 条（{reason}）")
+
+        summary = (f"[hermes_core] 总结完成：{len(details)} 个会话 / {done_msgs} 条消息，"
+                   f"新记忆 {made_mem} 条，新技能 {made_skill} 个。")
+        logger.info(summary + " | " + "；".join(details))
+        if made_skill and self._get_cfg("skill_notify_admin", True) and self._last_origin \
+                and MessageChain is not None and Plain is not None:
+            try:
+                await self.context.send_message(
+                    self._last_origin,
+                    MessageChain([Plain(f"[技能进化] 刚学会了 {made_skill} 个新技能，用 /hermes 技能 查看。")]),
+                )
+            except Exception:
+                pass
+        return summary
+
+    async def _summarize_session(self, provider, batch: list[dict],
+                                 sid: str) -> tuple[int, int]:
+        """把一个会话的一批消息交给 LLM 归纳，写入记忆与技能。"""
+        fmt = batch[0].get("platform") or ""
+        gid = batch[0].get("group_id") or ""
         known_ids: set[str] = set()
-        session_meta: dict[str, tuple[str, str]] = {}  # sid -> (platform, group_id)
-        transcript_parts = []
-        for sid, group in by_session.items():
-            first = group[0]
-            session_meta[sid] = (first.get("platform") or "", first.get("group_id") or "")
-            lines = []
-            for g in group:
-                if g["role"] == "user":
-                    known_ids.add(str(g["sender_id"] or ""))
-                    lines.append(f"[用户 {g['sender_id'] or '未知'}({g['sender_name'] or '匿名'})]: {g['content'][:300]}")
-                else:
-                    lines.append(f"助手: {g['content'][:300]}")
-            transcript_parts.append(f"== 会话 {sid} ==\n" + "\n".join(lines))
-        transcript = "\n\n".join(transcript_parts)[:12000]
+        lines: list[str] = []
+        for m in batch:
+            if m["role"] == "user":
+                known_ids.add(str(m["sender_id"] or ""))
+                lines.append(f"[用户 {m['sender_id'] or '未知'}({m['sender_name'] or '匿名'})]: {m['content'][:300]}")
+            else:
+                lines.append(f"助手: {m['content'][:300]}")
+        transcript = "\n".join(lines)[:12000]
 
         prompt = (self._get_cfg("summary_prompt", "")
                   + "\n\n对话中每位用户都带有 [用户 ID(昵称)] 标记。"
@@ -322,9 +381,8 @@ class HermesCore(Star):
             text = resp.completion_text or ""
         except Exception:
             pass
-        items = self._extract_json_array(text)
-        made_mem, made_skill = 0, 0
-        for item in items:
+        made_mem = made_skill = 0
+        for item in self._extract_json_array(text):
             if not isinstance(item, dict):
                 continue
             if item.get("skill") and self._get_cfg("auto_skill", True):
@@ -336,31 +394,15 @@ class HermesCore(Star):
                 owner = str(item.get("owner", "")).strip()
                 if owner not in known_ids:
                     owner = ""  # 归属不明 → 降级为群公共记忆
-                sid_of_item = next((s for s, grp in by_session.items()
-                                    if any(str(g["sender_id"] or "") == owner for g in grp)), "") if owner else ""
-                platform, gid = session_meta.get(sid_of_item, ("", ""))
                 if owner:
-                    owner = self.db.resolve_owner(owner, platform)
+                    owner = self.db.resolve_owner(owner, fmt)
                 self.db.add_memory(
                     str(item.get("kind", "fact")), str(item["content"]),
                     scope="user" if owner else "group", source="auto_summary",
-                    owner_id=owner, session_id=sid_of_item,
-                    platform=platform, group_id=gid,
+                    owner_id=owner, session_id=sid, platform=fmt, group_id=gid,
                 )
                 made_mem += 1
-        self.db.set_meta("last_summarized_id", str(msgs[-1]["id"]))
-        summary = f"[hermes_core] 总结完成：新记忆 {made_mem} 条，新技能 {made_skill} 个（处理 {new_count} 条消息）。"
-        logger.info(summary)
-        if made_skill and self._get_cfg("skill_notify_admin", True) and self._last_origin \
-                and MessageChain is not None and Plain is not None:
-            try:
-                await self.context.send_message(
-                    self._last_origin,
-                    MessageChain([Plain(f"[技能进化] 刚学会了 {made_skill} 个新技能，用 /hermes 技能 查看。")]),
-                )
-            except Exception:
-                pass
-        return summary
+        return made_mem, made_skill
 
     @staticmethod
     def _extract_json_array(text: str) -> list:
@@ -385,19 +427,27 @@ class HermesCore(Star):
     @hermes.command("状态")
     async def hermes_status(self, event: AstrMessageEvent):
         s = self.db.stats()
+        interval = self._get_cfg("summarize_interval_minutes", 30)
+        min_new = self._get_cfg("min_new_messages", 8)
+        grace = self._get_cfg("summarize_grace_hours", 6)
+        pending = self.db.unsummarized_by_session()
+        pend_info = (f"{len(pending)} 个会话共 {sum(p['count'] for p in pending)} 条"
+                     if pending else "无")
         yield event.plain_result(
             f"[Hermes 记忆系统]\n"
             f"对话消息: {s['messages']} 条 / {s['sessions']} 个会话\n"
             f"长期记忆: {s['memories']} 条\n"
             f"技能: {s['skills']} 个\n"
             f"FTS5 检索: {'开启' if self.db.fts_enabled else '退化 LIKE'}\n"
-            f"自动总结: {'每 ' + str(self._get_cfg('summarize_interval_minutes', 30)) + ' 分钟' if self._get_cfg('auto_summarize', True) else '关闭'}"
+            f"自动总结: {'每 ' + str(interval) + ' 分钟检查（单会话满 ' + str(min_new)
+                         + ' 条或超 ' + str(grace) + ' 小时兜底）' if self._get_cfg('auto_summarize', True) else '关闭'}\n"
+            f"待总结: {pend_info}"
         )
 
     @hermes.command("总结")
     async def hermes_summarize(self, event: AstrMessageEvent):
-        yield event.plain_result("正在总结……")
-        result = await self._summarize()
+        yield event.plain_result("正在总结（手动触发会忽略条数阈值，处理全部待总结会话）……")
+        result = await self._summarize(force=True)
         yield event.plain_result(result)
 
     @hermes.command("记住")

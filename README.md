@@ -14,7 +14,7 @@
 | 周期性记忆 nudge / LLM 总结 | 后台循环调用你已配置的 Provider，把新对话压缩为记忆条目（JSON 协议） |
 | 技能自动生成（Markdown Skill） | 总结时一并提炼技能；模型也可通过 `save_skill` 工具主动沉淀，同名自动更新 |
 | 工具化记忆检索 | 5 个 llm_tool：`search_memory` / `save_memory` / `list_skills` / `read_skill` / `save_skill` |
-| 定时任务 | 复用插件后台 asyncio 循环（默认 30 分钟，可配置） |
+| 定时任务 | 复用插件后台 asyncio 循环（默认 30 分钟检查一次，可配置） |
 | （本插件扩展）多用户隔离 | 记忆按 `用户 > 群 > 全局` 三级作用域存储与召回，群聊中不同群友互不污染 |
 | （本插件扩展）接管 AstrBot 记忆 | 原生对话历史一键导入 + 内置记忆/其他记忆插件冲突检测 |
 
@@ -86,6 +86,28 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 - `/hermes 身份` — 查看所有身份绑定；`/hermes 解绑 <ID>` 取消绑定
 - `/hermes 清空记录` — 清空对话上下文但**保留记忆与技能**：先预演条数，再加 `全群 确认`（管理员，会同时清 AstrBot 原生会话）或 `我 确认`（仅自己的消息记录）
 
+## 总结是怎么触发的（按会话独立）
+
+三个参数容易误解，实际规则是**按会话独立判断**（会话 = 一个群窗口，或一个私聊窗口）：
+
+| 参数 | 真正的含义 | 不是 |
+|---|---|---|
+| `summarize_interval_minutes` | 每 N 分钟醒一次，**逐个会话**检查 | 不是「每 N 分钟总结一次」 |
+| `min_new_messages` | **单个会话**攒够这么多条才总结 | 不是「全库合计够 N 条」 |
+| `summarize_grace_hours` | 某会话的消息超过 N 小时还没总结，即使不够条数也强制总结 | 不是时效性要求 |
+
+举例（阈值 8 条 / 兜底 6 小时）：
+
+- 群 A 攒了 10 条 → 总结群 A，一次 LLM 调用
+- 群 B 只有 3 条但已经放了 7 小时 → 兜底总结群 B
+- 私聊 C 刚聊 2 条 → 跳过，等下轮继续攒或等兜底
+
+**每个会话独立一次 LLM 调用、串行执行，绝不把多个会话塞进同一个 prompt**；各会话的总结水位（`meta` 表 `summarized:<会话ID>`）互不影响。
+
+一个必须说清的点：**会话不等于人**。同一个群里的 A 和 B 共享一个会话，他们的话会进同一次总结——这是刻意的，因为群聊本来就是多人交织的对话，按人拆开会丢失「谁在回谁」的上下文，而且 LLM 调用次数会翻倍。归属安全靠三层保证：每句带 `[用户ID(昵称)]` 标记 → 模型产出 `owner` 字段 → 写入前校验 owner 必须出现在本批对话的 ID 里，否则降级为群公共记忆（不会硬塞给某个人）。
+
+如果确实要求「完全按人隔离总结」，把 AstrBot 的 `unique_session` 打开即可：群里每个人变成独立会话，自然就按人拆开了（代价是失去群公共上下文）。
+
 ## 清上下文 vs 清记忆：两套独立存储
 
 很容易混淆的一点：**上下文和记忆在物理上是分开存的**。
@@ -106,7 +128,7 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 - `exclusive_memory`：独占记忆模式，启动时检测其他记忆插件
 - `memory_injection`：开关请求前记忆注入
 - `inject_memories_topk` / `inject_history_topk`：注入条数
-- `auto_summarize` + `summarize_interval_minutes` + `min_new_messages`：自动总结节奏
+- `auto_summarize` + `summarize_interval_minutes` + `min_new_messages` + `summarize_grace_hours`：自动总结节奏（见下）
 - `auto_skill`：允许总结时自动提炼技能
 - `summary_prompt`：总结器提示词，可自定义输出协议
 
