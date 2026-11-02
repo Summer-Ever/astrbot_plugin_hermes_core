@@ -45,7 +45,23 @@ except ImportError:
     MessageChain = None
     Plain = None
 
-from .db import HermesDB
+# db 模块位于 ./modules/db.py。AstrBot 以 data.plugins.<name>.main 的形式加载插件，
+# 正常情况下相对导入即可；不同版本/安装方式的加载路径有差异，故逐级兜底。
+try:
+    from .modules.db import HermesDB
+except ImportError:
+    try:
+        from modules.db import HermesDB  # 插件目录本身在 sys.path 上时
+    except ImportError:  # 最后兜底：按文件路径直接加载，不污染 sys.path
+        import importlib.util as _ilu
+
+        _db_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "modules", "db.py"
+        )
+        _db_spec = _ilu.spec_from_file_location("astrbot_plugin_hermes_core_db", _db_file)
+        _db_mod = _ilu.module_from_spec(_db_spec)
+        _db_spec.loader.exec_module(_db_mod)
+        HermesDB = _db_mod.HermesDB
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -54,7 +70,7 @@ SYSTEM_MEMORY_HINT = (
 )
 
 
-@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.3.1")
+@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.3.2")
 class HermesCore(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -194,7 +210,7 @@ class HermesCore(Star):
     async def tool_search_memory(self, event: AstrMessageEvent, query: str) -> str:
         """按关键词检索长期记忆与历史对话。当需要回忆当前用户偏好、之前聊过的内容时调用。
         Args:
-            query: 检索关键词
+            query (string): 检索关键词
         """
         sc = self._scope_keys(event)
         mems = self.db.search_memories(
@@ -213,8 +229,8 @@ class HermesCore(Star):
                                kind: str = "fact") -> str:
         """把值得长期记住的信息保存为记忆（自动归属到当前发言用户）。用户偏好、重要事实、项目背景等都应保存。
         Args:
-            content: 记忆内容（简洁的一句话）
-            kind: 类型，fact/preference/profile/summary 之一
+            content (string): 记忆内容（简洁的一句话）
+            kind (string): 类型，fact/preference/profile/summary 之一
         """
         sc = self._scope_keys(event)
         mid = self.db.add_memory(kind or "fact", content, scope="user",
@@ -235,7 +251,7 @@ class HermesCore(Star):
     async def tool_read_skill(self, event: AstrMessageEvent, name: str) -> str:
         """读取指定技能的完整 Markdown 内容。执行该技能覆盖的任务前应先调用。
         Args:
-            name: 技能名称
+            name (string): 技能名称
         """
         sk = self.db.get_skill(name)
         return sk["content"] if sk else f"技能 {name} 不存在。"
@@ -245,9 +261,9 @@ class HermesCore(Star):
                               trigger: str, content: str) -> str:
         """把一个可复用的解决流程保存为技能（Markdown 步骤）。完成复杂任务后若流程可复用，调用此工具。
         Args:
-            name: 英文短名，如 deploy_blog
-            trigger: 什么场景下应该使用该技能
-            content: Markdown 格式的完整步骤
+            name (string): 英文短名，如 deploy_blog
+            trigger (string): 什么场景下应该使用该技能
+            content (string): Markdown 格式的完整步骤
         """
         name = re.sub(r"\s+", "_", name.strip())[:64]
         created = self.db.upsert_skill(name, trigger or "", content)
