@@ -54,7 +54,7 @@ SYSTEM_MEMORY_HINT = (
 )
 
 
-@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.2.0")
+@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.3.0")
 class HermesCore(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -79,9 +79,22 @@ class HermesCore(Star):
 
     # ============ 钩子：请求前注入记忆 ============
 
-    def _scope_keys(self, event: AstrMessageEvent) -> tuple[str, str]:
-        """返回 (owner_id, session_id)。owner_id 为发言人 ID，session_id 为会话（群）ID。"""
-        return str(event.get_sender_id() or ""), event.unified_msg_origin
+    def _scope_keys(self, event: AstrMessageEvent) -> dict:
+        """解析当前消息的作用域键。
+
+        注意：QQ 官方适配器中 sender_id 是 member_openid(群)/user_openid(私聊)，
+        并非 QQ 号；且 member_openid 按群维度不同、与 user_openid 不同命名空间。
+        因此 owner_id 会先过别名表，把同一人的多个 openid 归一。
+        """
+        raw_id = str(event.get_sender_id() or "")
+        platform = event.get_platform_name() or ""
+        return {
+            "raw_id": raw_id,
+            "owner_id": self.db.resolve_owner(raw_id, platform),
+            "sid": event.unified_msg_origin,
+            "platform": platform,
+            "group_id": str(event.get_group_id() or ""),
+        }
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -106,7 +119,8 @@ class HermesCore(Star):
 
     def _build_context_block(self, event: AstrMessageEvent, query: str) -> str:
         lines: list[str] = []
-        owner_id, sid = self._scope_keys(event)
+        sc = self._scope_keys(event)
+        owner_id, sid = sc["owner_id"], sc["sid"]
         mem_k = int(self._get_cfg("inject_memories_topk", 5))
         hist_k = int(self._get_cfg("inject_history_topk", 3))
         scope = str(self._get_cfg("memory_scope", "user"))
@@ -114,9 +128,13 @@ class HermesCore(Star):
 
         # 记忆：user 模式按 用户>群>全局 三级召回；group 模式按 群>全局；global 模式全量
         if scope == "user":
-            memories = self.db.search_memories(query, limit=mem_k, owner_id=owner_id, session_id=sid)
+            memories = self.db.search_memories(
+                query, limit=mem_k, owner_id=owner_id,
+                session_id=sid, platform=sc["platform"], group_id=sc["group_id"] or None)
         elif scope == "group":
-            memories = self.db.search_memories(query, limit=mem_k, session_id=sid)
+            memories = self.db.search_memories(
+                query, limit=mem_k, session_id=sid,
+                platform=sc["platform"], group_id=sc["group_id"] or None)
         else:
             memories = self.db.search_memories(query, limit=mem_k)
         if memories:
@@ -124,7 +142,7 @@ class HermesCore(Star):
             lines += [f"- ({m['kind']}) {m['content']}" for m in memories]
 
         # 历史：默认只看本人在本群的历史，避免混入其他群友的对话
-        sender_filter = owner_id if (scope == "user" and per_user_hist) else None
+        sender_filter = sc["raw_id"] if (scope == "user" and per_user_hist) else None
         history = self.db.search_messages(query, limit=hist_k, session_id=sid, sender_id=sender_filter)
         if history:
             lines.append("[相关历史对话]")
@@ -156,6 +174,7 @@ class HermesCore(Star):
                     platform=event.get_platform_name() or "",
                     sender_id=str(event.get_sender_id() or ""),
                     sender_name=event.get_sender_name() or "",
+                    group_id=str(event.get_group_id() or ""),
                 )
             reply = ""
             try:
@@ -163,7 +182,9 @@ class HermesCore(Star):
             except Exception:
                 pass
             if reply:
-                self.db.add_message(sid, "assistant", reply)
+                self.db.add_message(sid, "assistant", reply,
+                                    platform=event.get_platform_name() or "",
+                                    group_id=str(event.get_group_id() or ""))
         except Exception:
             logger.error(f"[hermes_core] 落库失败:\n{traceback.format_exc()}")
 
@@ -175,9 +196,11 @@ class HermesCore(Star):
         Args:
             query: 检索关键词
         """
-        owner_id, sid = self._scope_keys(event)
-        mems = self.db.search_memories(query, limit=5, owner_id=owner_id, session_id=sid)
-        msgs = self.db.search_messages(query, limit=5, session_id=sid, sender_id=owner_id)
+        sc = self._scope_keys(event)
+        mems = self.db.search_memories(
+            query, limit=5, owner_id=sc["owner_id"], session_id=sc["sid"],
+            platform=sc["platform"], group_id=sc["group_id"] or None)
+        msgs = self.db.search_messages(query, limit=5, session_id=sc["sid"], sender_id=sc["raw_id"])
         out = []
         if mems:
             out.append("[记忆] " + " | ".join(f"{m['content']}" for m in mems))
@@ -193,9 +216,11 @@ class HermesCore(Star):
             content: 记忆内容（简洁的一句话）
             kind: 类型，fact/preference/profile/summary 之一
         """
-        owner_id, sid = self._scope_keys(event)
+        sc = self._scope_keys(event)
         mid = self.db.add_memory(kind or "fact", content, scope="user",
-                                 source="llm_tool", owner_id=owner_id, session_id=sid)
+                                 source="llm_tool", owner_id=sc["owner_id"],
+                                 session_id=sc["sid"], platform=sc["platform"],
+                                 group_id=sc["group_id"])
         return f"已保存记忆 #{mid}。"
 
     @filter.llm_tool(name="list_skills")
@@ -256,8 +281,11 @@ class HermesCore(Star):
         for m in msgs:
             by_session.setdefault(m["session_id"], []).append(m)
         known_ids: set[str] = set()
+        session_meta: dict[str, tuple[str, str]] = {}  # sid -> (platform, group_id)
         transcript_parts = []
         for sid, group in by_session.items():
+            first = group[0]
+            session_meta[sid] = (first.get("platform") or "", first.get("group_id") or "")
             lines = []
             for g in group:
                 if g["role"] == "user":
@@ -294,10 +322,14 @@ class HermesCore(Star):
                     owner = ""  # 归属不明 → 降级为群公共记忆
                 sid_of_item = next((s for s, grp in by_session.items()
                                     if any(str(g["sender_id"] or "") == owner for g in grp)), "") if owner else ""
+                platform, gid = session_meta.get(sid_of_item, ("", ""))
+                if owner:
+                    owner = self.db.resolve_owner(owner, platform)
                 self.db.add_memory(
                     str(item.get("kind", "fact")), str(item["content"]),
                     scope="user" if owner else "group", source="auto_summary",
                     owner_id=owner, session_id=sid_of_item,
+                    platform=platform, group_id=gid,
                 )
                 made_mem += 1
         self.db.set_meta("last_summarized_id", str(msgs[-1]["id"]))
@@ -357,9 +389,11 @@ class HermesCore(Star):
         if not content.strip():
             yield event.plain_result("用法：/hermes 记住 <内容>")
             return
-        owner_id, sid = self._scope_keys(event)
+        sc = self._scope_keys(event)
         mid = self.db.add_memory("fact", content.strip(), scope="user",
-                                 source="manual", owner_id=owner_id, session_id=sid)
+                                 source="manual", owner_id=sc["owner_id"],
+                                 session_id=sc["sid"], platform=sc["platform"],
+                                 group_id=sc["group_id"])
         yield event.plain_result(f"已记住（#{mid}）：{content.strip()}")
 
     @hermes.command("忘记")
@@ -457,6 +491,51 @@ class HermesCore(Star):
             )
         except Exception:
             pass
+
+    # ============ 身份归一（解决 openid 碎片化）============
+
+    @hermes.command("我的ID")
+    async def hermes_my_id(self, event: AstrMessageEvent):
+        sc = self._scope_keys(event)
+        hint = ""
+        if sc["platform"].startswith("qq_official"):
+            hint = ("\n提示：QQ 官方适配器用的是 openid（群内 member_openid / 私聊 user_openid），"
+                    "不是 QQ 号。同一个人在不同群、或群聊与私聊之间 openid 不同，"
+                    "记忆会分散——用 /hermes 绑定 <另一个openid> 可合并。")
+        yield event.plain_result(
+            f"[当前身份]\n"
+            f"平台: {sc['platform']}\n"
+            f"发送者ID(原始): {sc['raw_id']}\n"
+            f"记忆归属ID: {sc['owner_id']}\n"
+            f"群ID: {sc['group_id'] or '无（私聊）'}\n"
+            f"会话(umo): {sc['sid']}{hint}"
+        )
+
+    @hermes.command("绑定")
+    async def hermes_bind(self, event: AstrMessageEvent, alias_id: str = ""):
+        """把另一个 ID（如其他群的 member_openid）绑定到当前身份，记忆即可互通。"""
+        alias_id = alias_id.strip()
+        if not alias_id:
+            yield event.plain_result("用法：/hermes 绑定 <另一个ID>\n先用对方身份执行 /hermes 我的ID 拿到 ID。")
+            return
+        sc = self._scope_keys(event)
+        created = self.db.add_alias(alias_id, sc["owner_id"], sc["platform"])
+        yield event.plain_result(
+            f"已{'绑定' if created else '更新'}：{alias_id} → {sc['owner_id']}，之后的记忆将合并。")
+
+    @hermes.command("身份")
+    async def hermes_identities(self, event: AstrMessageEvent):
+        aliases = self.db.list_aliases()
+        if not aliases:
+            yield event.plain_result("暂无身份绑定。用 /hermes 绑定 <ID> 把多个 openid 合并成一个人。")
+            return
+        text = "\n".join(f"- {a['alias_id']} → {a['canonical_id']}" for a in aliases[:30])
+        yield event.plain_result("[身份绑定]\n" + text)
+
+    @hermes.command("解绑")
+    async def hermes_unbind(self, event: AstrMessageEvent, alias_id: str = ""):
+        ok = self.db.delete_alias(alias_id.strip()) if alias_id.strip() else False
+        yield event.plain_result(f"已解绑 {alias_id}" if ok else "解绑失败：没找到该绑定。")
 
     async def terminate(self):
         if self._bg_task:

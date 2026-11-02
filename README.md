@@ -29,6 +29,26 @@ Hermes 本身是单用户私人助理，没有多用户概念；本插件为此�
 - 技能库全机器人共享——技能是"能力"而非隐私，这也是 Hermes 的设计
 - 总结器会收到带 `[用户 ID(昵称)]` 标记的对话，产出记忆时自动归属到对应人；归属不明的降级为群公共记忆
 
+### 关于 ID：QQ 官方机器人没有"QQ 号"
+
+这点必须说清楚，否则会踩坑。AstrBot 的 QQ 官方适配器（`qq_official`）里：
+
+| 场景 | `get_sender_id()` | `get_group_id()` | 会话 umo 第三段 |
+|---|---|---|---|
+| 群消息 | `member_openid`（群内成员 openid） | `group_openid` | `group_openid` |
+| C2C 私聊 | `user_openid` | 空 | `user_openid` |
+
+- `member_openid` **按群维度不同**：同一个人在群 A 和群 B 是两套 ID
+- `member_openid` ≠ `user_openid`：同一个人在群聊和私聊是两套 ID
+- openid **与机器人 AppID 绑定**：换 bot 后全部 ID 变化
+
+因此本插件做了两件事：
+
+1. **群公共记忆的键用 `(platform, group_openid)`，不用 umo** —— 所以开关 `unique_session`（会改写 umo 为 `sender_group`）不会让既有群记忆失联
+2. **身份别名表**：`/hermes 绑定 <另一个ID>` 可把一个人的多个 openid 归一，跨群/跨私聊的记忆合并
+
+> 用 `NapCat/aiocqhttp` 系列适配器时 `sender_id` 就是真实 QQ 号，上面的碎片化问题不存在。
+
 ## 接管 AstrBot 的记忆体系
 
 本插件在 `on_llm_request` / `on_llm_response` 两个官方钩子上完成"注入 + 落库"，因此可以把 AstrBot 的记忆职责完全收拢过来：
@@ -61,6 +81,9 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 - `/hermes 技能` — 列出技能；`/hermes 技能 <名称>` 查看全文
 - `/hermes 导出` — 导出 MEMORY.md 到插件数据目录
 - `/hermes 导入历史` — 导入 AstrBot 原生对话历史（接管记忆时用）
+- `/hermes 我的ID` — 查看当前平台的 sender_id / 归属 ID / 群 ID / umo（排查隔离问题）
+- `/hermes 绑定 <ID>` — 把一个别名 ID 归并到当前身份（跨群、跨私聊合并记忆）
+- `/hermes 身份` — 查看所有身份绑定；`/hermes 解绑 <ID>` 取消绑定
 
 ## 配置（WebUI 可视化）
 

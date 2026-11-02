@@ -76,11 +76,30 @@ class HermesDB:
         for ddl in (
             "ALTER TABLE memories ADD COLUMN owner_id TEXT DEFAULT ''",
             "ALTER TABLE memories ADD COLUMN session_id TEXT DEFAULT ''",
+            # v0.3.0 迁移：用平台+群/用户原生 ID 作稳定键，避免 umo 随 unique_session 漂移
+            "ALTER TABLE memories ADD COLUMN platform TEXT DEFAULT ''",
+            "ALTER TABLE memories ADD COLUMN group_id TEXT DEFAULT ''",
         ):
             try:
                 c.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # v0.3.0 迁移：消息也记录群原生 ID，供总结器写入群级记忆时定位
+        try:
+            c.execute("ALTER TABLE messages ADD COLUMN group_id TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        # v0.3.0：身份别名表（把同一人的多个 openid/sid 合并成一个主体）
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS identities(
+                alias_id TEXT PRIMARY KEY,
+                canonical_id TEXT NOT NULL,
+                platform TEXT DEFAULT '',
+                ts REAL NOT NULL
+            );
+            """
+        )
         c.commit()
         return fts_ok
 
@@ -91,12 +110,14 @@ class HermesDB:
     # ---------- messages ----------
 
     def add_message(self, session_id: str, role: str, content: str,
-                    platform: str = "", sender_id: str = "", sender_name: str = "") -> int:
+                    platform: str = "", sender_id: str = "", sender_name: str = "",
+                    group_id: str = "") -> int:
         with self._lock:
             cur = self.conn.execute(
-                "INSERT INTO messages(ts, session_id, platform, sender_id, sender_name, role, content)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (time.time(), session_id, platform, sender_id, sender_name, role, content),
+                "INSERT INTO messages(ts, session_id, platform, sender_id, sender_name,"
+                " role, content, group_id) VALUES(?,?,?,?,?,?,?,?)",
+                (time.time(), session_id, platform, sender_id, sender_name, role,
+                 content, group_id or ""),
             )
             if self._fts_enabled:
                 self.conn.execute(
@@ -164,56 +185,124 @@ class HermesDB:
     # ---------- memories ----------
 
     def add_memory(self, kind: str, content: str, scope: str = "global",
-                   source: str = "", owner_id: str = "", session_id: str = "") -> int:
+                   source: str = "", owner_id: str = "", session_id: str = "",
+                   platform: str = "", group_id: str = "") -> int:
         with self._lock:
             cur = self.conn.execute(
-                "INSERT INTO memories(ts, kind, scope, content, source, owner_id, session_id)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (time.time(), kind, scope, content, source, owner_id or "", session_id or ""),
+                "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
+                " session_id, platform, group_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (time.time(), kind, scope, content, source, owner_id or "",
+                 session_id or "", platform or "", group_id or ""),
             )
             self.conn.commit()
             return cur.lastrowid
 
     def search_memories(self, query: str, limit: int = 5,
                         owner_id: str | None = None,
-                        session_id: str | None = None) -> list[dict]:
-        """记忆检索，支持三级作用域隔离（优先级：用户 > 会话/群 > 全局）。
+                        session_id: str | None = None,
+                        platform: str | None = None,
+                        group_id: str | None = None) -> list[dict]:
+        """记忆检索，支持三级作用域隔离（优先级：用户 > 群 > 全局）。
 
-        - owner_id + session_id 都给出：召回本人记忆、本群公共记忆、全局记忆
-        - 仅 session_id：召回本群公共记忆 + 全局记忆
-        - 仅 owner_id：召回本人记忆 + 全局记忆
-        - 都不传：全局检索（旧行为）
+        群公共记忆的键用 (platform, group_id) 而不是 session_id(umo)，
+        因此开启/关闭 unique_session 不会让既有群记忆失联；session_id 仅作老数据兼容。
         """
-        conds: list[str] = []
+        tiers: list[str] = []
         args: list = []
-        if owner_id is not None and session_id is not None:
-            conds.append("(owner_id = ? OR (session_id = ? AND owner_id = '')"
-                         " OR (owner_id = '' AND session_id = ''))")
-            args += [owner_id, session_id]
-            order = ("ORDER BY CASE WHEN owner_id = ? THEN 0"
-                     " WHEN session_id = ? THEN 1 ELSE 2 END, id DESC")
-            order_args = [owner_id, session_id]
-        elif session_id is not None:
-            conds.append("(session_id = ? OR (owner_id = '' AND session_id = ''))")
-            args.append(session_id)
-            order = "ORDER BY id DESC"
-            order_args = []
-        elif owner_id is not None:
-            conds.append("(owner_id = ? OR (owner_id = '' AND session_id = ''))")
+        order = ""
+        order_args: list = []
+        group_key_sql = ""
+        group_key_args: list = []
+        if group_id is not None:
+            group_key_sql = "((group_id = ? AND platform = ?)"
+            group_key_args = [group_id, platform or ""]
+            if session_id is not None:
+                group_key_sql += " OR (session_id = ? AND group_id = ''))"
+                group_key_args.append(session_id)
+            else:
+                group_key_sql += ")"
+        global_sql = "owner_id = '' AND session_id = '' AND group_id = ''"
+
+        if owner_id is not None and group_id is not None:
+            tiers.append("owner_id = ?")
             args.append(owner_id)
+            if group_key_sql:
+                tiers.append(group_key_sql)
+                args += group_key_args
+            tiers.append(global_sql)
+            order = ("ORDER BY CASE WHEN owner_id = ? THEN 0"
+                     " WHEN owner_id = '' AND group_id != '' THEN 1 ELSE 2 END, id DESC")
+            order_args = [owner_id]
+        elif owner_id is not None:
+            tiers.append("owner_id = ?")
+            args.append(owner_id)
+            tiers.append(global_sql)
+            order = "ORDER BY CASE WHEN owner_id = ? THEN 0 ELSE 1 END, id DESC"
+            order_args = [owner_id]
+        elif group_id is not None:
+            if group_key_sql:
+                tiers.append(group_key_sql)
+                args += group_key_args
+            tiers.append(global_sql)
             order = "ORDER BY id DESC"
-            order_args = []
         else:
             order = "ORDER BY id DESC"
-            order_args = []
+
         like = f"%{query.strip()[:100]}%"
         rows = self.conn.execute(
             f"SELECT * FROM memories WHERE content LIKE ?"
-            + (" AND " + " AND ".join(conds) if conds else "")
+            + (" AND (" + " OR ".join(tiers) + ")" if tiers else "")
             + f" {order} LIMIT ?",
             (like, *args, *order_args, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- 身份别名 ----------
+
+    def add_alias(self, alias_id: str, canonical_id: str, platform: str = "") -> bool:
+        """把 alias 指向 canonical，返回是否新建。"""
+        with self._lock:
+            exist = self.conn.execute(
+                "SELECT canonical_id FROM identities WHERE alias_id = ?", (alias_id,)
+            ).fetchone()
+            if exist:
+                self.conn.execute(
+                    "UPDATE identities SET canonical_id = ?, platform = ? WHERE alias_id = ?",
+                    (canonical_id, platform, alias_id),
+                )
+                created = False
+            else:
+                self.conn.execute(
+                    "INSERT INTO identities(alias_id, canonical_id, platform, ts) VALUES(?,?,?,?)",
+                    (alias_id, canonical_id, platform, time.time()),
+                )
+                created = True
+            self.conn.commit()
+            return created
+
+    def resolve_owner(self, raw_id: str, platform: str = "") -> str:
+        """沿别名链解析出规范 ID（最多 5 跳，防环）。未登记则原样返回。"""
+        cur = raw_id
+        for _ in range(5):
+            row = self.conn.execute(
+                "SELECT canonical_id FROM identities WHERE alias_id = ?", (cur,)
+            ).fetchone()
+            if not row or not row["canonical_id"] or row["canonical_id"] == cur:
+                break
+            cur = row["canonical_id"]
+        return cur
+
+    def list_aliases(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM identities ORDER BY ts DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_alias(self, alias_id: str) -> bool:
+        with self._lock:
+            cur = self.conn.execute("DELETE FROM identities WHERE alias_id = ?", (alias_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
 
     def all_memories(self, limit: int = 200) -> list[dict]:
         rows = self.conn.execute(
