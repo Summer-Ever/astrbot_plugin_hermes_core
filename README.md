@@ -13,7 +13,26 @@
 | 长期记忆注入（MEMORY.md/USER.md） | `on_llm_request` 钩子按当前消息检索 top-k 记忆 + 相关历史，经 `extra_user_content_parts` 临时注入（保护 prompt 缓存） |
 | 周期性记忆 nudge / LLM 总结 | 后台循环调用你已配置的 Provider，把新对话压缩为记忆条目（JSON 协议） |
 | 技能自动生成（Markdown Skill） | 总结时一并提炼技能；模型也可通过 `save_skill` 工具主动沉淀，同名自动更新 |
-| 工具化记忆检索 | 5 个 llm_tool：`search_memory` / `save_memory` / `list_skills` / `read_skill` / `save_skill` |
+| 工具化记忆检索 | 6 个 llm_tool：`search_memory` / `save_memory` / `list_skills` / `read_skill` / `save_skill` / `render_mermaid` |
+
+## Mermaid 图表渲染（本地，无需外网渲染服务）
+
+直接在对话里让 bot"画个流程图/时序图/架构图"，模型会调用 `render_mermaid`
+工具把 mermaid 源码在**本机渲染成 PNG 并发到聊天**。也可用命令：
+
+```
+/hermes 图 flowchart TD\n A[开始] --> B[结束]
+```
+
+实现方式与在线服务（mermaid.ink / kroki）完全不同——那些服务在墙内经常
+不可达，而且 bot 容易在不可用服务上反复重试浪费时间。本插件的做法：
+
+1. 首次使用时从 jsdelivr / npmmirror 缓存一份 `mermaid.min.js`（约 3.5MB）
+2. 通过 `npm` 安装纯 JS 的 `puppeteer-core`（不下载浏览器，约 3MB）
+3. 调用**系统已安装的 Chrome 或 Edge** 无头模式截图
+
+依赖：Node.js（渲染引擎）+ Chrome/Edge（截图，Windows 10/11 自带 Edge）。
+首次渲染约 10 秒（下载依赖），之后约 1~2 秒。
 | 定时任务 | 复用插件后台 asyncio 循环（默认 30 分钟检查一次，可配置） |
 | （本插件扩展）多用户隔离 | 记忆按 `用户 > 群 > 全局` 三级作用域存储与召回，群聊中不同群友互不污染 |
 | （本插件扩展）接管 AstrBot 记忆 | 原生对话历史一键导入 + 内置记忆/其他记忆插件冲突检测 |

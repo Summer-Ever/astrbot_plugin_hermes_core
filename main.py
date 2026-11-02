@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -64,14 +65,38 @@ except ImportError:
         _db_spec.loader.exec_module(_db_mod)
         HermesDB = _db_mod.HermesDB
 
+# 渲染模块与 db 同层，复用同样的三级兜底
+try:
+    from .modules.render import RenderError, render_mermaid
+except ImportError:
+    try:
+        from modules.render import RenderError, render_mermaid
+    except ImportError:
+        import importlib.util as _ilu2
+
+        _rd_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "modules", "render.py"
+        )
+        _rd_spec = _ilu2.spec_from_file_location("astrbot_plugin_hermes_core_render", _rd_file)
+        _rd_mod = _ilu2.module_from_spec(_rd_spec)
+        _rd_spec.loader.exec_module(_rd_mod)
+        RenderError = _rd_mod.RenderError
+        render_mermaid = _rd_mod.render_mermaid
+
+try:
+    from astrbot.api.message_components import Image
+except ImportError:
+    Image = None
+
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
-    "list_skills(查看已学会的技能)、read_skill(读取技能全文)、save_skill(把可复用流程存为技能)。"
+    "list_skills(查看已学会的技能)、read_skill(读取技能全文)、save_skill(把可复用流程存为技能)、"
+    "render_mermaid(把 mermaid 图表渲染成 PNG 图片发到聊天)。"
     "遇到值得长期记住的信息请主动 save_memory；完成复杂流程后可用 save_skill 沉淀方法。"
 )
 
 
-@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.4.0")
+@register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", "0.5.0")
 class HermesCore(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -288,6 +313,35 @@ class HermesCore(Star):
         logger.info(f"[hermes_core] 技能 {'新建' if created else '更新'}: {name}")
         return f"技能 {name} 已{'保存' if created else '更新'}。"
 
+    @filter.llm_tool(name="render_mermaid")
+    async def tool_render_mermaid(self, event: AstrMessageEvent, code: str) -> str:
+        """把 mermaid 图表源码本地渲染为 PNG 并直接发送到当前聊天。当用户想要图、流程图、时序图、架构图等可视化内容时调用；不要使用 mermaid.ink 等外部渲染服务。
+        Args:
+            code (string): 完整的 mermaid 图表源码，第一行是图表类型声明，例如 "flowchart TD\\nA[开始] --> B[结束]"
+        """
+        if Image is None:
+            return "当前 AstrBot 版本缺少图片组件，无法发图。"
+        out = os.path.join(
+            _default_data_dir(), "renders",
+            f"m_{hashlib.md5(code.encode()).hexdigest()[:12]}.png",
+        )
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        try:
+            await render_mermaid(code, out, _default_data_dir())
+        except RenderError as e:
+            return f"渲染失败：{e}"
+        except Exception:
+            return f"渲染异常：{traceback.format_exc(limit=2)}"
+        if MessageChain is not None:
+            try:
+                await self.context.send_message(
+                    event.unified_msg_origin, MessageChain([Image.fromFileSystem(out)])
+                )
+                return "图片已发送。"
+            except Exception:
+                return f"渲染成功但自动发送失败，请改用 /hermes 图 命令。文件位于：{out}"
+        return f"渲染成功，文件位于：{out}"
+
     # ============ 后台总结循环（Hermes nudge）============
 
     async def _bg_loop(self):
@@ -499,6 +553,34 @@ class HermesCore(Star):
         with open(path, "w", encoding="utf-8") as f:
             f.write(md)
         yield event.plain_result(f"已导出到插件数据目录 MEMORY.md（{len(md)} 字符）。")
+
+    @hermes.command("图")
+    async def hermes_graph(self, event: AstrMessageEvent, *, code: str = ""):
+        """/hermes 图 <mermaid 源码> —— 本地渲染并发图。也可直接让模型调 render_mermaid 工具。"""
+        if not code.strip():
+            yield event.plain_result(
+                "用法：/hermes 图 <mermaid源码>\n"
+                "示例：/hermes 图 flowchart TD\\n A[开始] --> B[结束]\n"
+                "更方便的方式：直接在对话里让我\"画个流程图\"，我会自动调用渲染工具。"
+            )
+            return
+        if Image is None:
+            yield event.plain_result("当前 AstrBot 版本缺少图片组件，无法发图。")
+            return
+        code = code.replace("\\n", "\n")
+        out = os.path.join(
+            _default_data_dir(), "renders",
+            f"m_{hashlib.md5(code.encode()).hexdigest()[:12]}.png",
+        )
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        yield event.plain_result("正在本地渲染图表……")
+        try:
+            await render_mermaid(code, out, _default_data_dir())
+            yield event.chain([Image.fromFileSystem(out)])
+        except RenderError as e:
+            yield event.plain_result(f"渲染失败：{e}")
+        except Exception:
+            yield event.plain_result(f"渲染异常：{traceback.format_exc(limit=2)}")
 
     # ============ 接管系统级记忆 ============
 
