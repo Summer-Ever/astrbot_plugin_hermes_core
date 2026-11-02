@@ -156,7 +156,8 @@ python hot_reload.py --pull        # 拉代码 + 重载 + 核对是否真的生�
 
 1. `git pull --ff-only`（`--pull` 时）
 2. 用 `cmd_config.json` 里的 `dashboard.jwt_secret` 现签一个 5 分钟令牌
-3. `POST /api/v1/plugins/<插件名>/reload`（WebUI 的重载按钮调的是同一个服务）
+3. `POST /api/v1/plugins/reload`（body `{"plugin_id": "<插件名>"}`，WebUI 的重载按钮调的是同一个服务；
+   全量重载走 legacy 的 `POST /api/plugin/reload`）
 4. **核对**：读插件启动时写的 `build_stamp.json` 里的 `code_hash`，与磁盘上代码实时算出的哈希比对，
    输出「✅ 已生效」或「❌ 未生效」
 
@@ -168,6 +169,18 @@ python hot_reload.py --pull        # 拉代码 + 重载 + 核对是否真的生�
 
 注意：**改的是 `data/plugins/` 下那份代码**。如果你在别处（比如另一个 git clone）改，
 得先把改动同步过去——脚本的 `--pull` 只处理 git 远端同步的情况。
+
+### 更省事的办法：在聊天里重载
+
+装 [`astrbot_plugin_hot_reload`](https://github.com/Summer-Ever/astrbot_plugin_hot_reload) 后，
+不用开电脑，直接在 QQ 里发：
+
+```
+/reload hermes          # 或直接对机器人说「重载 hermes 插件」
+/reload all             # 重载全部插件
+```
+
+它是独立插件，hermes_core 自己加载失败时它仍然可用，正好用来把坏掉的插件拉回来。
 
 ## 配置（WebUI 可视化）
 

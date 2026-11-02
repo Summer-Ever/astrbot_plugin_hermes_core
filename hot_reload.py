@@ -56,8 +56,9 @@ def make_token(secret: str, ttl: int = 300) -> str:
     )
 
 
-def call(url: str, token: str, path: str, method: str = "POST") -> tuple[int, str]:
-    data = b"{}" if method == "POST" else None
+def call(url: str, token: str, path: str, method: str = "POST",
+         body: dict | None = None) -> tuple[int, str]:
+    data = json.dumps(body if body is not None else {}).encode() if method == "POST" else None
     req = urllib.request.Request(
         url + path, method=method, data=data,
         headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
@@ -108,10 +109,21 @@ def main() -> int:
     url = args.url or f"http://127.0.0.1:{db.get('port', 6185)}"
     token = make_token(db["jwt_secret"])
 
-    path = "/api/v1/plugins/reload" if args.all else f"/api/v1/plugins/{name}/reload"
+    if args.all:
+        # 新版 /api/v1/plugins/reload 要求 plugin_id 必填，全量只能走 legacy 接口
+        path = "/api/plugin/reload"
+        body = {"name": None}
+    else:
+        path = "/api/v1/plugins/reload"
+        body = {"plugin_id": name}
     print(f"[2/3] POST {url}{path}")
-    code, body = call(url, token, path)
-    print(f"      HTTP {code} {body[:200]}")
+    code, resp = call(url, token, path, body=body)
+    if code in (404, 405, 422) and not args.all:
+        # 老版本 AstrBot 只认 /api/v1/plugins/<name>/reload
+        path = f"/api/v1/plugins/{name}/reload"
+        print(f"      回退 {path}")
+        code, resp = call(url, token, path)
+    print(f"      HTTP {code} {resp[:200]}")
     if code != 200:
         print("重载失败。常见原因：插件名不对（用 --name）、服务未启动、端口不对（用 --url）")
         return 1
