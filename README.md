@@ -140,6 +140,35 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 
 真正会让 ID 变化、导致记忆变成孤儿的情况只有三种：换机器人 AppID（openid 命名空间随 bot 变化）、换适配器（`qq_official` ↔ `aiocqhttp/NapCat`，后者返回真实 QQ 号）、用户换号。这三种都无法自动迁移，需要重新建立记忆或做数据映射。
 
+## 开发：改完代码怎么生效（热重载，不用重启）
+
+AstrBot **没有文件监听**——把新代码放到 `data/plugins/` 下不会自动生效，
+但**也不需要重启整个后端**，调一次重载接口即可：
+
+```bash
+# 在插件目录（data/plugins/astrbot_plugin_hermes_core）里执行
+python hot_reload.py --pull        # 拉代码 + 重载 + 核对是否真的生效
+
+# Windows 直接双击 hot_reload.bat 即可（自动用 AstrBot 自带 python）
+```
+
+脚本做的事：
+
+1. `git pull --ff-only`（`--pull` 时）
+2. 用 `cmd_config.json` 里的 `dashboard.jwt_secret` 现签一个 5 分钟令牌
+3. `POST /api/v1/plugins/<插件名>/reload`（WebUI 的重载按钮调的是同一个服务）
+4. **核对**：读插件启动时写的 `build_stamp.json` 里的 `code_hash`，与磁盘上代码实时算出的哈希比对，
+   输出「✅ 已生效」或「❌ 未生效」
+
+> 为什么第 4 步必要：接口返回 200 只代表"重载流程跑完了"，不代表你改的代码真的被加载。
+> 有了构建戳，`/hermes 状态` 也会显示 `版本: v0.5.1 (code 6b17dc0b56)`，一眼能看出跑的是哪份代码。
+
+常用参数：`--name 插件名`（目录名与插件名不同时）、`--all`（重载全部插件，慢）、
+`--url http://127.0.0.1:6185`、`--data C:\Users\你\.astrbot`。
+
+注意：**改的是 `data/plugins/` 下那份代码**。如果你在别处（比如另一个 git clone）改，
+得先把改动同步过去——脚本的 `--pull` 只处理 git 远端同步的情况。
+
 ## 配置（WebUI 可视化）
 
 - `memory_scope`：`user` / `group` / `global`，记忆隔离级别
