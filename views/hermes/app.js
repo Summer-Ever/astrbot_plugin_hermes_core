@@ -15,6 +15,7 @@
     overview: ["概览", "记忆、技能与自动整理的运行状态"],
     memories: ["记忆", "检索、编辑、合并；合并走软删除，可回溯"],
     skills: ["技能", "查看与维护模型沉淀下来的可复用流程"],
+    models: ["模型", "主模型 + 有序降级链：谁先上、失败怎么重试、什么时候换人"],
     settings: ["设置", "直接修改插件配置，与 AstrBot 配置页同一份文件"],
     tools: ["工具", "手动总结、整理、导出与身份绑定"],
   };
@@ -33,6 +34,7 @@
     mem: { q: "", scope: "", kind: "", merged: false, limit: 50, offset: 0, total: 0, rows: [], selected: new Set() },
     skills: { rows: [], filter: "", current: null, preview: false },
     settings: { groups: [], dirty: false },
+    models: { data: null, draft: null, dirty: false },
     aliases: [],
   };
 
@@ -208,6 +210,9 @@
     if (state.tab === "settings" && name !== "settings" && state.settings.dirty) {
       if (!window.confirm("设置还有未保存的修改，确定离开？")) return;
     }
+    if (state.tab === "models" && name !== "models" && state.models.dirty) {
+      if (!window.confirm("模型配置还有未保存的修改，确定离开？")) return;
+    }
     state.tab = name;
     $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
     $$(".tab-panel").forEach((p) => p.classList.toggle("active", p.id === `tab-${name}`));
@@ -217,6 +222,7 @@
     if (name === "overview") loadOverview();
     if (name === "memories") loadMemories();
     if (name === "skills") loadSkills();
+    if (name === "models") loadModels();
     if (name === "settings") loadSettings();
     if (name === "tools") { loadAliases(); }
   }
@@ -267,6 +273,13 @@
         : '<span class="chip warn">已关闭</span>'],
       ["待总结", `${fmtNum(sm.pending_sessions)} 个会话 / ${fmtNum(sm.pending_messages)} 条消息`],
       ["身份别名", `${fmtNum(d.aliases)} 条`],
+      ["总结模型", (() => {
+        const m = d.models || {};
+        if (!m.primary) return '<span class="chip warn">未配置</span>';
+        const extra = (m.chain || []).length - 1;
+        return `${esc(m.primary)}${m.follow_current ? ' <span class="faint">（跟随对话）</span>' : ""}`
+          + (extra > 0 ? ` <span class="faint">· ${extra} 个降级</span>` : "");
+      })()],
       ["代码校验", `<span class="mono faint">${esc(d.code_hash || "—")}</span>`],
     ].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
 
@@ -725,6 +738,276 @@
     }
   }
 
+  /* ---------------- 模型 ---------------- */
+
+  const POLICY_FIELDS = [
+    ["llm_max_retries", "每模型重试次数", 0, 9, 1],
+    ["llm_total_attempts", "整链最多尝试", 1, 30, 1],
+    ["llm_timeout", "单次超时（秒）", 5, 600, 1],
+    ["llm_backoff", "退避基数（秒）", 0, 30, 0.5],
+    ["llm_cooldown_seconds", "失败冷却（秒）", 0, 3600, 10],
+    ["llm_max_prompt_chars", "单次最大字符", 2000, 200000, 1000],
+  ];
+
+  const RETRY_KINDS = [
+    ["timeout", "超时"], ["conn", "连接失败"], ["rate", "限流/额度"],
+    ["server", "服务端错误"], ["empty", "空响应"],
+    ["auth", "鉴权失败"], ["ctx", "上下文超长"], ["other", "其他"],
+  ];
+
+  function kindLabel(kind) {
+    const hit = RETRY_KINDS.find(([k]) => k === kind);
+    if (hit) return hit[1];
+    const labels = (state.models.data && state.models.data.error_labels) || {};
+    return labels[kind] || kind || "失败";
+  }
+
+  function ctxText(tokens) {
+    if (!tokens) return "未知";
+    return tokens >= 1024 ? `${Math.round(tokens / 1024)}k` : String(tokens);
+  }
+
+  function fmtClock(ts) {
+    if (!ts) return "—";
+    const d = new Date(Number(ts) * 1000);
+    if (Number.isNaN(d.getTime())) return "—";
+    const p = (x) => String(x).padStart(2, "0");
+    const today = new Date();
+    return d.toDateString() === today.toDateString()
+      ? `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+      : `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  function markModelsDirty() {
+    state.models.dirty = true;
+    const el = $("#model-save-status");
+    if (el) el.textContent = "有未保存的修改";
+  }
+
+  async function loadModels() {
+    try {
+      const d = await apiGet("models");
+      state.models.data = d;
+      state.models.draft = {
+        primary: d.primary || "",
+        fallbacks: (d.fallbacks || []).slice(),
+        policy: Object.assign({ retry_on: [] }, d.policy || {}),
+      };
+      state.models.dirty = false;
+      renderModels();
+      const status = $("#model-save-status");
+      if (status) status.textContent = "修改后记得保存";
+    } catch (err) {
+      toast(`读取模型配置失败：${errMsg(err)}`, "err");
+    }
+  }
+
+  function modelById(id) {
+    const list = (state.models.data && state.models.data.providers) || [];
+    return list.find((p) => p.id === id) || null;
+  }
+
+  function renderModels() {
+    const d = state.models.data, draft = state.models.draft;
+    if (!d || !draft) return;
+    const list = d.providers || [];
+    const usable = list.filter((p) => p.loaded);
+    const cur = d.current_id || "";
+
+    // 主模型下拉：留空 = 跟随当前对话模型
+    const opts = [`<option value="">跟随当前对话模型${cur ? `（${esc(cur)}）` : "（未配置）"}</option>`];
+    list.forEach((p) => {
+      const label = `${p.id}${p.model && p.model !== p.id ? ` · ${p.model}` : ""}`;
+      const tail = [ctxText(p.context_tokens), p.loaded ? "" : "未启用", p.id === cur ? "当前对话" : ""]
+        .filter(Boolean).join(" · ");
+      opts.push(`<option value="${esc(p.id)}"${p.id === draft.primary ? " selected" : ""}>${esc(label)}（${esc(tail)}）</option>`);
+    });
+    if (draft.primary && !list.some((p) => p.id === draft.primary)) {
+      opts.push(`<option value="${esc(draft.primary)}" selected>${esc(draft.primary)}（不在当前列表）</option>`);
+    }
+    $("#model-primary").innerHTML = opts.join("");
+    $("#model-current-chip").textContent = cur ? `对话模型：${cur}` : "未配置对话模型";
+    $("#model-primary-hint").textContent = draft.primary
+      ? `总结优先用 ${draft.primary}；它失败时按下方降级链继续`
+      : "留空表示跟随 AstrBot 当前对话模型（对话模型一换，总结模型也跟着换）";
+
+    // 降级链
+    const chain = draft.fallbacks;
+    $("#model-chain").innerHTML = chain.length
+      ? chain.map((id, i) => {
+        const p = modelById(id);
+        const bits = [];
+        if (p) {
+          if (p.model && p.model !== id) bits.push(p.model);
+          bits.push(`上下文 ${ctxText(p.context_tokens)}`);
+          if (!p.loaded) bits.push('<span class="chip danger">未启用</span>');
+          if (p.cooling > 0) bits.push(`<span class="chip warn">冷却 ${p.cooling}s</span>`);
+          if (p.id === cur) bits.push("当前对话");
+        } else {
+          bits.push('<span class="chip danger">不存在</span>');
+        }
+        return `<div class="chain-item">
+          <span class="idx">${i + 1}</span>
+          <div class="chain-main">
+            <div class="mono">${esc(id)}</div>
+            <small>${bits.join(" · ")}</small>
+          </div>
+          <div class="chain-actions">
+            <button class="btn tiny ghost" data-chain-up="${i}" title="上移"${i === 0 ? " disabled" : ""}>↑</button>
+            <button class="btn tiny ghost" data-chain-down="${i}" title="下移"${i === chain.length - 1 ? " disabled" : ""}>↓</button>
+            <button class="btn tiny danger" data-chain-del="${i}" title="移除">×</button>
+          </div>
+        </div>`;
+      }).join("")
+      : '<div class="empty">还没有降级模型。主模型一挂，总结就整批失败。</div>';
+
+    const cand = usable.filter((p) => p.id !== draft.primary && !chain.includes(p.id));
+    $("#model-add-select").innerHTML = cand.length
+      ? cand.map((p) => `<option value="${esc(p.id)}">${esc(p.id)}${p.model && p.model !== p.id ? ` · ${esc(p.model)}` : ""}</option>`).join("")
+      : '<option value="">没有可添加的模型</option>';
+    $("#model-add").disabled = !cand.length;
+
+    const effective = [draft.primary || cur].concat(chain).filter(Boolean);
+    $("#model-chain-hint").textContent = effective.length
+      ? `实际顺序：${effective.join(" → ")}`
+      : "还没有任何可用模型";
+    if (effective.length > 1) {
+      $("#model-chain-hint").textContent += `（共 ${effective.length} 个）`;
+    }
+
+    // 容错策略
+    $("#model-policy").innerHTML = POLICY_FIELDS.map(([key, label, low, high, step]) => {
+      const val = draft.policy[key];
+      return `<label class="field" style="margin-bottom:0">
+        <span class="label">${esc(label)}</span>
+        <input type="number" data-policy="${key}" min="${low}" max="${high}" step="${step}"
+               value="${val == null ? "" : esc(val)}" />
+      </label>`;
+    }).join("");
+
+    const picked = new Set(draft.policy.retry_on || []);
+    $("#model-retry-kinds").innerHTML = RETRY_KINDS.map(([k, label]) => {
+      const on = picked.has(k);
+      const risky = k === "auth" || k === "ctx";
+      const cls = on ? (risky ? "chip warn" : "chip blue") : "chip";
+      const tip = risky ? "这类错误重试通常没用，建议只在排查时开启" : `重试 ${label} 类的失败`;
+      return `<button type="button" class="${cls}" data-retry="${k}" title="${esc(tip)}">${on ? "✓ " : ""}${esc(label)}</button>`;
+    }).join("");
+
+    // 可用模型
+    $("#model-tbody").innerHTML = list.length
+      ? list.map((p) => {
+        const inChain = draft.fallbacks.indexOf(p.id);
+        const chips = [];
+        if (p.is_current) chips.push('<span class="chip blue">当前对话</span>');
+        if (p.id === draft.primary) chips.push('<span class="chip ok">主模型</span>');
+        if (inChain >= 0) chips.push(`<span class="chip">降级 ${inChain + 1}</span>`);
+        if (!p.loaded) chips.push('<span class="chip danger">未启用</span>');
+        if (p.cooling > 0) chips.push(`<span class="chip warn">冷却 ${p.cooling}s</span>`);
+        if (!chips.length) chips.push('<span class="faint">备用</span>');
+        const st = p.stats || {};
+        const stat = st.calls
+          ? `${fmtNum(st.ok || 0)} 成功 / ${fmtNum(st.fail || 0)} 失败 · 均 ${fmtNum(st.avg_ms || 0)}ms`
+          : "还没用过";
+        return `<tr>
+          <td class="mono">${esc(p.id)}</td>
+          <td class="mono">${esc(p.model || "—")}</td>
+          <td>${esc(ctxText(p.context_tokens))}</td>
+          <td>${chips.join(" ")}</td>
+          <td class="faint" style="font-size:12px">${esc(stat)}${st.last_kind ? ` <span class="chip danger">最近 ${esc(kindLabel(st.last_kind))}</span>` : ""}</td>
+          <td><button class="btn tiny" data-model-test="${esc(p.id)}"${p.loaded ? "" : " disabled"}>测试</button></td>
+        </tr>`;
+      }).join("")
+      : '<tr><td colspan="6"><div class="empty">AstrBot 里还没有配置对话模型</div></td></tr>';
+
+    // 调用日志
+    const logs = d.logs || [];
+    $("#model-log-hint").textContent = logs.length ? `最近 ${logs.length} 条` : "暂无记录";
+    $("#model-log-tbody").innerHTML = logs.length
+      ? logs.map((l) => `<tr>
+          <td class="faint">${esc(fmtClock(l.ts))}</td>
+          <td>${esc(l.purpose)}</td>
+          <td class="mono" style="font-size:12px">${esc(l.provider)}</td>
+          <td>${l.attempt}</td>
+          <td>${fmtNum(l.ms)}ms</td>
+          <td>${l.ok ? '<span class="chip ok">成功</span>' : `<span class="chip danger">${esc(kindLabel(l.kind))}</span>`}</td>
+          <td class="faint" style="font-size:12px" title="${esc(l.error || "")}">${esc((l.error || "").slice(0, 90))}</td>
+        </tr>`).join("")
+      : '<tr><td colspan="7"><div class="empty">还没有调用记录。跑一次总结或点「测试」就会出现在这里。</div></td></tr>';
+  }
+
+  function renderTestResults(results) {
+    if (!results || !results.length) {
+      $("#model-test-results").innerHTML = '<div class="empty">没有返回结果</div>';
+      return;
+    }
+    $("#model-test-results").innerHTML = results.map((r) => `
+      <div class="test-item">
+        <div class="row-between">
+          <span class="mono">${esc(r.id)}</span>
+          <span class="row" style="gap:8px">
+            ${r.ok ? '<span class="chip ok">通过</span>' : `<span class="chip danger">${esc(r.label || kindLabel(r.kind))}</span>`}
+            <span class="faint">${fmtNum(r.ms)}ms</span>
+          </span>
+        </div>
+        ${r.ok
+          ? `<small class="faint">回复：${esc((r.reply || "").slice(0, 80))}</small>`
+          : `<small class="err-text">${esc((r.error || "").slice(0, 220))}</small>`}
+      </div>`).join("");
+  }
+
+  async function testModels(ids, btn) {
+    setBusy(btn, true, ids.length > 1 ? "逐个测试中" : "测试中");
+    try {
+      const d = await apiPost("models/test", { ids });
+      const results = d.results || [];
+      renderTestResults(results);
+      const ok = results.filter((r) => r.ok).length;
+      toast(`测试完成：${ok}/${results.length} 通过`, ok === results.length ? "ok" : "err");
+      // 有未保存修改时不要刷新，免得把用户正在编辑的链冲掉
+      if (!state.models.dirty) await loadModels();
+    } catch (err) {
+      toast(`测试失败：${errMsg(err)}`, "err");
+    } finally {
+      setBusy(btn, false);
+    }
+  }
+
+  function useAstrbotChain() {
+    const d = state.models.data;
+    const a = (d && d.astrbot) || {};
+    if (!a.primary && !(a.fallbacks || []).length) {
+      toast("AstrBot 对话配置里没有可用的模型信息", "err");
+      return;
+    }
+    const known = new Set((d.providers || []).filter((p) => p.loaded).map((p) => p.id));
+    const draft = state.models.draft;
+    draft.primary = known.has(a.primary) ? a.primary : "";
+    draft.fallbacks = (a.fallbacks || []).filter((id) => known.has(id) && id !== draft.primary);
+    markModelsDirty();
+    renderModels();
+    toast("已按 AstrBot 对话配置填入，记得保存");
+  }
+
+  async function saveModels(btn) {
+    const draft = state.models.draft;
+    setBusy(btn, true, "保存中");
+    try {
+      const r = await apiPost("models/save", {
+        primary: draft.primary,
+        fallbacks: draft.fallbacks,
+        policy: draft.policy,
+      });
+      state.models.dirty = false;
+      toast(`已保存：${(r.chain || []).join(" → ") || "无可用模型"}`);
+      await loadModels();
+    } catch (err) {
+      toast(`保存失败：${errMsg(err)}`, "err");
+    } finally {
+      setBusy(btn, false);
+    }
+  }
+
   /* ---------------- 工具 ---------------- */
 
   async function runAction(btn, outEl, fn, busyText) {
@@ -903,6 +1186,93 @@
     });
 
     // 设置
+    // 模型
+    $("#model-primary").addEventListener("change", (e) => {
+      state.models.draft.primary = e.target.value;
+      markModelsDirty();
+      renderModels();
+    });
+    $("#model-chain").addEventListener("click", (e) => {
+      const arr = state.models.draft.fallbacks;
+      const up = e.target.closest("[data-chain-up]");
+      const down = e.target.closest("[data-chain-down]");
+      const del = e.target.closest("[data-chain-del]");
+      if (up) {
+        const i = Number(up.dataset.chainUp);
+        if (i > 0) [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+      } else if (down) {
+        const i = Number(down.dataset.chainDown);
+        if (i < arr.length - 1) [arr[i + 1], arr[i]] = [arr[i], arr[i + 1]];
+      } else if (del) {
+        arr.splice(Number(del.dataset.chainDel), 1);
+      } else {
+        return;
+      }
+      markModelsDirty();
+      renderModels();
+    });
+    $("#model-add").addEventListener("click", () => {
+      const id = $("#model-add-select").value;
+      if (!id) return;
+      const arr = state.models.draft.fallbacks;
+      if (!arr.includes(id)) arr.push(id);
+      markModelsDirty();
+      renderModels();
+    });
+    $("#model-policy").addEventListener("input", (e) => {
+      const input = e.target.closest("[data-policy]");
+      if (!input) return;
+      state.models.draft.policy[input.dataset.policy] = input.value === "" ? 0 : Number(input.value);
+      markModelsDirty();
+    });
+    $("#model-retry-kinds").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-retry]");
+      if (!btn) return;
+      const draft = state.models.draft;
+      if (!Array.isArray(draft.policy.retry_on)) draft.policy.retry_on = [];
+      const key = btn.dataset.retry;
+      const i = draft.policy.retry_on.indexOf(key);
+      if (i >= 0) draft.policy.retry_on.splice(i, 1);
+      else draft.policy.retry_on.push(key);
+      markModelsDirty();
+      renderModels();
+    });
+    $("#model-save").addEventListener("click", (e) => saveModels(e.currentTarget));
+    $("#model-reset").addEventListener("click", () => {
+      state.models.dirty = false;
+      loadModels();
+      toast("已恢复为已保存的配置");
+    });
+    $("#model-use-astrbot").addEventListener("click", useAstrbotChain);
+    $("#model-test-primary").addEventListener("click", (e) => {
+      const d = state.models;
+      if (!d.data) return;
+      const pid = d.draft.primary || d.data.current_id;
+      if (!pid) { toast("还没有可测试的主模型", "err"); return; }
+      testModels([pid], e.currentTarget);
+    });
+    $("#model-test-chain").addEventListener("click", (e) => {
+      const d = state.models;
+      if (!d.data) return;
+      const ids = [d.draft.primary || d.data.current_id, ...d.draft.fallbacks].filter(Boolean);
+      if (!ids.length) { toast("链里还没有模型", "err"); return; }
+      testModels(ids, e.currentTarget);
+    });
+    $("#model-tbody").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-model-test]");
+      if (btn) testModels([btn.dataset.modelTest], btn);
+    });
+    $("#model-log-clear").addEventListener("click", async () => {
+      try {
+        await apiPost("models/logs/clear");
+        toast("已清空日志与冷却");
+        state.models.dirty = false;
+        loadModels();
+      } catch (err) {
+        toast(errMsg(err), "err");
+      }
+    });
+
     $("#settings-groups").addEventListener("input", () => {
       state.settings.dirty = true;
       $("#settings-status").textContent = "有未保存的修改";

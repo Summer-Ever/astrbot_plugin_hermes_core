@@ -40,8 +40,16 @@ CONFIG_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("技能", ("auto_skill", "skill_notify_admin", "skill_merge_same_name",
               "skill_merge_threshold", "skill_consolidate_max",
               "skill_consolidate_every_n")),
+    # 模型链的列表型配置（降级顺序、可重试错误）由「模型」页专门维护，
+    # 设置页只放标量项，避免两处编辑同一份数据打架。
+    ("模型容错", ("llm_max_retries", "llm_timeout", "llm_backoff",
+                  "llm_total_attempts", "llm_cooldown_seconds",
+                  "llm_max_prompt_chars")),
     ("提示词", ("summary_prompt",)),
 ]
+
+# 不在设置页渲染的配置项（由「模型」页以更直观的方式维护）
+HIDDEN_IN_SETTINGS = {"llm_primary_provider", "llm_fallback_providers", "llm_retry_on"}
 
 # 改了需要重载插件才生效的配置（后台循环在 initialize 时读取一次）
 NEEDS_RELOAD = {"auto_summarize", "summarize_interval_minutes"}
@@ -89,6 +97,11 @@ class HermesWebAPI:
             (f"{self.prefix}/aliases", self.aliases, ["GET"], "身份别名列表"),
             (f"{self.prefix}/aliases/add", self.alias_add, ["POST"], "添加身份别名"),
             (f"{self.prefix}/aliases/delete", self.alias_delete, ["POST"], "删除身份别名"),
+            (f"{self.prefix}/models", self.models, ["GET"], "模型链、容错策略与调用日志"),
+            (f"{self.prefix}/models/save", self.models_save, ["POST"], "保存主模型与降级链"),
+            (f"{self.prefix}/models/test", self.models_test, ["POST"], "测试模型连通性"),
+            (f"{self.prefix}/models/logs/clear", self.models_logs_clear,
+             ["POST"], "清空调用日志与冷却"),
         ]
         for route, handler, methods, desc in routes:
             try:
@@ -140,6 +153,26 @@ class HermesWebAPI:
 
     # ---------- 概览 ----------
 
+    def _model_summary(self) -> dict:
+        """概览页只需要「用哪个模型、链多长、最近有没有出错」。"""
+        router = getattr(self.plugin, "router", None)
+        if router is None:
+            return {}
+        try:
+            primary = router.configured_primary()
+            chain = [e["id"] for e in router.effective_chain(ignore_cooldown=True)]
+            logs = router.logs(20)
+            return {
+                "primary": primary or router.current_provider_id(),
+                "follow_current": not primary,
+                "chain": chain,
+                "last_used": getattr(router, "_last_used", ""),
+                "recent_fail": sum(1 for x in logs if not x["ok"]),
+                "cooling": [p["id"] for p in router.all_providers() if p["cooling"] > 0],
+            }
+        except Exception:
+            return {}
+
     async def overview(self):
         db = self.plugin.db
         stats = db.stats()
@@ -177,6 +210,7 @@ class HermesWebAPI:
             },
             "db_bytes": self._db_size(),
             "aliases": len(aliases),
+            "models": self._model_summary(),
             "recent_memories": db.all_memories(limit=8),
             "top_skills": sorted(skills, key=lambda s: -int(s.get("use_count") or 0))[:6],
             "now": time.time(),
@@ -337,6 +371,8 @@ class HermesWebAPI:
         for title, keys in CONFIG_GROUPS:
             items = []
             for key in keys:
+                if key in HIDDEN_IN_SETTINGS:
+                    continue
                 meta = schema.get(key)
                 if not meta:
                     continue
@@ -363,7 +399,8 @@ class HermesWebAPI:
                 "value": values.get(key, meta.get("default")),
                 "needs_reload": key in NEEDS_RELOAD,
             }
-            for key, meta in schema.items() if key not in seen
+            for key, meta in schema.items()
+            if key not in seen and key not in HIDDEN_IN_SETTINGS
         ]
         if rest:
             groups.append({"title": "其他", "items": rest})
@@ -405,6 +442,15 @@ class HermesWebAPI:
                     cleaned[key] = val
                 elif typ == "float":
                     cleaned[key] = float(raw)
+                elif typ == "list":
+                    # 列表型配置（降级链、可重试错误类别）：允许数组或逗号分隔字符串
+                    if isinstance(raw, str):
+                        items = [x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()]
+                    elif isinstance(raw, (list, tuple)):
+                        items = [str(x).strip() for x in raw if str(x).strip()]
+                    else:
+                        raise ValueError("需要列表")
+                    cleaned[key] = items
                 else:
                     text = str(raw)
                     options = meta.get("options")
@@ -427,19 +473,17 @@ class HermesWebAPI:
     # ---------- 操作 ----------
 
     async def action_summarize(self):
-        provider = self.plugin.context.get_using_provider()
-        if provider is None:
-            return self._fail("未配置 LLM Provider，无法总结")
+        if not self.plugin.router.has_model():
+            return self._fail("没有可用的对话模型，请先在「模型」标签配置主模型")
         result = await self.plugin._summarize(force=True)
         return json_response({"result": result})
 
     async def action_consolidate(self):
         data = await self._body()
         dry = bool(data.get("dry_run"))
-        provider = self.plugin.context.get_using_provider()
-        if provider is None:
-            return self._fail("未配置 LLM Provider，无法整理")
-        result = await self.plugin._consolidate_memories(provider, dry_run=dry)
+        if not self.plugin.router.has_model():
+            return self._fail("没有可用的对话模型，请先在「模型」标签配置主模型")
+        result = await self.plugin._consolidate_memories(dry_run=dry)
         if not dry:
             self.plugin._reset_memory_queue()
         return json_response({"result": result, "dry_run": dry})
@@ -447,10 +491,9 @@ class HermesWebAPI:
     async def action_skill_consolidate(self):
         data = await self._body()
         dry = bool(data.get("dry_run"))
-        provider = self.plugin.context.get_using_provider()
-        if provider is None:
-            return self._fail("未配置 LLM Provider，无法整理")
-        result = await self.plugin._consolidate_skills(provider, dry_run=dry)
+        if not self.plugin.router.has_model():
+            return self._fail("没有可用的对话模型，请先在「模型」标签配置主模型")
+        result = await self.plugin._consolidate_skills(dry_run=dry)
         if not dry:
             self.plugin.db.set_meta("skill_consolidate_pending", "0")
         return json_response({"result": result, "dry_run": dry})
@@ -487,3 +530,160 @@ class HermesWebAPI:
         if not alias:
             return self._fail("缺少别名 ID")
         return json_response({"deleted": bool(self.plugin.db.delete_alias(alias))})
+
+    # ---------- 模型路由 ----------
+
+    # 可重试错误类别的固定顺序（页面上按此顺序展示，便于对齐）
+    RETRY_KINDS = ("timeout", "conn", "rate", "server", "empty", "auth", "ctx", "other")
+
+    # 数值型容错参数：key -> (下限, 上限, 是否浮点)
+    POLICY_BOUNDS = {
+        "llm_max_retries": (0, 9, False),
+        "llm_timeout": (5, 600, True),
+        "llm_backoff": (0, 30, True),
+        "llm_total_attempts": (1, 30, False),
+        "llm_cooldown_seconds": (0, 3600, False),
+        "llm_max_prompt_chars": (2000, 200000, False),
+    }
+
+    def _astrbot_chain(self) -> dict:
+        """读 AstrBot 主体「对话模型 / 降级模型」配置，供页面一键沿用。"""
+        try:
+            acm = self.plugin.context.astrbot_config_mgr
+            cfg = acm.confs["default"]
+            ar = cfg.get("agent_runner", {}) or {}
+            if ar.get("runner_type") != "local":
+                return {"primary": "", "fallbacks": [], "source": "非 local 运行器，无此配置"}
+            model = (ar.get("config") or {}).get("model") or {}
+            return {
+                "primary": str(model.get("provider_id") or ""),
+                "fallbacks": [str(x) for x in (model.get("fallback_provider_ids") or [])],
+                "max_retries": model.get("request_max_retries"),
+                "source": "AstrBot 对话配置",
+            }
+        except Exception:
+            return {"primary": "", "fallbacks": [], "source": ""}
+
+    async def models(self):
+        snap = self.plugin.router.snapshot()
+        snap["astrbot"] = self._astrbot_chain()
+        return json_response(snap)
+
+    async def models_save(self):
+        data = await self._body()
+        router = self.plugin.router
+        known = {p["id"]: p for p in router.all_providers()}
+
+        primary = str(data.get("primary") or "").strip()
+        if primary:
+            if primary not in known:
+                return self._fail(f"主模型 {primary} 不在 AstrBot 的模型列表里")
+            if not known[primary]["loaded"]:
+                return self._fail(f"主模型 {primary} 未启用，AstrBot 没有加载它")
+
+        raw_fb = data.get("fallbacks")
+        if raw_fb is None:
+            raw_fb = router.configured_fallbacks()
+        if isinstance(raw_fb, str):
+            raw_fb = [x.strip() for x in raw_fb.replace("\n", ",").split(",")]
+        if not isinstance(raw_fb, list):
+            return self._fail("降级模型必须是列表")
+
+        fallbacks: list[str] = []
+        errors: list[str] = []
+        for item in raw_fb:
+            pid = str(item or "").strip()
+            if not pid or pid == primary or pid in fallbacks:
+                continue
+            if pid not in known:
+                errors.append(f"{pid} 不存在")
+                continue
+            if not known[pid]["loaded"]:
+                errors.append(f"{pid} 未启用")
+                continue
+            fallbacks.append(pid)
+        if errors:
+            return self._fail("；".join(errors))
+        if len(fallbacks) > 10:
+            return self._fail("降级模型最多 10 个")
+
+        cleaned: dict = {
+            "llm_primary_provider": primary,
+            "llm_fallback_providers": fallbacks,
+        }
+
+        policy = data.get("policy")
+        if policy is not None:
+            if not isinstance(policy, dict):
+                return self._fail("policy 需要对象")
+            errs: list[str] = []
+            for key, (low, high, is_float) in self.POLICY_BOUNDS.items():
+                if key not in policy:
+                    continue
+                try:
+                    val = float(policy[key])
+                except (TypeError, ValueError):
+                    errs.append(f"{key} 需要数字")
+                    continue
+                if val < low or val > high:
+                    errs.append(f"{key} 需在 {low}~{high} 之间")
+                    continue
+                cleaned[key] = val if is_float else int(val)
+            if "retry_on" in policy:
+                raw = policy["retry_on"]
+                if isinstance(raw, str):
+                    raw = [x.strip() for x in raw.split(",")]
+                if not isinstance(raw, (list, tuple)):
+                    errs.append("retry_on 需要数组")
+                else:
+                    picked = {str(x) for x in raw}
+                    cleaned["llm_retry_on"] = [k for k in self.RETRY_KINDS if k in picked]
+            if errs:
+                return self._fail("；".join(errs))
+
+        if self.plugin.config is None:
+            return self._fail("插件没有拿到配置对象", 500)
+        try:
+            self.plugin.config.update(cleaned)
+            await self.plugin.config.save_config_async()
+        except Exception:
+            logger.error(f"[hermes_core] 保存模型配置失败:\n{traceback.format_exc()}")
+            return self._fail("写入配置文件失败，请查看后端日志", 500)
+
+        # 配置刚改过，之前的失败冷却很可能已经过时，清掉让新配置立刻生效
+        router.clear_cooldowns()
+        return json_response({"saved": cleaned,
+                              "chain": [e["id"] for e in router.effective_chain(True)]})
+
+    async def models_test(self):
+        data = await self._body()
+        ids = data.get("ids")
+        if ids is None:
+            one = str(data.get("id") or "").strip()
+            ids = [one] if one else []
+        if isinstance(ids, str):
+            ids = [ids]
+        if not isinstance(ids, list):
+            return self._fail("ids 需要数组")
+        ids = [str(x).strip() for x in ids if str(x).strip()]
+        if not ids:
+            # 不指定就测整条链，按实际会走的顺序
+            ids = [e["id"] for e in self.plugin.router.effective_chain(ignore_cooldown=True)]
+        if not ids:
+            return self._fail("没有可测试的模型")
+        if len(ids) > 8:
+            return self._fail("一次最多测试 8 个模型")
+        results = []
+        for pid in ids:
+            try:
+                results.append(await self.plugin.router.test(pid))
+            except Exception:
+                logger.error(f"[hermes_core] 测试模型 {pid} 异常:\n{traceback.format_exc(limit=2)}")
+                results.append({"id": pid, "ok": False, "kind": "other",
+                                "error": traceback.format_exc(limit=1)})
+        return json_response({"results": results})
+
+    async def models_logs_clear(self):
+        self.plugin.router.clear_logs()
+        self.plugin.router.clear_cooldowns()
+        return json_response({"ok": True})

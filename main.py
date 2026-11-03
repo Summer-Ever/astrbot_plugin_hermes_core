@@ -83,12 +83,31 @@ except ImportError:
         RenderError = _rd_mod.RenderError
         render_mermaid = _rd_mod.render_mermaid
 
+# 模型路由：主模型 + 降级链 + 重试/错误分类，同样三级兜底
+try:
+    from .modules.router import ModelRouter, ModelError, ERROR_LABELS
+except ImportError:
+    try:
+        from modules.router import ModelRouter, ModelError, ERROR_LABELS
+    except ImportError:
+        import importlib.util as _ilu3
+
+        _rt_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "modules", "router.py"
+        )
+        _rt_spec = _ilu3.spec_from_file_location("astrbot_plugin_hermes_core_router", _rt_file)
+        _rt_mod = _ilu3.module_from_spec(_rt_spec)
+        _rt_spec.loader.exec_module(_rt_mod)
+        ModelRouter = _rt_mod.ModelRouter
+        ModelError = _rt_mod.ModelError
+        ERROR_LABELS = _rt_mod.ERROR_LABELS
+
 try:
     from astrbot.api.message_components import Image
 except ImportError:
     Image = None
 
-PLUGIN_VERSION = "0.7.0"
+PLUGIN_VERSION = "0.8.0"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -172,6 +191,8 @@ class HermesCore(Star):
         super().__init__(context)
         self.config = config
         self.db = HermesDB(_default_data_dir())
+        # 所有总结/整理都走它：主模型失败自动降级，不依赖「当前对话模型」
+        self.router = ModelRouter(self)
         self._bg_task: asyncio.Task | None = None
         self._last_origin: str | None = None  # 最近活跃会话，用于技能生成通知
 
@@ -495,9 +516,9 @@ class HermesCore(Star):
         每个会话有自己的水位（meta 键 summarized:<sid>），互不干扰，避免
         "全局凑够 8 条"导致的低频会话永远不总结、以及跨会话打包串味。
         """
-        provider = self.context.get_using_provider()
-        if provider is None:
-            return "未配置 LLM Provider，无法总结。"
+        if not self.router.has_model():
+            return ("没有可用的对话模型：请先在 AstrBot 里配置模型提供商，"
+                    "再到插件页面「模型」标签选择总结模型。")
 
         min_new = max(1, int(self._get_cfg("min_new_messages", 8)))
         grace_h = float(self._get_cfg("summarize_grace_hours", 6))
@@ -525,7 +546,14 @@ class HermesCore(Star):
             batch = self.db.session_batch(st["session_id"], st["watermark"], limit=200)
             if not batch:
                 continue
-            mem, sk, sk_up = await self._summarize_session(provider, batch, st["session_id"])
+            try:
+                mem, sk, sk_up = await self._summarize_session(batch, st["session_id"])
+            except Exception as exc:
+                # 单个会话失败不拖垮其他会话；不推进水位，下一轮会重试这批消息
+                logger.error(f"[hermes_core] 会话总结失败 {st['session_id'][:36]}:\n"
+                             f"{traceback.format_exc(limit=3)}")
+                details.append(f"{st['session_id'][:20]}：失败（{str(exc)[:80]}）")
+                continue
             made_mem += mem
             made_skill += sk
             skill_upd += sk_up
@@ -542,7 +570,7 @@ class HermesCore(Star):
         queued = self._queue_memories(new_ids) if new_ids else self._queued_memory_count()
         if self._should_consolidate_memories(queued):
             try:
-                note = await self._consolidate_memories(provider, focus_ids=set(self._pending_memory_ids()))
+                note = await self._consolidate_memories(focus_ids=set(self._pending_memory_ids()))
                 if note and not note.startswith("记忆只有"):
                     summary += "\n" + note
                 self._reset_memory_queue()
@@ -557,7 +585,7 @@ class HermesCore(Star):
             pend_skill = int(self.db.get_meta("skill_consolidate_pending", "0") or 0)
         if self._should_consolidate_skills(pend_skill):
             try:
-                note = await self._consolidate_skills(provider)
+                note = await self._consolidate_skills()
                 summary += "\n" + note
                 self.db.set_meta("skill_consolidate_pending", "0")
             except Exception:
@@ -575,11 +603,12 @@ class HermesCore(Star):
                 pass
         return summary
 
-    async def _summarize_session(self, provider, batch: list[dict],
+    async def _summarize_session(self, batch: list[dict],
                                  sid: str) -> tuple[int, int, int]:
         """把一个会话的一批消息交给 LLM 归纳，写入记忆与技能。
 
         返回 (新记忆数, 新技能数, 更新技能数)。
+        prompt 按目标模型的上下文动态裁剪：小上下文模型当降级模型时也能用。
         """
         fmt = batch[0].get("platform") or ""
         gid = batch[0].get("group_id") or ""
@@ -591,7 +620,7 @@ class HermesCore(Star):
                 lines.append(f"[用户 {m['sender_id'] or '未知'}({m['sender_name'] or '匿名'})]: {m['content'][:300]}")
             else:
                 lines.append(f"助手: {m['content'][:300]}")
-        transcript = "\n".join(lines)[:12000]
+        transcript = "\n".join(lines)
 
         # 把已有技能清单给模型看：否则同一类任务每次都会造一个新名字，
         # 技能库只会越堆越多，用的时候还得一个个读。
@@ -606,18 +635,25 @@ class HermesCore(Star):
                 "（不要造近义新名），content 写该技能合并后的完整版本：\n" + lines_s
             )
 
-        prompt = (self._get_cfg("summary_prompt", "")
-                  + "\n\n对话中每位用户都带有 [用户 ID(昵称)] 标记。"
-                    "若某条记忆只属于某个特定用户，请在该项追加 \"owner\": \"该用户的ID\"；"
-                    "属于整段对话/全体时省略 owner。"
-                  + skill_hint
-                  + "\n\n对话记录：\n" + transcript)
-        resp = await provider.text_chat(prompt=prompt, session_id=None)
-        text = ""
-        try:
-            text = resp.completion_text or ""
-        except Exception:
-            pass
+        head = (self._get_cfg("summary_prompt", "")
+                + "\n\n对话中每位用户都带有 [用户 ID(昵称)] 标记。"
+                  "若某条记忆只属于某个特定用户，请在该项追加 \"owner\": \"该用户的ID\"；"
+                  "属于整段对话/全体时省略 owner。"
+                + skill_hint
+                + "\n\n对话记录：\n")
+
+        def build(budget: int) -> str:
+            room = max(600, budget - len(head) - 60)
+            body = transcript
+            if len(body) > room:
+                body = body[:room]
+                cut = body.rfind("\n")
+                if cut > room * 0.6:
+                    body = body[:cut]
+                body += "\n…（对话过长，已按当前模型上下文截断，保留最早部分）"
+            return head + body
+
+        text = await self.router.chat(builder=build, purpose="总结记忆")
         made_mem = made_skill = skill_upd = 0
         for item in self._extract_json_array(text):
             if not isinstance(item, dict):
@@ -631,7 +667,7 @@ class HermesCore(Star):
                     if old and bool(self._get_cfg("skill_merge_same_name", True)):
                         # 同名技能：先读旧版再合并，而不是直接覆盖丢掉旧步骤
                         merged = await self._merge_skill_content(
-                            provider, name, old.get("trigger", ""), old.get("content", ""),
+                            name, old.get("trigger", ""), old.get("content", ""),
                             trigger, new_content,
                         )
                         self.db.upsert_skill(name, trigger or old.get("trigger", ""), merged)
@@ -724,7 +760,7 @@ class HermesCore(Star):
 
     # ============ 记忆巩固（consolidation）============
 
-    async def _consolidate_memories(self, provider, dry_run: bool = False,
+    async def _consolidate_memories(self, dry_run: bool = False,
                                     focus_ids: set[int] | None = None) -> str:
         """把碎片化的记忆合并成更完整的条目。
 
@@ -794,7 +830,7 @@ class HermesCore(Star):
                 id_to_group[m["id"]] = idx
                 listing.append(f"- #{m['id']} ({m['kind']}) {m['content'][:200]}")
 
-        prompt = (
+        head = (
             "下面是从长期记忆里挑出的若干组碎片，组内内容高度相似或互补。"
             "请把每组整理成尽量少、互不重复、信息不丢失的条目。\n"
             "规则：\n"
@@ -805,10 +841,22 @@ class HermesCore(Star):
             "5. ids 只能填同一组里的记忆编号，且至少 2 条。\n"
             "输出 JSON 数组，不要解释：[{\"ids\":[1,2],\"kind\":\"preference\","
             "\"content\":\"合并后的表述\"}]\n没有需要合并的就输出 []。\n\n"
-            + "\n".join(listing)
         )
-        resp = await provider.text_chat(prompt=prompt, session_id=None)
-        plan = self._extract_json_array(getattr(resp, "completion_text", "") or "")
+        body_text = "\n".join(listing)
+
+        def build(budget: int) -> str:
+            room = max(600, budget - len(head) - 40)
+            body = body_text
+            if len(body) > room:
+                body = body[:room]
+                cut = body.rfind("\n")
+                if cut > room * 0.6:
+                    body = body[:cut]
+                body += "\n（其余组因当前模型上下文不足未列出，可换更大上下文的模型再整理）"
+            return head + body
+
+        text = await self.router.chat(builder=build, purpose="整理记忆")
+        plan = self._extract_json_array(text)
 
         applied: list[str] = []
         for item in plan:
@@ -845,30 +893,40 @@ class HermesCore(Star):
         head = "记忆整理预览（未写入）" if dry_run else "记忆已整理"
         return f"{head}：{len(applied)} 组\n" + "\n".join(f"- {a}" for a in applied[:8])
 
-    async def _merge_skill_content(self, provider, name: str, old_trigger: str,
+    async def _merge_skill_content(self, name: str, old_trigger: str,
                                    old_content: str, new_trigger: str,
                                    new_content: str) -> str:
         """技能同名的 read-modify-write：保留旧版仍有效的步骤，吸收新版内容。"""
-        prompt = (
+        head = (
             "你是技能库管理员。下面是同一个技能的两个版本（旧版是之前总结的，新版是刚总结的）。"
             "请合并成一份完整、不重复、可直接照着执行的 Markdown 步骤文档："
             "保留旧版里仍然有效的步骤，吸收新版新增的内容，去掉重复描述。"
             "只输出合并后的 Markdown 正文，不要解释，不要加代码块围栏。\n\n"
-            f"[技能名] {name}\n[旧版触发条件] {old_trigger}\n[旧版]\n{old_content[:4000]}"
-            f"\n\n[新版触发条件] {new_trigger}\n[新版]\n{new_content[:4000]}"
+            f"[技能名] {name}\n"
         )
+
+        def build(budget: int) -> str:
+            # 两个版本平分可用空间，避免新版太长把旧版挤掉
+            room = max(800, budget - len(head) - 200)
+            half = max(400, room // 2)
+            old_part = old_content[:half]
+            new_part = new_content[:min(half, max(400, room - len(old_part)))]
+            return (head
+                    + f"[旧版触发条件] {old_trigger}\n[旧版]\n{old_part}"
+                    + f"\n\n[新版触发条件] {new_trigger}\n[新版]\n{new_part}")
+
         try:
-            resp = await provider.text_chat(prompt=prompt, session_id=None)
-            merged = (resp.completion_text or "").strip()
+            merged = (await self.router.chat(builder=build, purpose="合并技能")).strip()
         except Exception:
-            logger.error(f"[hermes_core] 技能合并失败:\n{traceback.format_exc()}")
+            logger.error(f"[hermes_core] 技能合并失败:\n{traceback.format_exc(limit=3)}")
             merged = ""
         if not merged or len(merged) < 20:
             # 合并失败就保守处理：保留旧版，把新版附在后面，绝不丢内容
             return old_content + "\n\n## 补充（新版）\n" + new_content
+        merged = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", merged).strip()
         return merged[:8000]
 
-    async def _consolidate_skills(self, provider, dry_run: bool = False) -> str:
+    async def _consolidate_skills(self, dry_run: bool = False) -> str:
         """把同一类任务被反复总结出来的多个技能合并成一个。
 
         技能不是记忆，字面相似度几乎没用（`chrome-cdp-browser-control` 和
@@ -914,7 +972,7 @@ class HermesCore(Star):
                     f"  内容：{str(full.get('content', ''))[:600]}"
                 )
 
-        prompt = (
+        head = (
             "下面是机器人已经学会的技能，其中一部分是同一类任务被反复总结出来的，"
             "导致同一个能力有多个技能、用的时候得读好几遍。请把真正重叠的合并。\n"
             "规则：\n"
@@ -924,10 +982,24 @@ class HermesCore(Star):
             "4. names 只能填下面出现过的技能名。\n"
             "输出 JSON 数组，不要解释：[{\"names\":[\"a\",\"b\"],\"name\":\"new_name\","
             "\"trigger\":\"何时使用\",\"content\":\"合并后的完整 Markdown\"}]\n"
-            "没有需要合并的就输出 []。\n\n" + "\n".join(listing)
+            "没有需要合并的就输出 []。\n\n"
         )
-        resp = await provider.text_chat(prompt=prompt, session_id=None)
-        plan = self._extract_json_array(getattr(resp, "completion_text", "") or "")
+        body_text = "\n".join(listing)
+
+        def build(budget: int) -> str:
+            room = max(600, budget - len(head) - 40)
+            body = body_text
+            if len(body) > room:
+                # 技能整理要看到正文才有意义，截断会让判断失真，所以明说
+                body = body[:room]
+                cut = body.rfind("\n")
+                if cut > room * 0.6:
+                    body = body[:cut]
+                body += "\n（其余技能因当前模型上下文不足未列出）"
+            return head + body
+
+        text = await self.router.chat(builder=build, purpose="整理技能")
+        plan = self._extract_json_array(text)
 
         all_names = {s["name"] for s in skills}
         done: list[str] = []
@@ -1001,14 +1073,13 @@ class HermesCore(Star):
     @hermes.command("整理")
     async def hermes_consolidate(self, event: AstrMessageEvent, mode: str = ""):
         """/hermes 整理 [预览] —— 把碎片化的相似记忆合并成一条"""
-        provider = self.context.get_using_provider()
-        if provider is None:
-            yield event.plain_result("未配置 LLM Provider，无法整理。")
+        if not self.router.has_model():
+            yield event.plain_result("没有可用的对话模型，请先在插件页面「模型」标签配置。")
             return
         dry = mode.strip() in ("预览", "试运行", "dry", "dry-run")
         yield event.plain_result("正在整理记忆（先本地聚类，有候选才会调用模型）……")
         try:
-            out = await self._consolidate_memories(provider, dry_run=dry)
+            out = await self._consolidate_memories(dry_run=dry)
             if not dry:
                 self._reset_memory_queue()  # 全库刚整理过，队列里的 id 已经没意义
             yield event.plain_result(out)
@@ -1018,14 +1089,13 @@ class HermesCore(Star):
     @hermes.command("技能整理")
     async def hermes_skill_consolidate(self, event: AstrMessageEvent, mode: str = ""):
         """/hermes 技能整理 [预览] —— 把重复的技能合并成一个"""
-        provider = self.context.get_using_provider()
-        if provider is None:
-            yield event.plain_result("未配置 LLM Provider，无法整理。")
+        if not self.router.has_model():
+            yield event.plain_result("没有可用的对话模型，请先在插件页面「模型」标签配置。")
             return
         dry = mode.strip() in ("预览", "试运行", "dry", "dry-run")
         yield event.plain_result("正在检查技能重叠情况……")
         try:
-            out = await self._consolidate_skills(provider, dry_run=dry)
+            out = await self._consolidate_skills(dry_run=dry)
             if not dry:
                 self.db.set_meta("skill_consolidate_pending", "0")
             yield event.plain_result(out)

@@ -22,6 +22,7 @@
         <button class="nav-item active" data-tab="overview"><span class="dot"></span>概览</button>
         <button class="nav-item" data-tab="memories"><span class="dot"></span>记忆</button>
         <button class="nav-item" data-tab="skills"><span class="dot"></span>技能</button>
+        <button class="nav-item" data-tab="models"><span class="dot"></span>模型</button>
         <button class="nav-item" data-tab="settings"><span class="dot"></span>设置</button>
         <button class="nav-item" data-tab="tools"><span class="dot"></span>工具</button>
       </nav>
@@ -213,6 +214,121 @@
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 模型 ============ -->
+      <section id="tab-models" class="tab-panel">
+        <div class="banner" style="background:var(--accent-soft);color:var(--accent);border-color:transparent">
+          总结、整理记忆、合并技能都走这条模型链：主模型失败后按顺序尝试降级模型，同一个模型内部还会重试。
+          模型全部来自 AstrBot 已配置的提供商，这里不会另存密钥。
+        </div>
+
+        <div class="grid c2">
+          <div class="card">
+            <div class="card-head">
+              <h2>主模型</h2>
+              <span class="chip" id="model-current-chip">—</span>
+            </div>
+            <label class="field">
+              <span class="label">用来做总结与整理</span>
+              <select id="model-primary"></select>
+            </label>
+            <p class="faint" id="model-primary-hint" style="margin:0 0 10px;font-size:12.5px">
+              留空表示跟随 AstrBot 当前对话模型
+            </p>
+            <div class="row">
+              <button class="btn tiny ghost" id="model-use-astrbot">沿用 AstrBot 对话配置</button>
+              <button class="btn tiny" id="model-test-primary">测试主模型</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>降级链</h2>
+              <span class="sub">主模型不可用时按顺序尝试</span>
+            </div>
+            <div id="model-chain" class="chain-list"></div>
+            <div class="row" style="margin-top:10px">
+              <select id="model-add-select" class="grow"></select>
+              <button class="btn" id="model-add">添加</button>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <button class="btn tiny ghost" id="model-test-chain">测试整条链</button>
+              <span class="faint" id="model-chain-hint"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>容错策略</h2>
+            <span class="chip">决定什么时候重试、什么时候换模型</span>
+          </div>
+          <div class="grid c4" id="model-policy"></div>
+          <div style="margin-top:14px">
+            <div class="label" style="font-size:12.5px;color:var(--muted);margin-bottom:6px">
+              这些错误会重试同一个模型；没勾的（如鉴权失败、上下文超长）直接换下一个模型
+            </div>
+            <div class="chips" id="model-retry-kinds"></div>
+          </div>
+          <div class="settings-bar" style="margin-top:14px">
+            <span class="muted" style="font-size:12.5px" id="model-save-status">修改后记得保存</span>
+            <div class="row">
+              <button class="btn ghost" id="model-reset">放弃修改</button>
+              <button class="btn primary" id="model-save">保存模型配置</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>连通性测试</h2>
+            <span class="sub">发一条极短请求，验证密钥、网络与额度</span>
+          </div>
+          <div id="model-test-results">
+            <div class="empty">还没有测试。点上面「测试主模型」「测试整条链」，或下面某个模型的「测试」。</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>可用模型</h2>
+            <span class="sub">来自 AstrBot 的模型提供商配置</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:30%">Provider ID</th><th>模型</th><th style="width:88px">上下文</th>
+                  <th style="width:150px">状态</th><th style="width:150px">调用统计</th><th style="width:72px">操作</th>
+                </tr>
+              </thead>
+              <tbody id="model-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>调用日志</h2>
+            <div class="row">
+              <span class="sub" id="model-log-hint">最近 80 条</span>
+              <button class="btn tiny ghost" id="model-log-clear">清空</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:78px">时间</th><th style="width:96px">用途</th><th>模型</th>
+                  <th style="width:58px">尝试</th><th style="width:74px">耗时</th>
+                  <th style="width:96px">结果</th><th>错误</th>
+                </tr>
+              </thead>
+              <tbody id="model-log-tbody"></tbody>
+            </table>
           </div>
         </div>
       </section>

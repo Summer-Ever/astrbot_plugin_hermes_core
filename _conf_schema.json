@@ -119,6 +119,76 @@
     "default": true,
     "description": "新技能生成时主动通知最近活跃会话"
   },
+  "llm_primary_provider": {
+    "type": "string",
+    "default": "",
+    "description": "总结时优先使用的模型（填 AstrBot 里的 provider ID，留空 = 跟随当前对话模型）",
+    "hint": "推荐在插件页面「模型」标签里选，那里能看到全部模型的上下文长度和连通性"
+  },
+  "llm_fallback_providers": {
+    "type": "list",
+    "default": [],
+    "description": "降级模型，按顺序尝试（主模型失败后依次使用）",
+    "hint": "最多 10 个；同样建议用「模型」页维护，支持上下移动排序"
+  },
+  "llm_max_retries": {
+    "type": "int",
+    "default": 2,
+    "min": 0,
+    "max": 9,
+    "description": "每个模型的重试次数（不含首次，0 = 失败立刻换下一个）",
+    "hint": "总尝试次数 = 重试次数 + 1；瞬时抖动多就调大，想快速降级就调小"
+  },
+  "llm_timeout": {
+    "type": "float",
+    "default": 90,
+    "min": 5,
+    "max": 600,
+    "description": "单次请求超时秒数",
+    "hint": "超时会计为可重试错误；长上下文模型整理大库时可能需要 120 以上"
+  },
+  "llm_backoff": {
+    "type": "float",
+    "default": 1.5,
+    "min": 0,
+    "max": 30,
+    "description": "重试退避基数（秒），实际等待按 基数×2^n 递增，上限 10 秒"
+  },
+  "llm_total_attempts": {
+    "type": "int",
+    "default": 8,
+    "min": 1,
+    "max": 30,
+    "description": "整条链最多尝试多少次，防止所有模型都挂时无限重试"
+  },
+  "llm_cooldown_seconds": {
+    "type": "int",
+    "default": 180,
+    "min": 0,
+    "max": 3600,
+    "description": "模型失败后冷却多少秒（冷却期内跳过它，避免每轮总结都先撞坏模型）",
+    "hint": "鉴权失败会自动按 4 倍冷却；0 = 不冷却"
+  },
+  "llm_max_prompt_chars": {
+    "type": "int",
+    "default": 24000,
+    "min": 2000,
+    "max": 200000,
+    "description": "单次送入模型的最大字符数（还会按模型上下文再压一次）",
+    "hint": "防 1M 上下文的模型把整段历史吞进去烧钱"
+  },
+  "llm_retry_on": {
+    "type": "list",
+    "default": [
+      "timeout",
+      "conn",
+      "rate",
+      "server",
+      "empty"
+    ],
+    "description": "这些错误会重试同一模型；未勾选的（如鉴权、上下文超长）直接换下一个模型",
+    "hint": "可选：timeout/conn/rate/server/empty/auth/ctx/other"
+  },
   "summary_prompt": {
     "type": "text",
     "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
