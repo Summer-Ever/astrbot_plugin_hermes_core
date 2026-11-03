@@ -107,13 +107,34 @@ try:
 except ImportError:
     Image = None
 
-PLUGIN_VERSION = "0.8.0"
+# 技能中枢：把本体装的只读技能和插件进化的个人技能合成一个视图，同样三级兜底
+try:
+    from .modules.skill_hub import SkillHub, guess_data_root
+except ImportError:
+    try:
+        from modules.skill_hub import SkillHub, guess_data_root
+    except ImportError:
+        import importlib.util as _ilu4
+
+        _sh_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "modules", "skill_hub.py"
+        )
+        _sh_spec = _ilu4.spec_from_file_location("astrbot_plugin_hermes_core_skillhub", _sh_file)
+        _sh_mod = _ilu4.module_from_spec(_sh_spec)
+        _sh_spec.loader.exec_module(_sh_mod)
+        SkillHub = _sh_mod.SkillHub
+        guess_data_root = _sh_mod.guess_data_root
+
+PLUGIN_VERSION = "0.9.0"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
-    "list_skills(查看已学会的技能)、read_skill(读取技能全文)、save_skill(把可复用流程存为技能)、"
+    "list_skills(查看技能，分「我的技能」和「系统技能·只读」)、read_skill(读取技能全文)、"
+    "save_skill(把可复用流程存为我的技能)、update_skill(局部修改我的技能)、"
     "render_mermaid(把 mermaid 图表渲染成 PNG 图片发到聊天)。"
     "遇到值得长期记住的信息请主动 save_memory；完成复杂流程后可用 save_skill 沉淀方法。"
+    "改技能一律走 update_skill 做局部替换，不要整份重写；"
+    "系统技能是 AstrBot 本体装的、全局共享，插件不能写它，要改就基于它生成个人副本。"
 )
 
 
@@ -191,6 +212,10 @@ class HermesCore(Star):
         super().__init__(context)
         self.config = config
         self.db = HermesDB(_default_data_dir())
+        # 技能分两个域：本体的 skills/ 只读，插件自己的按人隔离可写，见 modules/skill_hub.py
+        self.hub = SkillHub(
+            self.db, os.path.join(guess_data_root(_default_data_dir()), "skills")
+        )
         # 所有总结/整理都走它：主模型失败自动降级，不依赖「当前对话模型」
         self.router = ModelRouter(self)
         self._bg_task: asyncio.Task | None = None
@@ -366,10 +391,16 @@ class HermesCore(Star):
                 text = h["content"][:200]
                 lines.append(f"- {who}: {text}")
 
-        skills = self.db.list_skills()
+        skills = self.hub.list_for(owner_id, sc["group_id"])
         if skills:
-            names = "、".join(s["name"] for s in skills[:20])
-            lines.append(f"[已掌握技能] {names}（可用 read_skill 查看全文）")
+            personal = [s for s in skills if s.get("source") == "personal"]
+            system = [s for s in skills if s.get("source") == "system"]
+            parts: list[str] = []
+            if personal:
+                parts.append("我的技能：" + "、".join(s["name"] for s in personal[:15]))
+            if system:
+                parts.append("系统技能(本体装的,只读)：" + "、".join(s["name"] for s in system[:10]))
+            lines.append(f"[已掌握技能] {'；'.join(parts)}（可用 read_skill 查看全文）")
 
         if not lines:
             return ""
@@ -441,11 +472,11 @@ class HermesCore(Star):
 
     @filter.llm_tool(name="list_skills")
     async def tool_list_skills(self, event: AstrMessageEvent) -> str:
-        """列出已学会的全部技能名称与适用场景。"""
-        skills = self.db.list_skills()
-        if not skills:
-            return "暂无技能。"
-        return "\n".join(f"- {s['name']}（{s['trigger'] or '通用'}）" for s in skills)
+        """列出技能，分「我的技能」（属于当前用户，可改）和「系统技能·只读」两组。
+        用户提到要修改/查看某个技能前，先用它确认这个技能在哪一组。
+        """
+        sc = self._scope_keys(event)
+        return self.hub.describe(self.hub.list_for(sc["owner_id"], sc["group_id"]))
 
     @filter.llm_tool(name="read_skill")
     async def tool_read_skill(self, event: AstrMessageEvent, name: str) -> str:
@@ -453,22 +484,69 @@ class HermesCore(Star):
         Args:
             name (string): 技能名称
         """
-        sk = self.db.get_skill(name)
-        return sk["content"] if sk else f"技能 {name} 不存在。"
+        sc = self._scope_keys(event)
+        sk = self.hub.read(name, sc["owner_id"], sc["group_id"])
+        if not sk:
+            return f"技能 {name} 不存在。可用 list_skills 查看现有技能。"
+        if sk.get("source") == "system":
+            return (
+                f"[系统技能·只读] {sk['name']}——AstrBot 本体安装的，全局共享"
+                f"{'、含可执行脚本' if sk.get('has_scripts') else ''}，不能直接改。\n"
+                f"要定制就用 update_skill 局部改，或 save_skill 同名保存；"
+                f"插件会自动生成属于当前用户的个人副本，系统原版不受影响。\n\n"
+                f"{sk['content']}"
+            )
+        head = f"[我的技能] {sk['name']}——属于当前用户，可直接用 update_skill 局部修改"
+        if sk.get("shadow_of"):
+            head += f"；这是覆盖系统技能 {sk['shadow_of']} 的个人版本"
+        return f"{head}\n\n{sk['content']}"
 
     @filter.llm_tool(name="save_skill")
     async def tool_save_skill(self, event: AstrMessageEvent, name: str,
-                              trigger: str, content: str) -> str:
-        """把一个可复用的解决流程保存为技能（Markdown 步骤）。完成复杂任务后若流程可复用，调用此工具。
+                              trigger: str, content: str,
+                              scope: str = "private") -> str:
+        """把一个可复用的解决流程保存为「我的技能」（Markdown 步骤），同名则整份覆盖。
+        只改技能里某几步时不要用它（整份覆盖会丢内容），改用 update_skill。
         Args:
             name (string): 英文短名，如 deploy_blog
             trigger (string): 什么场景下应该使用该技能
             content (string): Markdown 格式的完整步骤
+            scope (string): private 只有自己可见（默认）；group 本群所有人可见
         """
+        sc = self._scope_keys(event)
         name = re.sub(r"\s+", "_", name.strip())[:64]
-        created = self.db.upsert_skill(name, trigger or "", content)
-        logger.info(f"[hermes_core] 技能 {'新建' if created else '更新'}: {name}")
-        return f"技能 {name} 已{'保存' if created else '更新'}。"
+        if not name or not content:
+            return "技能名和内容都不能为空。"
+        want = str(scope or "private").strip().lower()
+        scp = "group" if want == "group" and sc["group_id"] else "private"
+        res = self.hub.save(name, trigger or "", content, owner_id=sc["owner_id"],
+                            group_id=sc["group_id"], scope=scp)
+        logger.info(f"[hermes_core] 技能 {'新建' if res['created'] else '更新'}: {res['name']}")
+        tail = ""
+        if res.get("shadow_of"):
+            tail = f"（已覆盖系统技能 {res['shadow_of']}，本体原版未改动）"
+        where = "本群共享" if scp == "group" else "仅当前用户可见"
+        return f"技能 {res['name']} 已{'保存' if res['created'] else '更新'}，{where}{tail}。"
+
+    @filter.llm_tool(name="update_skill")
+    async def tool_update_skill(self, event: AstrMessageEvent, name: str,
+                                old_text: str, new_text: str) -> str:
+        """局部修改技能：把技能正文里的 old_text 换成 new_text，其余内容原样保留。
+        用户让你改某个技能的某几步、某个命令、某段说明时用这个，不要整份重写。
+        Args:
+            name (string): 技能名称
+            old_text (string): 要替换的原文，必须从 read_skill 结果里精确复制，且在正文中只出现一次；留空表示把 new_text 追加到技能末尾
+            new_text (string): 替换成什么
+        """
+        sc = self._scope_keys(event)
+        res = self.hub.update(name, old_text, new_text, owner_id=sc["owner_id"],
+                              group_id=sc["group_id"])
+        if not res.get("ok"):
+            return f"修改失败：{res.get('error', '未知错误')}"
+        if res.get("shadowed"):
+            return (f"已修改：系统技能 {res['name']} 不能直接改，我基于它建了一份属于你的副本再改，"
+                    f"以后你会优先读到这份，本体原版没动。")
+        return f"技能 {res['name']} 已按你的要求局部更新，其余内容保持不变。"
 
     @filter.llm_tool(name="render_mermaid")
     async def tool_render_mermaid(self, event: AstrMessageEvent, code: str) -> str:
@@ -622,9 +700,24 @@ class HermesCore(Star):
                 lines.append(f"助手: {m['content'][:300]}")
         transcript = "\n".join(lines)
 
+        # 技能归属：这一批对话里发言最多的人。技能跟人走，不跟群走——
+        # 否则 A 摸索出来的流程会被 B 覆盖掉。
+        skill_owner = ""
+        try:
+            counts: dict[str, int] = {}
+            for m in batch:
+                if m["role"] == "user" and m.get("sender_id"):
+                    sid_key = str(m["sender_id"])
+                    counts[sid_key] = counts.get(sid_key, 0) + 1
+            if counts:
+                top = max(counts.items(), key=lambda kv: kv[1])[0]
+                skill_owner = self.db.resolve_owner(top, fmt)
+        except Exception:
+            skill_owner = ""
+
         # 把已有技能清单给模型看：否则同一类任务每次都会造一个新名字，
-        # 技能库只会越堆越多，用的时候还得一个个读。
-        existing_skills = self.db.list_skills()
+        # 技能库只会越堆越多，用的时候还得一个个读。只看这个人自己的技能。
+        existing_skills = self.db.list_skills(owner_id=skill_owner, group_id=gid)
         skill_hint = ""
         if existing_skills and self._get_cfg("auto_skill", True):
             lines_s = "\n".join(
@@ -663,17 +756,19 @@ class HermesCore(Star):
                 if name and item.get("content"):
                     trigger = str(item.get("trigger", "")).strip()
                     new_content = str(item["content"])
-                    old = self.db.peek_skill(name)
+                    old = self.db.peek_skill(name, owner_id=skill_owner, group_id=gid)
                     if old and bool(self._get_cfg("skill_merge_same_name", True)):
                         # 同名技能：先读旧版再合并，而不是直接覆盖丢掉旧步骤
                         merged = await self._merge_skill_content(
                             name, old.get("trigger", ""), old.get("content", ""),
                             trigger, new_content,
                         )
-                        self.db.upsert_skill(name, trigger or old.get("trigger", ""), merged)
+                        self.db.upsert_skill(name, trigger or old.get("trigger", ""), merged,
+                                             owner_id=skill_owner, group_id=gid)
                         skill_upd += 1
                     else:
-                        self.db.upsert_skill(name, trigger, new_content)
+                        self.db.upsert_skill(name, trigger, new_content,
+                                             owner_id=skill_owner, group_id=gid)
                         made_skill += 1
             elif item.get("content"):
                 owner = str(item.get("owner", "")).strip()
@@ -926,16 +1021,72 @@ class HermesCore(Star):
         merged = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", merged).strip()
         return merged[:8000]
 
+    def _skill_groups(self) -> list[dict]:
+        """按归属把技能分组。只有落在同一个归属域里的技能才可能被合并。"""
+        buckets: dict[tuple[str, str, str], int] = {}
+        for r in self.db.skill_owners():
+            key = (str(r["owner_id"] or ""), str(r["scope"] or "private"),
+                   str(r["group_id"] or ""))
+            buckets[key] = buckets.get(key, 0) + int(r["c"] or 0)
+        groups = [
+            {"owner_id": k[0], "scope": k[1], "group_id": k[2], "count": n}
+            for k, n in buckets.items() if n >= 2
+        ]
+        groups.sort(key=lambda g: -g["count"])
+        return groups
+
+    @staticmethod
+    def _group_label(g: dict) -> str:
+        if g["scope"] == "global":
+            return "公共"
+        if g["scope"] == "group":
+            return f"群 {str(g['group_id'])[-6:]}"
+        return f"用户 {str(g['owner_id'])[-6:]}"
+
     async def _consolidate_skills(self, dry_run: bool = False) -> str:
-        """把同一类任务被反复总结出来的多个技能合并成一个。
+        """按归属分别整理技能，不同用户的技能绝不互相合并。
 
         技能不是记忆，字面相似度几乎没用（`chrome-cdp-browser-control` 和
-        `chrome_real_profile_cdp` 只有 0.09，但其实是同一件事）。所以技能数不多时
-        直接把全部技能交给模型判断，只有数量过多才用字面相似度粗筛。
+        `chrome_real_profile_cdp` 只有 0.09，但其实是同一件事）。所以每个归属域内
+        技能数不多时直接把全部技能交给模型判断，只有数量过多才用字面相似度粗筛。
         """
-        skills = self.db.list_skills()
+        groups = self._skill_groups()
+        if not groups:
+            return "每个人名下的技能都不足 2 个，无需整理。"
+
+        # 一人一次模型调用，人多时成本线性上涨，所以每次只处理技能最多的几个域
+        limit = max(1, int(self._get_cfg("skill_consolidate_owners", 3)))
+        picked = groups[:limit]
+        done_all: list[str] = []
+        notes: list[str] = []
+        for g in picked:
+            try:
+                note, done, checked = await self._consolidate_skill_group(g, dry_run)
+            except ModelError as exc:
+                notes.append(f"{self._group_label(g)}：整理失败（{exc.kind}），稍后重试")
+                continue
+            except Exception:
+                logger.error(f"[hermes_core] 整理技能失败:\n{traceback.format_exc()}")
+                continue
+            if note:
+                notes.append(note)
+            done_all += [f"{self._group_label(g)} {'/'.join(d)}" for d in done]
+            _ = checked
+
+        if done_all:
+            head = "技能整理预览（未写入）" if dry_run else "技能已合并"
+            body = "\n".join(f"- {d}" for d in done_all[:8])
+            return f"{head}：{len(done_all)} 组\n{body}" + (
+                "\n" + "\n".join(notes) if notes else "")
+        if notes:
+            return "\n".join(notes)
+        return f"检查了 {len(picked)} 个归属域的技能，模型判断不需要合并。"
+
+    async def _consolidate_skill_group(self, group: dict, dry_run: bool) -> tuple[str, list[str], int]:
+        """整理单个归属域内的技能，返回 (说明, 已合并列表, 检查数)。"""
+        skills = self.db.skills_in(group["owner_id"], group["scope"], group["group_id"])
         if len(skills) < 2:
-            return f"只有 {len(skills)} 个技能，无需整理。"
+            return "", [], len(skills)
 
         max_direct = max(4, int(self._get_cfg("skill_consolidate_max", 40)))
         threshold = float(self._get_cfg("skill_merge_threshold", 0.2))
@@ -953,27 +1104,21 @@ class HermesCore(Star):
             ]
             cs = _cluster_by_similarity(items, threshold, text_key="text")
             if not cs:
-                return f"技能有 {len(skills)} 个，字面没有明显重叠。"
+                return f"{self._group_label(group)}：{len(skills)} 个技能字面没有明显重叠。", [], len(skills)
             name2skill = {s["name"]: s for s in skills}
             clusters = [[name2skill[i["name"]] for i in g] for g in cs]
 
-        detail = {}
-        for group in clusters:
-            for s in group:
-                detail[s["name"]] = self.db.peek_skill(s["name"]) or s
-
         listing: list[str] = []
-        for idx, group in enumerate(clusters, 1):
+        for idx, cl in enumerate(clusters, 1):
             listing.append(f"组 {idx}：")
-            for s in group:
-                full = detail[s["name"]]
+            for s in cl:
                 listing.append(
                     f"- name: {s['name']} | trigger: {s['trigger'] or '通用'}\n"
-                    f"  内容：{str(full.get('content', ''))[:600]}"
+                    f"  内容：{str(s.get('content') or '')[:600]}"
                 )
 
         head = (
-            "下面是机器人已经学会的技能，其中一部分是同一类任务被反复总结出来的，"
+            "下面是同一个用户已经学会的技能，其中一部分是同一类任务被反复总结出来的，"
             "导致同一个能力有多个技能、用的时候得读好几遍。请把真正重叠的合并。\n"
             "规则：\n"
             "1. 只有确实做同一类事情才合并；不同图种（流程图 vs 时序图）、不同工具不要硬合；\n"
@@ -1014,13 +1159,16 @@ class HermesCore(Star):
             if dry_run:
                 done.append(f"{'/'.join(names)} → {new_name}")
                 continue
-            self.db.replace_skills(names, new_name, str(item.get("trigger") or ""), content[:8000])
+            self.db.replace_skills(
+                names, new_name, str(item.get("trigger") or ""), content[:8000],
+                owner_id=group["owner_id"], scope=group["scope"],
+                group_id=group["group_id"],
+            )
             done.append(f"{'/'.join(names)} → {new_name}")
 
         if not done:
-            return f"检查了 {len(skills)} 个技能，模型判断不需要合并。"
-        head = "技能整理预览（未写入）" if dry_run else "技能已合并"
-        return f"{head}：{len(done)} 组\n" + "\n".join(f"- {d}" for d in done[:8])
+            return f"{self._group_label(group)}：{len(skills)} 个技能，模型判断不需要合并。", [], len(skills)
+        return "", done, len(skills)
 
     @staticmethod
     def _extract_json_array(text: str) -> list:
@@ -1134,19 +1282,33 @@ class HermesCore(Star):
 
     @hermes.command("技能")
     async def hermes_skills(self, event: AstrMessageEvent, name: str = ""):
+        sc = self._scope_keys(event)
         if name:
-            sk = self.db.get_skill(name)
+            sk = self.hub.read(name, sc["owner_id"], sc["group_id"])
             if not sk:
-                yield event.plain_result(f"技能 {name} 不存在。")
-            else:
-                yield event.plain_result(f"[{sk['name']}] {sk['trigger']}\n\n{sk['content'][:1500]}")
+                yield event.plain_result(f"技能 {name} 不存在。发 /hermes 技能 看全部。")
+                return
+            tag = "系统·只读" if sk.get("source") == "system" else "我的"
+            yield event.plain_result(
+                f"[{sk['name']}]（{tag}）{sk['trigger']}\n\n{sk['content'][:1500]}"
+            )
             return
-        skills = self.db.list_skills()
+        skills = self.hub.list_for(sc["owner_id"], sc["group_id"])
         if not skills:
             yield event.plain_result("还没有学会任何技能。完成复杂任务后我会自动提炼。")
-        else:
-            text = "\n".join(f"- {s['name']}（{s['trigger'] or '通用'}）" for s in skills)
-            yield event.plain_result("[技能库]\n" + text)
+            return
+        personal = [s for s in skills if s.get("source") == "personal"]
+        system = [s for s in skills if s.get("source") == "system"]
+        lines: list[str] = []
+        if personal:
+            lines.append("[我的技能]")
+            lines += [f"- {s['name']}（{s['trigger'] or '通用'}）" for s in personal]
+        if system:
+            if lines:
+                lines.append("")
+            lines.append("[系统技能·只读]")
+            lines += [f"- {s['name']}（{s['trigger'] or '通用'}）" for s in system]
+        yield event.plain_result("\n".join(lines))
 
     @hermes.command("导出")
     async def hermes_export(self, event: AstrMessageEvent):

@@ -198,6 +198,21 @@
                   <input type="text" id="sk-trigger" placeholder="什么时候该用这个技能" />
                 </label>
               </div>
+              <div class="row" style="margin-top:10px;gap:10px">
+                <label class="field" style="margin:0">
+                  <span class="label">归属</span>
+                  <select id="sk-scope">
+                    <option value="private">私人（仅某个用户）</option>
+                    <option value="group">群共享</option>
+                    <option value="global">公共（所有人）</option>
+                  </select>
+                </label>
+                <label class="field" style="margin:0;flex:2">
+                  <span class="label">用户 ID / 群 ID</span>
+                  <input type="text" id="sk-owner" placeholder="私人技能填用户 ID；群共享填群 ID" />
+                </label>
+              </div>
+              <div id="sk-readonly" class="hidden" style="margin-top:10px;padding:9px 11px;border-radius:8px;background:rgba(240,170,60,.14);font-size:12px;line-height:1.6"></div>
               <div class="row-between" style="margin:14px 0 6px">
                 <span class="label muted" style="font-size:12.5px">技能正文（Markdown）</span>
                 <div class="row">

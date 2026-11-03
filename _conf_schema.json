@@ -1,197 +1,203 @@
 {
-  "memory_scope": {
-    "type": "string",
-    "default": "user",
-    "description": "记忆隔离级别：user=按用户隔离（推荐群聊）、group=按群/会话隔离、global=全机器人共享",
-    "options": [
-      "user",
-      "group",
-      "global"
-    ]
-  },
-  "per_user_history": {
-    "type": "bool",
-    "default": true,
-    "description": "历史对话检索只匹配当前发言人，避免注入同群其他人的对话",
-    "hint": "仅在 memory_scope=user 时生效"
-  },
-  "exclusive_memory": {
-    "type": "bool",
-    "default": true,
-    "description": "独占记忆模式：启动时检查并提醒关闭其他记忆插件与内置长期记忆，避免双重注入"
-  },
-  "memory_injection": {
-    "type": "bool",
-    "default": true,
-    "description": "每次 LLM 请求前自动检索并注入相关记忆与历史片段",
-    "hint": "关闭后仅可手动 /hermes 总结，模型仍可用记忆工具"
-  },
-  "inject_memories_topk": {
-    "type": "int",
-    "default": 5,
-    "description": "每次注入的记忆条数上限"
-  },
-  "inject_history_topk": {
-    "type": "int",
-    "default": 3,
-    "description": "每次注入的相关历史对话条数上限"
-  },
-  "auto_summarize": {
-    "type": "bool",
-    "default": true,
-    "description": "后台定时把新对话总结为记忆条目（Hermes 式 nudge）"
-  },
-  "summarize_interval_minutes": {
-    "type": "int",
-    "default": 30,
-    "description": "总结检查间隔（分钟）。到点后逐个会话判断是否需要总结，不是到点就强制总结",
-    "hint": "只是闹钟，真正触发条件见下面两项"
-  },
-  "min_new_messages": {
-    "type": "int",
-    "default": 8,
-    "description": "单个会话至少积累多少条新消息才总结（按会话独立计数，不是全局合计）"
-  },
-  "summarize_grace_hours": {
-    "type": "int",
-    "default": 6,
-    "description": "时间兜底：某个会话的消息超过这么多小时还没被总结，即使不足条数也强制总结，避免低频场景永远不产生记忆",
-    "hint": "设为 0 关闭兜底（则只按条数触发）"
-  },
-  "auto_consolidate": {
-    "type": "bool",
-    "default": true,
-    "description": "记忆巩固：总结后把碎片化的相似记忆合并成一条",
-    "hint": "合并只在攒够阈值时触发（见下一项），不是每条记忆都调模型"
-  },
-  "consolidate_every_n_memories": {
-    "type": "int",
-    "default": 10,
-    "description": "每累计新增多少条记忆，才自动合并一次（0 = 关闭自动整理，只能用 /hermes 整理 手动触发）",
-    "hint": "一次整理 = 一次模型调用。1 等于旧行为（每轮总结都整理）；10 表示约每 10 条新记忆才多花一次调用"
-  },
-  "consolidate_threshold": {
-    "type": "float",
-    "default": 0.3,
-    "description": "召回相似记忆的阈值（0~1，越低越容易进入候选）",
-    "hint": "字面相似度只用来找候选，真正合并由模型判断。「喜欢吃香蕉/苹果」约 0.33，「喜欢吃香蕉/看动漫」约 0.14"
-  },
-  "consolidate_min_memories": {
-    "type": "int",
-    "default": 6,
-    "description": "记忆少于这个数量时不做整理"
-  },
-  "consolidate_max_clusters": {
-    "type": "int",
-    "default": 6,
-    "description": "每次最多整理几组（控制单次花费）"
-  },
-  "skill_merge_same_name": {
-    "type": "bool",
-    "default": true,
-    "description": "同名技能改为「先读旧版再合并」，避免直接覆盖丢掉旧步骤"
-  },
-  "skill_merge_threshold": {
-    "type": "float",
-    "default": 0.2,
-    "description": "召回重叠技能的阈值（按名字+触发条件的字面相似度）",
-    "hint": "只影响候选范围；是否合并由模型判断。不同图种（流程图/时序图）约 0.22，会被召回但通常不会合并"
-  },
-  "skill_consolidate_max": {
-    "type": "int",
-    "default": 40,
-    "description": "技能不超过这个数量时，整理会全部交给模型判断（不靠字面筛选）",
-    "hint": "技能多于此数才用 skill_merge_threshold 粗筛，避免一次请求过长"
-  },
-  "skill_consolidate_every_n": {
-    "type": "int",
-    "default": 5,
-    "description": "每累计新增/更新多少个技能，才自动合并一次（0 = 关闭，只能手动 /hermes 技能整理）",
-    "hint": "技能整理会把技能正文全量发给模型，比记忆整理贵，因此默认 5 而不是 1"
-  },
-  "auto_skill": {
-    "type": "bool",
-    "default": true,
-    "description": "总结时允许模型提炼可复用技能（Markdown Skill）并自动保存"
-  },
-  "skill_notify_admin": {
-    "type": "bool",
-    "default": true,
-    "description": "新技能生成时主动通知最近活跃会话"
-  },
-  "llm_primary_provider": {
-    "type": "string",
-    "default": "",
-    "description": "总结时优先使用的模型（填 AstrBot 里的 provider ID，留空 = 跟随当前对话模型）",
-    "hint": "推荐在插件页面「模型」标签里选，那里能看到全部模型的上下文长度和连通性"
-  },
-  "llm_fallback_providers": {
-    "type": "list",
-    "default": [],
-    "description": "降级模型，按顺序尝试（主模型失败后依次使用）",
-    "hint": "最多 10 个；同样建议用「模型」页维护，支持上下移动排序"
-  },
-  "llm_max_retries": {
-    "type": "int",
-    "default": 2,
-    "min": 0,
-    "max": 9,
-    "description": "每个模型的重试次数（不含首次，0 = 失败立刻换下一个）",
-    "hint": "总尝试次数 = 重试次数 + 1；瞬时抖动多就调大，想快速降级就调小"
-  },
-  "llm_timeout": {
-    "type": "float",
-    "default": 90,
-    "min": 5,
-    "max": 600,
-    "description": "单次请求超时秒数",
-    "hint": "超时会计为可重试错误；长上下文模型整理大库时可能需要 120 以上"
-  },
-  "llm_backoff": {
-    "type": "float",
-    "default": 1.5,
-    "min": 0,
-    "max": 30,
-    "description": "重试退避基数（秒），实际等待按 基数×2^n 递增，上限 10 秒"
-  },
-  "llm_total_attempts": {
-    "type": "int",
-    "default": 8,
-    "min": 1,
-    "max": 30,
-    "description": "整条链最多尝试多少次，防止所有模型都挂时无限重试"
-  },
-  "llm_cooldown_seconds": {
-    "type": "int",
-    "default": 180,
-    "min": 0,
-    "max": 3600,
-    "description": "模型失败后冷却多少秒（冷却期内跳过它，避免每轮总结都先撞坏模型）",
-    "hint": "鉴权失败会自动按 4 倍冷却；0 = 不冷却"
-  },
-  "llm_max_prompt_chars": {
-    "type": "int",
-    "default": 24000,
-    "min": 2000,
-    "max": 200000,
-    "description": "单次送入模型的最大字符数（还会按模型上下文再压一次）",
-    "hint": "防 1M 上下文的模型把整段历史吞进去烧钱"
-  },
-  "llm_retry_on": {
-    "type": "list",
-    "default": [
-      "timeout",
-      "conn",
-      "rate",
-      "server",
-      "empty"
-    ],
-    "description": "这些错误会重试同一模型；未勾选的（如鉴权、上下文超长）直接换下一个模型",
-    "hint": "可选：timeout/conn/rate/server/empty/auth/ctx/other"
-  },
-  "summary_prompt": {
-    "type": "text",
-    "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
-    "description": "总结器使用的提示词"
-  }
+    "memory_scope": {
+        "type": "string",
+        "default": "user",
+        "description": "记忆隔离级别：user=按用户隔离（推荐群聊）、group=按群/会话隔离、global=全机器人共享",
+        "options": [
+            "user",
+            "group",
+            "global"
+        ]
+    },
+    "per_user_history": {
+        "type": "bool",
+        "default": true,
+        "description": "历史对话检索只匹配当前发言人，避免注入同群其他人的对话",
+        "hint": "仅在 memory_scope=user 时生效"
+    },
+    "exclusive_memory": {
+        "type": "bool",
+        "default": true,
+        "description": "独占记忆模式：启动时检查并提醒关闭其他记忆插件与内置长期记忆，避免双重注入"
+    },
+    "memory_injection": {
+        "type": "bool",
+        "default": true,
+        "description": "每次 LLM 请求前自动检索并注入相关记忆与历史片段",
+        "hint": "关闭后仅可手动 /hermes 总结，模型仍可用记忆工具"
+    },
+    "inject_memories_topk": {
+        "type": "int",
+        "default": 5,
+        "description": "每次注入的记忆条数上限"
+    },
+    "inject_history_topk": {
+        "type": "int",
+        "default": 3,
+        "description": "每次注入的相关历史对话条数上限"
+    },
+    "auto_summarize": {
+        "type": "bool",
+        "default": true,
+        "description": "后台定时把新对话总结为记忆条目（Hermes 式 nudge）"
+    },
+    "summarize_interval_minutes": {
+        "type": "int",
+        "default": 30,
+        "description": "总结检查间隔（分钟）。到点后逐个会话判断是否需要总结，不是到点就强制总结",
+        "hint": "只是闹钟，真正触发条件见下面两项"
+    },
+    "min_new_messages": {
+        "type": "int",
+        "default": 8,
+        "description": "单个会话至少积累多少条新消息才总结（按会话独立计数，不是全局合计）"
+    },
+    "summarize_grace_hours": {
+        "type": "int",
+        "default": 6,
+        "description": "时间兜底：某个会话的消息超过这么多小时还没被总结，即使不足条数也强制总结，避免低频场景永远不产生记忆",
+        "hint": "设为 0 关闭兜底（则只按条数触发）"
+    },
+    "auto_consolidate": {
+        "type": "bool",
+        "default": true,
+        "description": "记忆巩固：总结后把碎片化的相似记忆合并成一条",
+        "hint": "合并只在攒够阈值时触发（见下一项），不是每条记忆都调模型"
+    },
+    "consolidate_every_n_memories": {
+        "type": "int",
+        "default": 10,
+        "description": "每累计新增多少条记忆，才自动合并一次（0 = 关闭自动整理，只能用 /hermes 整理 手动触发）",
+        "hint": "一次整理 = 一次模型调用。1 等于旧行为（每轮总结都整理）；10 表示约每 10 条新记忆才多花一次调用"
+    },
+    "consolidate_threshold": {
+        "type": "float",
+        "default": 0.3,
+        "description": "召回相似记忆的阈值（0~1，越低越容易进入候选）",
+        "hint": "字面相似度只用来找候选，真正合并由模型判断。「喜欢吃香蕉/苹果」约 0.33，「喜欢吃香蕉/看动漫」约 0.14"
+    },
+    "consolidate_min_memories": {
+        "type": "int",
+        "default": 6,
+        "description": "记忆少于这个数量时不做整理"
+    },
+    "consolidate_max_clusters": {
+        "type": "int",
+        "default": 6,
+        "description": "每次最多整理几组（控制单次花费）"
+    },
+    "skill_merge_same_name": {
+        "type": "bool",
+        "default": true,
+        "description": "同名技能改为「先读旧版再合并」，避免直接覆盖丢掉旧步骤"
+    },
+    "skill_merge_threshold": {
+        "type": "float",
+        "default": 0.2,
+        "description": "召回重叠技能的阈值（按名字+触发条件的字面相似度）",
+        "hint": "只影响候选范围；是否合并由模型判断。不同图种（流程图/时序图）约 0.22，会被召回但通常不会合并"
+    },
+    "skill_consolidate_max": {
+        "type": "int",
+        "default": 40,
+        "description": "技能不超过这个数量时，整理会全部交给模型判断（不靠字面筛选）",
+        "hint": "技能多于此数才用 skill_merge_threshold 粗筛，避免一次请求过长"
+    },
+    "skill_consolidate_owners": {
+        "type": "int",
+        "description": "一次自动整理最多处理几个人的技能（每个归属域一次模型调用，人越多越费 token）",
+        "default": 3,
+        "hint": "技能按人隔离后，整理要逐人进行；默认只处理技能最多的 3 个人"
+    },
+    "skill_consolidate_every_n": {
+        "type": "int",
+        "default": 5,
+        "description": "每累计新增/更新多少个技能，才自动合并一次（0 = 关闭，只能手动 /hermes 技能整理）",
+        "hint": "技能整理会把技能正文全量发给模型，比记忆整理贵，因此默认 5 而不是 1"
+    },
+    "auto_skill": {
+        "type": "bool",
+        "default": true,
+        "description": "总结时允许模型提炼可复用技能（Markdown Skill）并自动保存"
+    },
+    "skill_notify_admin": {
+        "type": "bool",
+        "default": true,
+        "description": "新技能生成时主动通知最近活跃会话"
+    },
+    "llm_primary_provider": {
+        "type": "string",
+        "default": "",
+        "description": "总结时优先使用的模型（填 AstrBot 里的 provider ID，留空 = 跟随当前对话模型）",
+        "hint": "推荐在插件页面「模型」标签里选，那里能看到全部模型的上下文长度和连通性"
+    },
+    "llm_fallback_providers": {
+        "type": "list",
+        "default": [],
+        "description": "降级模型，按顺序尝试（主模型失败后依次使用）",
+        "hint": "最多 10 个；同样建议用「模型」页维护，支持上下移动排序"
+    },
+    "llm_max_retries": {
+        "type": "int",
+        "default": 2,
+        "min": 0,
+        "max": 9,
+        "description": "每个模型的重试次数（不含首次，0 = 失败立刻换下一个）",
+        "hint": "总尝试次数 = 重试次数 + 1；瞬时抖动多就调大，想快速降级就调小"
+    },
+    "llm_timeout": {
+        "type": "float",
+        "default": 90,
+        "min": 5,
+        "max": 600,
+        "description": "单次请求超时秒数",
+        "hint": "超时会计为可重试错误；长上下文模型整理大库时可能需要 120 以上"
+    },
+    "llm_backoff": {
+        "type": "float",
+        "default": 1.5,
+        "min": 0,
+        "max": 30,
+        "description": "重试退避基数（秒），实际等待按 基数×2^n 递增，上限 10 秒"
+    },
+    "llm_total_attempts": {
+        "type": "int",
+        "default": 8,
+        "min": 1,
+        "max": 30,
+        "description": "整条链最多尝试多少次，防止所有模型都挂时无限重试"
+    },
+    "llm_cooldown_seconds": {
+        "type": "int",
+        "default": 180,
+        "min": 0,
+        "max": 3600,
+        "description": "模型失败后冷却多少秒（冷却期内跳过它，避免每轮总结都先撞坏模型）",
+        "hint": "鉴权失败会自动按 4 倍冷却；0 = 不冷却"
+    },
+    "llm_max_prompt_chars": {
+        "type": "int",
+        "default": 24000,
+        "min": 2000,
+        "max": 200000,
+        "description": "单次送入模型的最大字符数（还会按模型上下文再压一次）",
+        "hint": "防 1M 上下文的模型把整段历史吞进去烧钱"
+    },
+    "llm_retry_on": {
+        "type": "list",
+        "default": [
+            "timeout",
+            "conn",
+            "rate",
+            "server",
+            "empty"
+        ],
+        "description": "这些错误会重试同一模型；未勾选的（如鉴权、上下文超长）直接换下一个模型",
+        "hint": "可选：timeout/conn/rate/server/empty/auth/ctx/other"
+    },
+    "summary_prompt": {
+        "type": "text",
+        "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
+        "description": "总结器使用的提示词"
+    }
 }

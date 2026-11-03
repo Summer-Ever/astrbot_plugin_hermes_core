@@ -213,6 +213,10 @@ class HermesWebAPI:
             "models": self._model_summary(),
             "recent_memories": db.all_memories(limit=8),
             "top_skills": sorted(skills, key=lambda s: -int(s.get("use_count") or 0))[:6],
+            "skills_split": {
+                "personal": len(skills),
+                "system": len(self.plugin.hub.system_skills()),
+            },
             "now": time.time(),
         })
 
@@ -326,37 +330,129 @@ class HermesWebAPI:
 
     # ---------- 技能 ----------
 
+    def _owner_label(self, row: dict, names: dict[str, str]) -> str:
+        scope = str(row.get("scope") or "private")
+        if scope == "global":
+            return "公共（所有人可读）"
+        if scope == "group":
+            gid = str(row.get("group_id") or "")
+            return f"群共享 {gid[-6:]}" if gid else "群共享"
+        oid = str(row.get("owner_id") or "")
+        nick = names.get(oid, "")
+        return f"{nick}（{oid[-6:]}）" if nick else (f"用户 {oid[-6:]}" if oid else "未归属")
+
     async def skills(self):
+        db = self.plugin.db
+        hub = self.plugin.hub
+        names = db.owner_names()
+        records = []
+        for row in db.all_skills():  # 管理员视角：所有人 + 公共的都列出来
+            row["source"] = "personal"
+            row["readonly"] = False
+            row["owner_label"] = self._owner_label(row, names)
+            records.append(row)
+        # 系统技能：AstrBot 本体装的，插件只读
+        system = []
+        for s in hub.system_skills(force=True):
+            system.append({
+                "id": f"sys:{s['slug']}",
+                "name": s["name"],
+                "trigger": s.get("trigger") or "",
+                "content": s.get("content") or "",
+                "path": s.get("path") or "",
+                "has_scripts": bool(s.get("has_scripts")),
+                "source": "system",
+                "readonly": True,
+                "owner_label": "AstrBot 本体（全局只读）",
+            })
+        owners = []
+        for r in db.skill_owners():
+            owners.append({
+                "owner_id": r.get("owner_id") or "",
+                "scope": r.get("scope") or "private",
+                "group_id": r.get("group_id") or "",
+                "count": int(r.get("c") or 0),
+                "label": self._owner_label(r, names),
+            })
         return json_response({
-            "records": self.plugin.db.all_skills(),
+            "records": records,
+            "system": system,
+            "owners": owners,
+            "system_root": hub.system_root,
             "max_direct": self._cfg("skill_consolidate_max", 40),
         })
 
     async def skill_save(self):
         data = await self._body()
+        db = self.plugin.db
         name = str(data.get("name") or "").strip()
         old_name = str(data.get("old_name") or "").strip()
         trigger = str(data.get("trigger") or "").strip()
         content = str(data.get("content") or "").strip()
+        owner_id = str(data.get("owner_id") or "").strip()
+        group_id = str(data.get("group_id") or "").strip()
+        scope = str(data.get("scope") or ("private" if owner_id else "global")).strip().lower()
+        if scope not in ("private", "group", "global"):
+            return self._fail("scope 只能是 private / group / global")
         if not name:
             return self._fail("技能名不能为空")
         if len(name) > 64 or any(ch.isspace() for ch in name):
             return self._fail("技能名最多 64 字符，且不能包含空格")
         if len(content) < 5:
             return self._fail("技能内容太短")
-        if old_name and old_name != name and self.plugin.db.peek_skill(name):
+
+        skill_id = data.get("id")
+        try:
+            skill_id = int(skill_id) if skill_id not in (None, "") else None
+        except (TypeError, ValueError):
+            skill_id = None
+
+        # 按 id 编辑：可以同时改归属（私人→群共享、转给别人）
+        if skill_id:
+            row = db.skill_by_id(skill_id)
+            if not row:
+                return self._fail("这条技能不存在，可能已被删除")
+            ok = db.move_skill(
+                skill_id, owner_id=owner_id, scope=scope, group_id=group_id,
+                name=name, trigger=trigger, content=content[:8000],
+            )
+            if not ok:
+                return self._fail(f"目标归属下已存在同名技能 {name}")
+            return json_response({"id": skill_id, "name": name, "updated": True})
+
+        if old_name and old_name != name and db.peek_skill(name, owner_id=owner_id,
+                                                           group_id=group_id):
             return self._fail("已存在同名技能")
-        created = self.plugin.db.upsert_skill(name, trigger, content[:8000])
+        created = db.upsert_skill(name, trigger, content[:8000], owner_id=owner_id,
+                                  scope=scope, group_id=group_id, origin="manual")
         if old_name and old_name != name:
-            self.plugin.db.delete_skill(old_name)
+            db.delete_skill(old_name, owner_id=owner_id, group_id=group_id)
         return json_response({"name": name, "created": bool(created)})
 
     async def skill_delete(self):
         data = await self._body()
+        db = self.plugin.db
+        skill_id = data.get("id")
+        if skill_id not in (None, ""):
+            try:
+                sid = int(skill_id)
+            except (TypeError, ValueError):
+                return self._fail("id 不合法")
+            row = db.skill_by_id(sid)
+            if not row:
+                return self._fail("这条技能不存在")
+            ok = db.delete_skill(row["name"], owner_id=row.get("owner_id") or "",
+                                 group_id=row.get("group_id") or "")
+            if not ok:  # 兜底：按 id 直接删
+                with db._lock:
+                    ok = db.conn.execute("DELETE FROM skills WHERE id = ?", (sid,)).rowcount > 0
+                    db.conn.commit()
+            return json_response({"deleted": bool(ok)})
         name = str(data.get("name") or "").strip()
         if not name:
-            return self._fail("缺少技能名")
-        ok = self.plugin.db.delete_skill(name)
+            return self._fail("缺少技能名或 id")
+        ok = db.delete_skill(name, owner_id=str(data.get("owner_id") or ""),
+                             group_id=str(data.get("group_id") or ""))
         return json_response({"deleted": bool(ok)})
 
     # ---------- 配置 ----------

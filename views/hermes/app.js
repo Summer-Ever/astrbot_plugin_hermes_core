@@ -32,7 +32,7 @@
     tab: "overview",
     overview: null,
     mem: { q: "", scope: "", kind: "", merged: false, limit: 50, offset: 0, total: 0, rows: [], selected: new Set() },
-    skills: { rows: [], filter: "", current: null, preview: false },
+    skills: { rows: [], system: [], owners: [], filter: "", current: null, currentId: null, preview: false },
     settings: { groups: [], dirty: false },
     models: { data: null, draft: null, dirty: false },
     aliases: [],
@@ -533,64 +533,136 @@
     try {
       const data = await apiGet("skills");
       state.skills.rows = data.records || [];
+      state.skills.system = data.system || [];
+      state.skills.owners = data.owners || [];
       renderSkillList();
-      if (state.skills.current) {
-        const still = state.skills.rows.find((s) => s.name === state.skills.current.name);
-        if (still) selectSkill(still.name); else clearSkillEditor();
+      if (state.skills.currentId) {
+        const still = findSkill(state.skills.currentId);
+        if (still) selectSkill(state.skills.currentId); else clearSkillEditor();
       }
     } catch (err) {
       $("#skill-list").innerHTML = `<div class="empty">加载失败：${esc(errMsg(err))}</div>`;
     }
   }
 
+  /** 技能分两个域：personal（按人隔离、可写）与 system（本体安装、只读）。 */
+  function findSkill(key) {
+    if (!key) return null;
+    if (String(key).startsWith("sys:")) {
+      return state.skills.system.find((s) => s.id === key) || null;
+    }
+    const id = Number(String(key).replace(/^p:/, ""));
+    return state.skills.rows.find((s) => s.id === id) || null;
+  }
+
+  function skillKey(s) {
+    return s.source === "system" ? s.id : `p:${s.id}`;
+  }
+
   function renderSkillList() {
     const kw = state.skills.filter.trim().toLowerCase();
-    const rows = state.skills.rows.filter((s) => !kw
+    const match = (s) => !kw
       || String(s.name).toLowerCase().includes(kw)
-      || String(s.trigger || "").toLowerCase().includes(kw));
-    $("#skill-count").textContent = `共 ${state.skills.rows.length} 个技能${kw ? `，匹配 ${rows.length} 个` : ""}`;
-    $("#skill-list").innerHTML = rows.length
-      ? rows.map((s) => `
-        <button class="skill-item ${state.skills.current && state.skills.current.name === s.name ? "active" : ""}" data-skill="${esc(s.name)}">
+      || String(s.trigger || "").toLowerCase().includes(kw);
+    const personal = state.skills.rows.filter(match);
+    const system = state.skills.system.filter(match);
+    const total = state.skills.rows.length + state.skills.system.length;
+    $("#skill-count").textContent = kw
+      ? `匹配 ${personal.length + system.length} / 共 ${total} 个技能`
+      : `我的 ${state.skills.rows.length} 个 · 系统 ${state.skills.system.length} 个`;
+
+    const item = (s) => {
+      const key = skillKey(s);
+      const ro = s.source === "system";
+      const meta = ro
+        ? `<span class="tag-ro">系统·只读</span>${s.has_scripts ? " 带脚本" : ""}`
+        : `${esc(s.owner_label || "")} · 使用 ${fmtNum(s.use_count)} 次`;
+      return `
+        <button class="skill-item ${state.skills.currentId === key ? "active" : ""}" data-skill="${esc(key)}">
           <div class="n mono">${esc(s.name)}</div>
           <div class="t">${esc(s.trigger || "通用")}</div>
-          <div class="u">使用 ${fmtNum(s.use_count)} 次 · ${fmtTime(s.created_ts)}</div>
-        </button>`).join("")
+          <div class="u">${meta}</div>
+        </button>`;
+    };
+
+    const parts = [];
+    if (personal.length) {
+      parts.push(`<div class="group-title">个人技能 <span>${personal.length}</span></div>`);
+      parts.push(personal.map(item).join(""));
+    }
+    if (system.length) {
+      parts.push(`<div class="group-title">系统技能 · 只读 <span>${system.length}</span></div>`);
+      parts.push(system.map(item).join(""));
+    }
+    $("#skill-list").innerHTML = parts.length
+      ? parts.join("")
       : '<div class="empty">没有匹配的技能</div>';
   }
 
   function clearSkillEditor() {
+    state.skills.currentId = null;
     state.skills.current = null;
     $("#skill-empty").classList.remove("hidden");
     $("#skill-editor").classList.add("hidden");
     renderSkillList();
   }
 
-  function selectSkill(name) {
-    const skill = state.skills.rows.find((s) => s.name === name);
+  function selectSkill(key) {
+    const skill = findSkill(key);
     if (!skill) return;
+    const readonly = skill.source === "system";
+    state.skills.currentId = key;
     state.skills.current = skill;
     $("#skill-empty").classList.add("hidden");
     $("#skill-editor").classList.remove("hidden");
     $("#sk-name").value = skill.name;
     $("#sk-trigger").value = skill.trigger || "";
     $("#sk-content").value = skill.content || "";
-    $("#sk-meta").textContent = `使用 ${fmtNum(skill.use_count)} 次 · 创建于 ${fmtTime(skill.created_ts)}`;
+    if (readonly) {
+      $("#sk-meta").textContent = "AstrBot 本体安装 · 全局共享";
+      $("#sk-owner").value = "";
+      $("#sk-scope").value = "global";
+      $("#sk-readonly").classList.remove("hidden");
+      $("#sk-readonly").innerHTML = "这是 <b>AstrBot 本体安装的系统技能</b>，全局共享"
+        + (skill.has_scripts ? "、含可执行脚本" : "")
+        + "。插件<b>不会写入</b>本体目录——改了会影响所有人，还可能在市场更新时被覆盖。"
+        + "<br>要改它：点「新建技能」用同名保存一份，或直接在 QQ 里让 AI 改（会自动生成属于你的个人副本，"
+        + "之后你优先读到个人版，本体原版不动）。";
+      $("#sk-content").setAttribute("readonly", "readonly");
+      $("#sk-save").disabled = true;
+      $("#sk-delete").disabled = true;
+    } else {
+      const scope = skill.scope || "private";
+      $("#sk-scope").value = scope;
+      $("#sk-owner").value = scope === "group" ? (skill.group_id || "") : (skill.owner_id || "");
+      $("#sk-meta").textContent = `${skill.owner_label || ""} · 使用 ${fmtNum(skill.use_count)} 次 · 创建于 ${fmtTime(skill.created_ts)}`;
+      $("#sk-readonly").classList.add("hidden");
+      $("#sk-content").removeAttribute("readonly");
+      $("#sk-save").disabled = false;
+      $("#sk-delete").disabled = false;
+    }
     state.skills.preview = false;
     $("#sk-preview").classList.add("hidden");
-    $("#sk-content").classList.remove("hidden");
+    $("#sk-content").classList.toggle("hidden", false);
     $("#sk-preview-toggle").textContent = "预览";
     renderSkillList();
   }
 
   function newSkill() {
+    state.skills.currentId = null;
     state.skills.current = null;
     $("#skill-empty").classList.add("hidden");
     $("#skill-editor").classList.remove("hidden");
     $("#sk-name").value = "";
     $("#sk-trigger").value = "";
     $("#sk-content").value = "";
+    $("#sk-scope").value = "private";
+    $("#sk-owner").value = "";
     $("#sk-meta").textContent = "新建技能";
+    $("#sk-readonly").classList.add("hidden");
+    $("#sk-content").removeAttribute("readonly");
+    $("#sk-save").disabled = false;
+    $("#sk-delete").disabled = true;
     state.skills.preview = false;
     $("#sk-preview").classList.add("hidden");
     $("#sk-content").classList.remove("hidden");
@@ -603,20 +675,35 @@
     const name = $("#sk-name").value.trim();
     const trigger = $("#sk-trigger").value.trim();
     const content = $("#sk-content").value;
+    const scope = $("#sk-scope").value;
+    const ownerField = $("#sk-owner").value.trim();
     if (!name) return toast("技能名不能为空", "err");
     if (content.trim().length < 5) return toast("技能内容太短", "err");
+    if (scope === "private" && !ownerField) {
+      return toast("私人技能需要填用户 ID（对话里那个没昵称的 ID 就是）", "err");
+    }
+    if (scope === "group" && !ownerField) {
+      return toast("群共享需要填群 ID", "err");
+    }
+    const payload = {
+      name,
+      old_name: state.skills.current ? state.skills.current.name : "",
+      trigger,
+      content,
+      scope,
+      owner_id: scope === "group" ? "" : ownerField,
+      group_id: scope === "group" ? ownerField : "",
+    };
+    if (state.skills.current) payload.id = state.skills.current.id;
     setBusy(btn, true, "保存中");
     try {
-      await apiPost("skills/save", {
-        name,
-        old_name: state.skills.current ? state.skills.current.name : "",
-        trigger,
-        content,
-      });
+      await apiPost("skills/save", payload);
       toast("已保存");
-      state.skills.current = { name };
+      const wantName = name;
+      state.skills.currentId = null;
       await loadSkills();
-      selectSkill(name);
+      const saved = state.skills.rows.find((s) => s.name === wantName);
+      if (saved) selectSkill(`p:${saved.id}`);
       loadOverview();
     } catch (err) {
       toast(errMsg(err), "err");
@@ -1159,16 +1246,17 @@
     });
     $("#sk-save").addEventListener("click", (e) => saveSkill(e.currentTarget));
     $("#sk-delete").addEventListener("click", () => {
+      const cur = state.skills.current;
       const name = $("#sk-name").value.trim();
-      if (!name) return;
+      if (!name || !cur || cur.source === "system") return;
       openModal({
         title: `删除技能 ${name}`,
-        sub: "删除后模型就不能再读取这个技能了",
-        bodyHtml: '<p class="muted">确认删除？</p>',
+        sub: `归属：${cur.owner_label || ""}`,
+        bodyHtml: '<p class="muted">只删这一份，其他人的同名技能不受影响。确认删除？</p>',
         okText: "删除",
         danger: true,
         onOk: async () => {
-          await apiPost("skills/delete", { name });
+          await apiPost("skills/delete", { id: cur.id, name });
           toast("已删除");
           clearSkillEditor();
           await loadSkills();

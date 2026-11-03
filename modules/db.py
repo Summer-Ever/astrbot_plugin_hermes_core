@@ -14,6 +14,43 @@ import threading
 import time
 
 
+# 技能表：唯一键是 (owner_id, name)，同一个人不能有两条同名技能，
+# 但不同的人可以各自持有同名技能（比如两个人都改过 computer-power）。
+# 注意：这里只建表，索引要等迁移完（老表补上 owner_id 列）再建，
+# 否则在老库上会因缺列直接抛错。
+SKILLS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS skills(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL DEFAULT 'private',
+        group_id TEXT DEFAULT '',
+        name TEXT NOT NULL,
+        trigger TEXT DEFAULT '',
+        content TEXT NOT NULL,
+        created_ts REAL NOT NULL,
+        updated_ts REAL DEFAULT 0,
+        use_count INTEGER DEFAULT 0,
+        merged_into INTEGER DEFAULT 0,
+        origin TEXT DEFAULT 'hermes'
+    );
+"""
+
+SKILLS_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_key ON skills(owner_id, name);
+    CREATE INDEX IF NOT EXISTS idx_skill_scope ON skills(scope, group_id);
+"""
+
+# 技能可见性：自己的 private + 本群 group + 全体 global。
+# owner_id 为空的存量记录一律按 global 处理，避免迁移后凭空消失。
+SKILL_VISIBLE_SQL = (
+    "merged_into = 0 AND ("
+    " (scope = 'private' AND owner_id = ? AND owner_id != '')"
+    " OR (scope = 'group' AND ? != '' AND group_id = ?)"
+    " OR scope = 'global'"
+    ")"
+)
+
+
 class HermesDB:
     def __init__(self, data_dir: str, db_name: str = "hermes.db"):
         os.makedirs(data_dir, exist_ok=True)
@@ -50,20 +87,18 @@ class HermesDB:
                 content TEXT NOT NULL,
                 source TEXT DEFAULT ''
             );
-            CREATE TABLE IF NOT EXISTS skills(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                trigger TEXT DEFAULT '',
-                content TEXT NOT NULL,
-                created_ts REAL NOT NULL,
-                use_count INTEGER DEFAULT 0
-            );
             CREATE TABLE IF NOT EXISTS meta(
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
             """
         )
+        # v0.9.0：技能按身份隔离。此前 name 是全局唯一，谁学的大家都能改，
+        # 和记忆的按人隔离对不上；现在唯一键是 (owner_id, name)，同一个技能名
+        # 允许每个人各有一份。
+        c.executescript(SKILLS_TABLE_SQL)
+        self._migrate_skills(c)
+        c.executescript(SKILLS_INDEX_SQL)
         fts_ok = True
         try:
             c.execute(
@@ -110,6 +145,45 @@ class HermesDB:
     @property
     def fts_enabled(self) -> bool:
         return self._fts_enabled
+
+    def _migrate_skills(self, c) -> None:
+        """把老库的全局技能表重建成按身份隔离的表。
+
+        老表是 `name TEXT UNIQUE`，SQLite 改不了约束，只能重建。
+        存量技能没有归属信息，统一归给「记忆最多的那个人」——通常就是一直在用
+        这个机器人的本人；如果库是空的，就退化成 global 共享。
+        """
+        cols = {r[1] for r in c.execute("PRAGMA table_info(skills)")}
+        if not cols or "owner_id" in cols:
+            return
+        try:
+            row = c.execute(
+                "SELECT owner_id FROM memories WHERE owner_id != ''"
+                " GROUP BY owner_id ORDER BY COUNT(*) DESC LIMIT 1"
+            ).fetchone()
+            owner = str(row[0] or "") if row else ""
+        except sqlite3.OperationalError:
+            owner = ""
+        scope = "private" if owner else "global"
+        try:
+            c.execute("ALTER TABLE skills RENAME TO skills_legacy_v080")
+        except sqlite3.OperationalError:
+            return
+        c.executescript(SKILLS_TABLE_SQL)
+        c.execute(
+            "INSERT INTO skills(owner_id, scope, group_id, name, trigger, content,"
+            " created_ts, updated_ts, use_count, merged_into, origin)"
+            " SELECT ?, ?, '', name, trigger, content, created_ts, created_ts,"
+            " COALESCE(use_count, 0), 0, 'hermes' FROM skills_legacy_v080",
+            (owner, scope),
+        )
+        c.execute("DROP TABLE skills_legacy_v080")
+        c.execute(
+            "INSERT INTO meta(key, value) VALUES('skills_migrated_v090', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (f"{owner or '(global)'}",),
+        )
+        c.commit()
 
     # ---------- messages ----------
 
@@ -530,73 +604,176 @@ class HermesDB:
             return cur.rowcount > 0
 
     # ---------- skills ----------
+    #
+    # 技能和记忆一样按人分：private 只有本人可见，group 同群可见，global 全体可见。
+    # 可见性 = 自己的 private ∪ 本群 group ∪ global。
 
-    def upsert_skill(self, name: str, trigger: str, content: str) -> bool:
-        """存在同名技能则更新内容，返回是否新建。"""
+    @staticmethod
+    def _norm_scope(owner_id: str, scope: str | None,
+                    group_id: str = "") -> tuple[str, str]:
+        """把 owner + scope 归一成合法组合，返回 (owner_id, scope)。"""
+        want = (scope or "").strip().lower()
+        if want == "global":
+            return "", "global"
+        if want == "group" and group_id:
+            return "", "group"
+        if owner_id:
+            return owner_id, "private"
+        return ("", "group") if group_id else ("", "global")
+
+    def upsert_skill(self, name: str, trigger: str, content: str, *,
+                     owner_id: str = "", scope: str | None = None,
+                     group_id: str = "", origin: str = "hermes") -> bool:
+        """写入某个人（或某个作用域）的技能，返回是否新建。"""
+        oid, scp = self._norm_scope(owner_id, scope, group_id)
+        gid = group_id if scp == "group" else ""
+        now = time.time()
         with self._lock:
             exist = self.conn.execute(
-                "SELECT id FROM skills WHERE name = ?", (name,)
+                "SELECT id FROM skills WHERE owner_id = ? AND name = ?", (oid, name)
             ).fetchone()
             if exist:
                 self.conn.execute(
-                    "UPDATE skills SET trigger = ?, content = ? WHERE id = ?",
-                    (trigger, content, exist["id"]),
+                    "UPDATE skills SET trigger = ?, content = ?, updated_ts = ?,"
+                    " scope = ?, group_id = ? WHERE id = ?",
+                    (trigger, content, now, scp, gid, exist["id"]),
                 )
                 created = False
             else:
                 self.conn.execute(
-                    "INSERT INTO skills(name, trigger, content, created_ts) VALUES(?,?,?,?)",
-                    (name, trigger, content, time.time()),
+                    "INSERT INTO skills(owner_id, scope, group_id, name, trigger, content,"
+                    " created_ts, updated_ts, origin) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (oid, scp, gid, name, trigger, content, now, now, origin),
                 )
                 created = True
             self.conn.commit()
             return created
 
-    def list_skills(self) -> list[dict]:
+    def list_skills(self, owner_id: str = "", group_id: str = "") -> list[dict]:
+        """列出发言人当前能看到的技能，自己的排最前。"""
         rows = self.conn.execute(
-            "SELECT id, name, trigger, use_count, created_ts FROM skills ORDER BY id"
+            "SELECT id, owner_id, scope, group_id, name, trigger, use_count,"
+            " created_ts, updated_ts, origin FROM skills"
+            f" WHERE {SKILL_VISIBLE_SQL}"
+            " ORDER BY CASE scope WHEN 'private' THEN 0 WHEN 'group' THEN 1 ELSE 2 END, id",
+            (owner_id, group_id, group_id),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def all_skills(self) -> list[dict]:
-        """带正文的完整技能列表，供 WebUI 展示/编辑。"""
+    def all_skills(self, owner_id: str | None = None,
+                   group_id: str | None = None) -> list[dict]:
+        """带正文的完整技能列表，供 WebUI 展示/编辑。
+
+        owner_id 传 None 表示不过滤（管理员视角看全部人）。
+        """
+        conds: list[str] = []
+        args: list = []
+        if owner_id is not None:
+            conds.append("owner_id = ?")
+            args.append(owner_id)
+        if group_id is not None:
+            conds.append("group_id = ?")
+            args.append(group_id)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
         rows = self.conn.execute(
-            "SELECT * FROM skills ORDER BY use_count DESC, id"
+            "SELECT * FROM skills" + where + " ORDER BY use_count DESC, id", args
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def peek_skill(self, name: str) -> dict | None:
-        """读取技能但不像 get_skill 那样增加使用计数（写入/合并时用）。"""
-        row = self.conn.execute(
-            "SELECT * FROM skills WHERE name = ?", (name,)
+    def _pick_skill(self, name: str, owner_id: str, group_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM skills WHERE name = ? AND " + SKILL_VISIBLE_SQL +
+            " ORDER BY CASE scope WHEN 'private' THEN 0 WHEN 'group' THEN 1 ELSE 2 END,"
+            " id DESC LIMIT 1",
+            (name, owner_id, group_id, group_id),
         ).fetchone()
+
+    def peek_skill(self, name: str, owner_id: str = "",
+                   group_id: str = "") -> dict | None:
+        """读取技能但不像 get_skill 那样增加使用计数（写入/合并时用）。"""
+        row = self._pick_skill(name, owner_id, group_id)
         return dict(row) if row else None
 
-    def delete_skill(self, name: str) -> bool:
+    def delete_skill(self, name: str, owner_id: str = "",
+                     group_id: str = "") -> bool:
+        """只删当前身份能看到的那一条，不会误删别人的同名技能。"""
+        row = self._pick_skill(name, owner_id, group_id)
+        if not row:
+            return False
         with self._lock:
-            cur = self.conn.execute("DELETE FROM skills WHERE name = ?", (name,))
+            cur = self.conn.execute("DELETE FROM skills WHERE id = ?", (row["id"],))
             self.conn.commit()
             return cur.rowcount > 0
 
+    def move_skill(self, skill_id: int, *, owner_id: str = "",
+                   scope: str = "private", group_id: str = "",
+                   name: str | None = None, trigger: str | None = None,
+                   content: str | None = None) -> bool:
+        """按 id 改技能的归属/内容（WebUI 编辑与「发给本群」都用它）。
+
+        改名撞上同一归属域里已有的同名技能时返回 False，不写库。
+        """
+        oid, scp = self._norm_scope(owner_id, scope, group_id)
+        try:
+            with self._lock:
+                self.conn.execute(
+                    "UPDATE skills SET owner_id = ?, scope = ?, group_id = ?,"
+                    " name = COALESCE(?, name), trigger = COALESCE(?, trigger),"
+                    " content = COALESCE(?, content), updated_ts = ? WHERE id = ?",
+                    (oid, scp, group_id if scp == "group" else "", name, trigger,
+                     content, time.time(), skill_id),
+                )
+                self.conn.commit()
+                return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def skill_by_id(self, skill_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM skills WHERE id = ?", (skill_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def owner_names(self) -> dict[str, str]:
+        """从历史消息里捞每位用户的昵称，供 WebUI 标注技能归属。"""
+        try:
+            rows = self.conn.execute(
+                "SELECT sender_id, sender_name, MAX(ts) t FROM messages"
+                " WHERE sender_id != '' AND sender_name NOT IN ('', '.', '。')"
+                " GROUP BY sender_id ORDER BY t DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {str(r["sender_id"]): str(r["sender_name"]) for r in rows}
+
     def replace_skills(self, old_names: list[str], name: str, trigger: str,
-                       content: str) -> None:
-        """技能整合：写入合并后的技能，并删除被并入的旧技能。"""
+                       content: str, *, owner_id: str = "", scope: str | None = None,
+                       group_id: str = "") -> None:
+        """技能整合：写入合并后的技能，并删除同作用域内被并入的旧技能。
+
+        只动同一个人的技能，绝不跨用户合并。
+        """
+        oid, scp = self._norm_scope(owner_id, scope, group_id)
+        gid = group_id if scp == "group" else ""
+        now = time.time()
         with self._lock:
             self.conn.execute(
-                "INSERT INTO skills(name, trigger, content, created_ts) VALUES(?,?,?,?)"
-                " ON CONFLICT(name) DO UPDATE SET trigger = excluded.trigger,"
-                " content = excluded.content",
-                (name, trigger, content, time.time()),
+                "INSERT INTO skills(owner_id, scope, group_id, name, trigger, content,"
+                " created_ts, updated_ts) VALUES(?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(owner_id, name) DO UPDATE SET trigger = excluded.trigger,"
+                " content = excluded.content, updated_ts = excluded.updated_ts",
+                (oid, scp, gid, name, trigger, content, now, now),
             )
             for old in old_names:
                 if old and old != name:
-                    self.conn.execute("DELETE FROM skills WHERE name = ?", (old,))
+                    self.conn.execute(
+                        "DELETE FROM skills WHERE owner_id = ? AND name = ?", (oid, old)
+                    )
             self.conn.commit()
 
-    def get_skill(self, name: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT * FROM skills WHERE name = ?", (name,)
-        ).fetchone()
+    def get_skill(self, name: str, owner_id: str = "",
+                  group_id: str = "") -> dict | None:
+        row = self._pick_skill(name, owner_id, group_id)
         if not row:
             return None
         self.conn.execute(
@@ -604,6 +781,26 @@ class HermesDB:
         )
         self.conn.commit()
         return dict(row)
+
+    def skill_owners(self) -> list[dict]:
+        """按归属统计技能数量，供技能整理分组和 WebUI 筛选。"""
+        rows = self.conn.execute(
+            "SELECT owner_id, scope, group_id, COUNT(*) c FROM skills"
+            " WHERE merged_into = 0 GROUP BY owner_id, scope, group_id"
+            " ORDER BY c DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def skills_in(self, owner_id: str = "", scope: str = "private",
+                  group_id: str = "") -> list[dict]:
+        """取出某个归属域内的全部技能（整理合并只在这个域里做）。"""
+        rows = self.conn.execute(
+            "SELECT id, owner_id, scope, group_id, name, trigger, content, use_count"
+            " FROM skills WHERE owner_id = ? AND scope = ? AND group_id = ?"
+            " AND merged_into = 0 ORDER BY id",
+            (owner_id, scope, group_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---------- meta ----------
 
