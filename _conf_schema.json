@@ -62,7 +62,13 @@
     "type": "bool",
     "default": true,
     "description": "记忆巩固：总结后把碎片化的相似记忆合并成一条",
-    "hint": "先用本地相似度聚类，只有发现重复才会调用模型，平时几乎不额外花钱"
+    "hint": "合并只在攒够阈值时触发（见下一项），不是每条记忆都调模型"
+  },
+  "consolidate_every_n_memories": {
+    "type": "int",
+    "default": 10,
+    "description": "每累计新增多少条记忆，才自动合并一次（0 = 关闭自动整理，只能用 /hermes 整理 手动触发）",
+    "hint": "一次整理 = 一次模型调用。1 等于旧行为（每轮总结都整理）；10 表示约每 10 条新记忆才多花一次调用"
   },
   "consolidate_threshold": {
     "type": "float",
@@ -96,6 +102,12 @@
     "default": 40,
     "description": "技能不超过这个数量时，整理会全部交给模型判断（不靠字面筛选）",
     "hint": "技能多于此数才用 skill_merge_threshold 粗筛，避免一次请求过长"
+  },
+  "skill_consolidate_every_n": {
+    "type": "int",
+    "default": 5,
+    "description": "每累计新增/更新多少个技能，才自动合并一次（0 = 关闭，只能手动 /hermes 技能整理）",
+    "hint": "技能整理会把技能正文全量发给模型，比记忆整理贵，因此默认 5 而不是 1"
   },
   "auto_skill": {
     "type": "bool",

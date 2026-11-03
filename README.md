@@ -135,7 +135,10 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 用的时候模型只捞到一条；技能更糟——同一个绘图能力被总结三次，就变成三个技能，
 每次用之前都得读一遍。
 
-所以每次总结写入新记忆后，会自动跑一次**巩固**：
+整理要花一次模型调用，所以**不逐条整理**，而是先排队、攒够阈值再一次性处理
+（详见下面的「什么时候整理」）。
+
+攒够之后会自动跑一次**巩固**：
 
 1. **本地找候选**：拿刚写的记忆和同一用户/同一群的历史记忆比字面相似度（字符二元组 Jaccard），
    只把相近的挑出来。没有候选就结束，不花钱。
@@ -146,6 +149,28 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 
 字面相似度**只用来召回**，不直接决定合并。原因很实在：`喜欢吃香蕉 / 喜欢吃苹果` 相似度只有 0.33，
 而 `养了只猫叫咪咪 / 养了只狗叫旺财` 有 0.38——字面分不出该不该合，得靠模型读语义。
+
+### 什么时候整理：攒够 N 条才合并（v0.6.1）
+
+新记忆不会立刻合并，而是进一个**待整理队列**，等队列攒够阈值再一次性处理：
+
+| 配置项 | 默认 | 含义 |
+|---|---|---|
+| `consolidate_every_n_memories` | 10 | 累计新增 10 条记忆才整理一次；`0` = 关闭自动，只能手动 `/hermes 整理` |
+| `skill_consolidate_every_n` | 5 | 累计新增/更新 5 个技能才合并一次；`0` = 关闭自动，只能手动 `/hermes 技能整理` |
+
+这样 100 条新记忆最多触发 10 次整理，而不是每次总结都多花一次调用。
+队列里的 id 存在 `meta.consolidate_pending_memories`（上限 200 条，超出丢最旧的），
+模型手动 `save_memory`、`/hermes 记住` 存的记忆也会进队列，不会漏掉。
+
+`/hermes 状态` 里能看到进度：
+
+```
+自动整理: 记忆 3/10 条、技能 1/5 个 触发一次（每次约 1 次模型调用）
+```
+
+整理失败（模型超时、报错）时**不清队列**，下一轮自动重试；成功才清零。
+手动执行 `/hermes 整理` / `/hermes 技能整理` 会顺手清空对应队列，避免重复整理。
 
 技能的重复问题走另一条路：
 
@@ -220,11 +245,14 @@ python hot_reload.py --pull        # 拉代码 + 重载 + 核对是否真的生�
 - `inject_memories_topk` / `inject_history_topk`：注入条数
 - `auto_summarize` + `summarize_interval_minutes` + `min_new_messages` + `summarize_grace_hours`：自动总结节奏（见下）
 - `auto_skill`：允许总结时自动提炼技能
-- `auto_consolidate`：总结后自动把相似记忆合并（默认开）
+- `auto_consolidate`：自动整理总开关（默认开）
+- `consolidate_every_n_memories`：攒够多少条新记忆才整理一次（默认 10，`0` = 关闭自动）
+- `skill_consolidate_every_n`：攒够多少个新/更新技能才合并一次（默认 5，`0` = 关闭自动）
 - `consolidate_threshold`：召回相似记忆的阈值（默认 0.3，只影响候选范围）
 - `consolidate_min_memories` / `consolidate_max_clusters`：最少多少条才整理、单次最多整理几组（控花费）
 - `skill_merge_same_name`：同名技能先读旧版再合并（默认开）
 - `skill_merge_threshold`：召回重叠技能的阈值（默认 0.2，是否合并仍由模型判断）
+- `skill_consolidate_max`：技能不超过此数时全量交给模型整理（默认 40）
 - `summary_prompt`：总结器提示词，可自定义输出协议
 
 ## QQ 官方机器人注意事项

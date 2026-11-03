@@ -88,7 +88,7 @@ try:
 except ImportError:
     Image = None
 
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.6.1"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -388,6 +388,7 @@ class HermesCore(Star):
                                  source="llm_tool", owner_id=sc["owner_id"],
                                  session_id=sc["sid"], platform=sc["platform"],
                                  group_id=sc["group_id"])
+        self._queue_memories([mid])  # 手动存的也进整理队列，攒够阈值一起合并
         return f"已保存记忆 #{mid}。"
 
     @filter.llm_tool(name="list_skills")
@@ -509,18 +510,31 @@ class HermesCore(Star):
         summary = (f"[hermes_core] 总结完成：{len(details)} 个会话 / {done_msgs} 条消息，"
                    f"新记忆 {made_mem} 条，技能 新增 {made_skill} / 更新 {skill_upd} 个。")
 
-        # 记忆巩固：把碎片化的相似记忆合成一条，避免越攒越散
-        if made_mem and bool(self._get_cfg("auto_consolidate", True)):
+        # 记忆巩固：攒够 N 条新记忆才整理一次（一次整理 = 一次模型调用，别每条都调）
+        new_ids = {m["id"] for m in self.db.all_active_memories() if m["id"] > before_max}
+        queued = self._queue_memories(new_ids) if new_ids else self._queued_memory_count()
+        if self._should_consolidate_memories(queued):
             try:
-                new_ids = {
-                    m["id"] for m in self.db.all_active_memories()
-                    if m["id"] > before_max
-                }
-                note = await self._consolidate_memories(provider, focus_ids=new_ids)
+                note = await self._consolidate_memories(provider, focus_ids=set(self._pending_memory_ids()))
                 if note and not note.startswith("记忆只有"):
                     summary += "\n" + note
+                self._reset_memory_queue()
             except Exception:
+                # 出错不清队列，下一轮重试
                 logger.error(f"[hermes_core] 记忆巩固失败:\n{traceback.format_exc()}")
+
+        # 技能合并：同理，攒够 N 个新增/更新技能才跑一次（技能整理是全量发给模型，更贵）
+        if made_skill or skill_upd:
+            pend_skill = self._bump_skill_queue(made_skill + skill_upd)
+        else:
+            pend_skill = int(self.db.get_meta("skill_consolidate_pending", "0") or 0)
+        if self._should_consolidate_skills(pend_skill):
+            try:
+                note = await self._consolidate_skills(provider)
+                summary += "\n" + note
+                self.db.set_meta("skill_consolidate_pending", "0")
+            except Exception:
+                logger.error(f"[hermes_core] 技能整理失败:\n{traceback.format_exc()}")
 
         logger.info(summary + " | " + "；".join(details))
         if made_skill and self._get_cfg("skill_notify_admin", True) and self._last_origin \
@@ -611,6 +625,75 @@ class HermesCore(Star):
                 )
                 made_mem += 1
         return made_mem, made_skill, skill_upd
+
+    # ============ 整理队列：攒够 N 条才合并 ============
+    #
+    # 合并是「一次模型调用」，逐条触发会变成每轮总结都多花一次钱。
+    # 所以新记忆不立即合并，先排进队列，攒到阈值再一次性处理：
+    #   meta.consolidate_pending_memories = 新记忆 id 列表（JSON，上限 200）
+    #   meta.skill_consolidate_pending   = 新增/更新技能的累计计数
+
+    MAX_QUEUE = 200
+
+    def _pending_memory_ids(self) -> list[int]:
+        raw = self.db.get_meta("consolidate_pending_memories", "")
+        if not raw:
+            return []
+        try:
+            return [int(i) for i in json.loads(raw)]
+        except Exception:
+            return []
+
+    def _queued_memory_count(self) -> int:
+        return len(self._pending_memory_ids())
+
+    def _queue_memories(self, ids) -> int:
+        """把新记忆加入待整理队列，返回队列长度。"""
+        queue = self._pending_memory_ids()
+        seen = set(queue)
+        for i in ids:
+            i = int(i)
+            if i not in seen:
+                queue.append(i)
+                seen.add(i)
+        queue = queue[-self.MAX_QUEUE:]
+        self.db.set_meta("consolidate_pending_memories", json.dumps(queue))
+        return len(queue)
+
+    def _reset_memory_queue(self):
+        self.db.set_meta("consolidate_pending_memories", "[]")
+
+    def _bump_skill_queue(self, n: int) -> int:
+        cur = int(self.db.get_meta("skill_consolidate_pending", "0") or 0) + max(0, n)
+        self.db.set_meta("skill_consolidate_pending", str(cur))
+        return cur
+
+    def _mem_every(self) -> int:
+        return max(0, int(self._get_cfg("consolidate_every_n_memories", 10)))
+
+    def _skill_every(self) -> int:
+        return max(0, int(self._get_cfg("skill_consolidate_every_n", 5)))
+
+    def _should_consolidate_memories(self, queued: int) -> bool:
+        every = self._mem_every()
+        if every <= 0 or not bool(self._get_cfg("auto_consolidate", True)):
+            return False
+        return queued >= every
+
+    def _should_consolidate_skills(self, queued: int) -> bool:
+        every = self._skill_every()
+        if every <= 0:
+            return False
+        return queued >= every and self.db.stats()["skills"] >= 2
+
+    def _queue_progress(self) -> str:
+        """给 /hermes 状态 用：离下次自动整理还差多少。"""
+        mem_every, sk_every = self._mem_every(), self._skill_every()
+        mem_on = mem_every > 0 and bool(self._get_cfg("auto_consolidate", True))
+        mem_txt = f"记忆 {self._queued_memory_count()}/{mem_every} 条" if mem_on else "记忆 关闭"
+        sk_n = int(self.db.get_meta("skill_consolidate_pending", "0") or 0)
+        sk_txt = f"技能 {sk_n}/{sk_every} 个" if sk_every > 0 else "技能 关闭"
+        return f"{mem_txt}、{sk_txt} 触发一次（每次约 1 次模型调用）"
 
     # ============ 记忆巩固（consolidation）============
 
@@ -878,7 +961,8 @@ class HermesCore(Star):
             f"FTS5 检索: {'开启' if self.db.fts_enabled else '退化 LIKE'}\n"
             f"自动总结: {'每 ' + str(interval) + ' 分钟检查（单会话满 ' + str(min_new)
                          + ' 条或超 ' + str(grace) + ' 小时兜底）' if self._get_cfg('auto_summarize', True) else '关闭'}\n"
-            f"待总结: {pend_info}"
+            f"待总结: {pend_info}\n"
+            f"自动整理: {self._queue_progress()}"
         )
 
     @hermes.command("总结")
@@ -897,7 +981,10 @@ class HermesCore(Star):
         dry = mode.strip() in ("预览", "试运行", "dry", "dry-run")
         yield event.plain_result("正在整理记忆（先本地聚类，有候选才会调用模型）……")
         try:
-            yield event.plain_result(await self._consolidate_memories(provider, dry_run=dry))
+            out = await self._consolidate_memories(provider, dry_run=dry)
+            if not dry:
+                self._reset_memory_queue()  # 全库刚整理过，队列里的 id 已经没意义
+            yield event.plain_result(out)
         except Exception:
             yield event.plain_result(f"整理失败：{traceback.format_exc(limit=3)}")
 
@@ -911,7 +998,10 @@ class HermesCore(Star):
         dry = mode.strip() in ("预览", "试运行", "dry", "dry-run")
         yield event.plain_result("正在检查技能重叠情况……")
         try:
-            yield event.plain_result(await self._consolidate_skills(provider, dry_run=dry))
+            out = await self._consolidate_skills(provider, dry_run=dry)
+            if not dry:
+                self.db.set_meta("skill_consolidate_pending", "0")
+            yield event.plain_result(out)
         except Exception:
             yield event.plain_result(f"整理失败：{traceback.format_exc(limit=3)}")
 
@@ -925,11 +1015,15 @@ class HermesCore(Star):
                                  source="manual", owner_id=sc["owner_id"],
                                  session_id=sc["sid"], platform=sc["platform"],
                                  group_id=sc["group_id"])
+        self._queue_memories([mid])
         yield event.plain_result(f"已记住（#{mid}）：{content.strip()}")
 
     @hermes.command("忘记")
     async def hermes_forget(self, event: AstrMessageEvent, memory_id: int):
         ok = self.db.delete_memory(memory_id)
+        if ok:
+            queue = [i for i in self._pending_memory_ids() if i != int(memory_id)]
+            self.db.set_meta("consolidate_pending_memories", json.dumps(queue))
         yield event.plain_result(f"记忆 #{memory_id} 已删除。" if ok else f"记忆 #{memory_id} 不存在。")
 
     @hermes.command("记忆")
