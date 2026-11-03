@@ -462,6 +462,67 @@ class HermesDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def query_memories(self, q: str = "", scope: str = "", kind: str = "",
+                       owner_id: str = "", include_merged: bool = False,
+                       limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
+        """供 WebUI 列表使用：关键词/作用域/类型筛选 + 分页，返回 (rows, total)。"""
+        where: list[str] = []
+        args: list = []
+        if not include_merged:
+            where.append("merged_into = 0")
+        if scope:
+            where.append("scope = ?")
+            args.append(scope)
+        if kind:
+            where.append("kind = ?")
+            args.append(kind)
+        if owner_id:
+            where.append("(owner_id LIKE ? OR session_id LIKE ? OR group_id LIKE ?)")
+            like = f"%{owner_id[:100]}%"
+            args += [like, like, like]
+        if q.strip():
+            like = f"%{q.strip()[:100]}%"
+            where.append("(content LIKE ? OR owner_id LIKE ? OR group_id LIKE ?"
+                         " OR session_id LIKE ?)")
+            args += [like, like, like, like]
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        total = self.conn.execute(
+            f"SELECT COUNT(*) c FROM memories{clause}", tuple(args)
+        ).fetchone()["c"]
+        rows = self.conn.execute(
+            f"SELECT * FROM memories{clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*args, max(1, min(int(limit), 200)), max(0, int(offset))),
+        ).fetchall()
+        return [dict(r) for r in rows], int(total)
+
+    def update_memory(self, memory_id: int, content: str | None = None,
+                      kind: str | None = None) -> bool:
+        sets: list[str] = []
+        args: list = []
+        if content is not None:
+            sets.append("content = ?")
+            args.append(content.strip())
+        if kind is not None:
+            sets.append("kind = ?")
+            args.append(kind.strip())
+        if not sets:
+            return False
+        sets.append("updated_ts = ?")
+        args.append(time.time())
+        args.append(int(memory_id))
+        with self._lock:
+            cur = self.conn.execute(
+                f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", tuple(args)
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def memory_kind_counts(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT kind, COUNT(*) c FROM memories WHERE merged_into = 0 GROUP BY kind"
+        ).fetchall()
+        return {r["kind"] or "fact": int(r["c"]) for r in rows}
+
     def delete_memory(self, memory_id: int) -> bool:
         with self._lock:
             cur = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
@@ -494,6 +555,13 @@ class HermesDB:
     def list_skills(self) -> list[dict]:
         rows = self.conn.execute(
             "SELECT id, name, trigger, use_count, created_ts FROM skills ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_skills(self) -> list[dict]:
+        """带正文的完整技能列表，供 WebUI 展示/编辑。"""
+        rows = self.conn.execute(
+            "SELECT * FROM skills ORDER BY use_count DESC, id"
         ).fetchall()
         return [dict(r) for r in rows]
 

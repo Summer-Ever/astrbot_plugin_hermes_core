@@ -88,7 +88,7 @@ try:
 except ImportError:
     Image = None
 
-PLUGIN_VERSION = "0.6.1"
+PLUGIN_VERSION = "0.7.0"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -180,8 +180,35 @@ class HermesCore(Star):
         logger.info(f"[hermes_core] 已加载，FTS5: {'开启' if self.db.fts_enabled else '不可用(退化为 LIKE)'}")
         self._migrate_watermarks()
         self._check_memory_conflicts()
+        self._register_web_apis()
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
+
+    def _register_web_apis(self):
+        """把 WebUI 接口挂到 dashboard 上（页面见 views/hermes/）。
+
+        导入方式沿用 db 的三级兜底：真实部署里插件可能不是以包的形式加载，
+        `from .webapi import ...` 会失败，需要退化到同名模块/文件加载。
+        """
+        try:
+            try:
+                from .webapi import HermesWebAPI
+            except ImportError:
+                try:
+                    from webapi import HermesWebAPI
+                except ImportError:
+                    import importlib.util
+                    _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapi.py")
+                    _spec = importlib.util.spec_from_file_location("hermes_webapi", _p)
+                    _mod = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    HermesWebAPI = _mod.HermesWebAPI
+            self._web_api = HermesWebAPI(self, PLUGIN_VERSION, _default_data_dir)
+            self._web_api.register()
+            logger.info("[hermes_core] WebUI 接口已注册：/views/hermes/")
+        except Exception:
+            logger.error(f"[hermes_core] 注册 WebUI 接口失败:\n{traceback.format_exc()}")
+
 
     def _migrate_watermarks(self):
         """v0.4 起总结水位按会话独立。老库只有全局 last_summarized_id，

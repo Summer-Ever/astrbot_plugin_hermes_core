@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "Hermes 记忆系统",
+    "description": "复刻 Hermes 的学习闭环：长期记忆、技能沉淀、自动整理，并带可视化管理页面"
+  },
+  "views": {
+    "hermes": {
+      "title": "记忆与技能"
+    }
+  }
+}

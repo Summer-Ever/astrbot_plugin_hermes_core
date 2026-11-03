@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hermes 记忆系统</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="shell">
+    <!-- 侧栏：与 AstrBot 面板其它页面一致的导航形态 -->
+    <aside class="side">
+      <div class="brand">
+        <span class="logo">H</span>
+        <div>
+          <strong>Hermes</strong>
+          <small>记忆与技能</small>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-tab="overview"><span class="dot"></span>概览</button>
+        <button class="nav-item" data-tab="memories"><span class="dot"></span>记忆</button>
+        <button class="nav-item" data-tab="skills"><span class="dot"></span>技能</button>
+        <button class="nav-item" data-tab="settings"><span class="dot"></span>设置</button>
+        <button class="nav-item" data-tab="tools"><span class="dot"></span>工具</button>
+      </nav>
+
+      <div class="side-foot">
+        <div class="line"><span>版本</span><b id="side-version">—</b></div>
+        <div class="line"><span>记忆队列</span><b id="side-queue-mem">—</b></div>
+        <div class="line"><span>技能队列</span><b id="side-queue-skill">—</b></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="bridge-banner" class="banner hidden">
+        当前页面没有连上 AstrBot 面板，数据接口不可用。请从 AstrBot WebUI 的插件页面入口打开。
+      </div>
+
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">概览</h1>
+          <p id="page-sub">记忆、技能与自动整理的运行状态</p>
+        </div>
+        <div class="top-actions">
+          <button class="btn ghost" id="btn-refresh">刷新</button>
+        </div>
+      </header>
+
+      <!-- ============ 概览 ============ -->
+      <section id="tab-overview" class="tab-panel active">
+        <div class="grid c4" id="stat-grid">
+          <div class="card stat">
+            <div class="k">对话消息</div>
+            <div class="v" id="stat-messages">—</div>
+            <div class="d" id="stat-sessions">— 个会话</div>
+          </div>
+          <div class="card stat accent">
+            <div class="k">长期记忆</div>
+            <div class="v" id="stat-memories">—</div>
+            <div class="d" id="stat-merged">已合并 — 条</div>
+          </div>
+          <div class="card stat">
+            <div class="k">技能</div>
+            <div class="v" id="stat-skills">—</div>
+            <div class="d" id="stat-kinds">—</div>
+          </div>
+          <div class="card stat">
+            <div class="k">待整理</div>
+            <div class="v" id="stat-queue">—</div>
+            <div class="d" id="stat-pending">待总结 — 条</div>
+          </div>
+        </div>
+
+        <div class="grid c2" style="margin-top:14px">
+          <div class="card">
+            <div class="card-head">
+              <h2>运行状态</h2>
+              <span class="sub" id="run-version"></span>
+            </div>
+            <dl class="kv" id="run-kv"></dl>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h2>自动整理队列</h2>
+              <button class="btn tiny ghost" data-goto="settings">调整阈值</button>
+            </div>
+            <div id="queue-box"></div>
+            <div class="hint faint" style="font-size:11.5px;margin-top:8px">
+              每攒够阈值才调用一次模型；想立刻整理可以去「工具」页手动执行。
+            </div>
+          </div>
+        </div>
+
+        <div class="grid c2" style="margin-top:14px">
+          <div class="card">
+            <div class="card-head">
+              <h2>最近记忆</h2>
+              <button class="btn tiny ghost" data-goto="memories">查看全部</button>
+            </div>
+            <div class="mini-list" id="recent-memories"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h2>技能使用 Top</h2>
+              <button class="btn tiny ghost" data-goto="skills">管理技能</button>
+            </div>
+            <div class="mini-list" id="top-skills"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 记忆 ============ -->
+      <section id="tab-memories" class="tab-panel">
+        <div class="card">
+          <div class="toolbar">
+            <div class="grow">
+              <input type="search" id="mem-q" placeholder="搜索内容 / 归属 ID / 群 ID / 会话 ID，回车搜索" />
+            </div>
+            <select id="mem-scope" title="作用域">
+              <option value="">全部作用域</option>
+              <option value="user">按用户</option>
+              <option value="group">按群/会话</option>
+              <option value="global">全局</option>
+            </select>
+            <select id="mem-kind" title="类型">
+              <option value="">全部类型</option>
+              <option value="fact">事实</option>
+              <option value="preference">偏好</option>
+              <option value="profile">画像</option>
+              <option value="summary">摘要</option>
+            </select>
+            <label class="chip" style="cursor:pointer">
+              <input type="checkbox" class="checkbox" id="mem-merged" /> 显示已合并
+            </label>
+            <button class="btn primary" id="mem-search">搜索</button>
+            <button class="btn ghost" id="mem-add">＋ 新增</button>
+          </div>
+
+          <div class="bulkbar hidden" id="mem-bulk">
+            <span id="mem-sel-count">已选 0 条</span>
+            <button class="btn tiny" id="mem-merge">合并为一条</button>
+            <button class="btn tiny danger" id="mem-del">删除所选</button>
+            <span class="spacer"></span>
+            <button class="btn tiny ghost" id="mem-clear-sel">取消选择</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:34px"><input type="checkbox" class="checkbox" id="mem-check-all" /></th>
+                  <th style="width:56px">ID</th>
+                  <th style="width:74px">类型</th>
+                  <th>内容</th>
+                  <th style="width:150px">归属</th>
+                  <th style="width:92px">来源</th>
+                  <th style="width:132px">时间</th>
+                  <th style="width:96px">操作</th>
+                </tr>
+              </thead>
+              <tbody id="mem-tbody"></tbody>
+            </table>
+          </div>
+          <div class="pager">
+            <span id="mem-total">—</span>
+            <div class="row">
+              <button class="btn tiny" id="mem-prev">上一页</button>
+              <span id="mem-page">1 / 1</span>
+              <button class="btn tiny" id="mem-next">下一页</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 技能 ============ -->
+      <section id="tab-skills" class="tab-panel">
+        <div class="split">
+          <div class="card list-pane">
+            <input type="search" id="skill-q" placeholder="筛选技能名 / 触发条件" />
+            <button class="btn primary block" id="skill-new">＋ 新建技能</button>
+            <div class="skill-list" id="skill-list"></div>
+            <div class="faint" style="font-size:11.5px" id="skill-count">—</div>
+          </div>
+
+          <div class="card editor-pane">
+            <div id="skill-empty" class="empty">从左侧选择一个技能，或新建一个</div>
+            <div id="skill-editor" class="hidden">
+              <div class="editor-head">
+                <label class="field" style="margin:0">
+                  <span class="label">技能名</span>
+                  <input type="text" id="sk-name" placeholder="英文短名，如 draw_mermaid" />
+                </label>
+                <label class="field" style="margin:0;flex:2">
+                  <span class="label">触发条件</span>
+                  <input type="text" id="sk-trigger" placeholder="什么时候该用这个技能" />
+                </label>
+              </div>
+              <div class="row-between" style="margin:14px 0 6px">
+                <span class="label muted" style="font-size:12.5px">技能正文（Markdown）</span>
+                <div class="row">
+                  <button class="btn tiny ghost" id="sk-preview-toggle">预览</button>
+                </div>
+              </div>
+              <textarea id="sk-content" spellcheck="false" placeholder="按步骤写清楚，模型会照着执行"></textarea>
+              <pre id="sk-preview" class="md hidden"></pre>
+              <div class="row-between" style="margin-top:12px">
+                <span class="faint" style="font-size:11.5px" id="sk-meta"></span>
+                <div class="row">
+                  <button class="btn danger" id="sk-delete">删除</button>
+                  <button class="btn primary" id="sk-save">保存</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 设置 ============ -->
+      <section id="tab-settings" class="tab-panel">
+        <div class="banner" style="background:var(--accent-soft);color:var(--accent);border-color:transparent">
+          这里的改动会直接写入插件的配置文件（和 AstrBot 配置页同一份），保存后即时生效；
+          标注「需重载」的项要重载插件才会重新读取。
+        </div>
+        <div class="card">
+          <div id="settings-groups">
+            <div class="empty">正在读取配置…</div>
+          </div>
+        </div>
+        <div class="settings-bar">
+          <span class="muted" style="font-size:12.5px" id="settings-status">修改后记得保存</span>
+          <div class="row">
+            <button class="btn ghost" id="settings-reset">放弃修改</button>
+            <button class="btn primary" id="settings-save">保存修改</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 工具 ============ -->
+      <section id="tab-tools" class="tab-panel">
+        <div class="grid c2">
+          <div class="card tool-card">
+            <div class="card-head"><h2>立即总结</h2><span class="chip warn">会调用模型</span></div>
+            <p>忽略「满 N 条」阈值，把当前所有待总结的会话立刻压缩成记忆。手动触发通常用于刚聊完一段重要内容。</p>
+            <div class="row"><button class="btn primary" id="act-summarize">开始总结</button></div>
+            <div class="output hidden" id="out-summarize"></div>
+          </div>
+
+          <div class="card tool-card">
+            <div class="card-head"><h2>整理记忆</h2><span class="chip">把碎片合成一条</span></div>
+            <p>先本地找相似候选，再由模型判断哪些该合并。建议先「预览」确认合并计划。</p>
+            <div class="row">
+              <button class="btn" id="act-consolidate-preview">预览</button>
+              <button class="btn primary" id="act-consolidate">执行整理</button>
+            </div>
+            <div class="output hidden" id="out-consolidate"></div>
+          </div>
+
+          <div class="card tool-card">
+            <div class="card-head"><h2>整理技能</h2><span class="chip">合并重复能力</span></div>
+            <p>把同一类任务被反复总结出来的多个技能合并成一个。技能数不超过阈值时会全量交给模型判断。</p>
+            <div class="row">
+              <button class="btn" id="act-skill-preview">预览</button>
+              <button class="btn primary" id="act-skill">执行整理</button>
+            </div>
+            <div class="output hidden" id="out-skill"></div>
+          </div>
+
+          <div class="card tool-card">
+            <div class="card-head"><h2>导出 MEMORY.md</h2><span class="chip ok">不花 token</span></div>
+            <p>把所有未合并的记忆导出成 Markdown，写到插件数据目录，方便备份或迁移到别的机器人。</p>
+            <div class="row"><button class="btn" id="act-export">导出</button></div>
+            <div class="output hidden" id="out-export"></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-head">
+            <h2>身份别名</h2>
+            <span class="sub">QQ 官方机器人同一个人的 openid 在不同群/私聊里不一样，绑定后记忆才会归到同一个人</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th style="width:34%">别名 ID</th><th style="width:34%">归一到</th><th>平台</th><th style="width:80px">操作</th></tr>
+              </thead>
+              <tbody id="alias-tbody"></tbody>
+            </table>
+          </div>
+          <div class="toolbar" style="margin:12px 0 0">
+            <input type="text" class="grow" id="alias-alias" placeholder="别名 ID（比如某个群里的 member_openid）" />
+            <input type="text" class="grow" id="alias-canonical" placeholder="归一到的 ID（你常用的 user_openid）" />
+            <input type="text" id="alias-platform" placeholder="平台，如 qq_official" style="width:170px" />
+            <button class="btn primary" id="alias-add">绑定</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div class="toast" id="toast"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

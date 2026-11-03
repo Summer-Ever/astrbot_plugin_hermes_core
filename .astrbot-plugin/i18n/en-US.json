@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "Hermes Memory",
+    "description": "Hermes-style learning loop for AstrBot: long-term memory, skills, consolidation, with a management UI"
+  },
+  "views": {
+    "hermes": {
+      "title": "Memory & Skills"
+    }
+  }
+}
