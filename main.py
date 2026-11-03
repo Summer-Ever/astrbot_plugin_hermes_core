@@ -88,7 +88,7 @@ try:
 except ImportError:
     Image = None
 
-PLUGIN_VERSION = "0.5.1"
+PLUGIN_VERSION = "0.6.0"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -96,6 +96,74 @@ SYSTEM_MEMORY_HINT = (
     "render_mermaid(把 mermaid 图表渲染成 PNG 图片发到聊天)。"
     "遇到值得长期记住的信息请主动 save_memory；完成复杂流程后可用 save_skill 沉淀方法。"
 )
+
+
+# ============ 记忆巩固：相似度与聚类（纯本地，不花 token）============
+
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", (s or "").lower())
+
+
+def _bigrams(s: str) -> set[str]:
+    s = _norm_text(s)
+    if not s:
+        return set()
+    if len(s) <= 2:
+        return {s}
+    return {s[i : i + 2] for i in range(len(s) - 1)}
+
+
+def _similarity(a: str, b: str) -> float:
+    """字符二元组 Jaccard。中文没有空格，按词切分不可靠，按字更稳。
+
+    "喜欢吃香蕉" vs "喜欢吃苹果" ≈ 0.5（该合）；"喜欢看动漫" vs "喜欢吃香蕉" ≈ 0.33（不该合）。
+    """
+    A, B = _bigrams(a), _bigrams(b)
+    if not A or not B:
+        return 0.0
+    inter = len(A & B)
+    return inter / (len(A) + len(B) - inter)
+
+
+def _cluster_by_similarity(items: list[dict], threshold: float,
+                           text_key: str = "content") -> list[list[dict]]:
+    """把相似的条目聚成簇（并查集）。O(n²)，记忆量在千条以内可接受。"""
+    n = len(items)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _similarity(str(items[i].get(text_key, "")),
+                           str(items[j].get(text_key, ""))) >= threshold:
+                union(i, j)
+
+    groups: dict[int, list[dict]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(items[i])
+    return [g for g in groups.values() if len(g) > 1]
+
+
+def _scope_bucket(m: dict) -> tuple:
+    """巩固的作用域桶：绝不把不同用户、不同群的记忆合到一起。"""
+    owner = (m.get("owner_id") or "").strip()
+    gid = (m.get("group_id") or "").strip()
+    if owner:
+        return ("user", owner, m.get("platform") or "")
+    if gid:
+        return ("group", gid, m.get("platform") or "")
+    return ("global",)
 
 
 @register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", PLUGIN_VERSION)
@@ -154,7 +222,9 @@ class HermesCore(Star):
                 h.update(os.path.relpath(path, base).replace("\\", "/").encode())
                 try:
                     with open(path, "rb") as fh:
-                        h.update(fh.read())
+                        # 统一换行符：Windows 上不同工具写出的 CRLF/LF 混合会让
+                        # 同一份代码算出不同哈希，"是否生效"的校验就永远失败。
+                        h.update(fh.read().replace(b"\r\n", b"\n"))
                 except OSError:
                     pass
         return h.hexdigest()[:10]
@@ -420,22 +490,38 @@ class HermesCore(Star):
             return (f"暂无需总结：{len(pending)} 个会话共 {total} 条新消息，"
                     f"均未达 {min_new} 条且未超 {grace_h:g} 小时兜底。")
 
-        made_mem = made_skill = done_msgs = 0
+        made_mem = made_skill = skill_upd = done_msgs = 0
         details: list[str] = []
+        before_max = self.db.max_memory_id()
         for st, reason in due:
             batch = self.db.session_batch(st["session_id"], st["watermark"], limit=200)
             if not batch:
                 continue
-            mem, sk = await self._summarize_session(provider, batch, st["session_id"])
+            mem, sk, sk_up = await self._summarize_session(provider, batch, st["session_id"])
             made_mem += mem
             made_skill += sk
+            skill_upd += sk_up
             done_msgs += len(batch)
             # 只推进到本批最后一条：积压超 200 条时下一轮继续处理
             self.db.set_watermark(st["session_id"], batch[-1]["id"])
             details.append(f"{st['session_id'][:36]}：{len(batch)} 条（{reason}）")
 
         summary = (f"[hermes_core] 总结完成：{len(details)} 个会话 / {done_msgs} 条消息，"
-                   f"新记忆 {made_mem} 条，新技能 {made_skill} 个。")
+                   f"新记忆 {made_mem} 条，技能 新增 {made_skill} / 更新 {skill_upd} 个。")
+
+        # 记忆巩固：把碎片化的相似记忆合成一条，避免越攒越散
+        if made_mem and bool(self._get_cfg("auto_consolidate", True)):
+            try:
+                new_ids = {
+                    m["id"] for m in self.db.all_active_memories()
+                    if m["id"] > before_max
+                }
+                note = await self._consolidate_memories(provider, focus_ids=new_ids)
+                if note and not note.startswith("记忆只有"):
+                    summary += "\n" + note
+            except Exception:
+                logger.error(f"[hermes_core] 记忆巩固失败:\n{traceback.format_exc()}")
+
         logger.info(summary + " | " + "；".join(details))
         if made_skill and self._get_cfg("skill_notify_admin", True) and self._last_origin \
                 and MessageChain is not None and Plain is not None:
@@ -449,8 +535,11 @@ class HermesCore(Star):
         return summary
 
     async def _summarize_session(self, provider, batch: list[dict],
-                                 sid: str) -> tuple[int, int]:
-        """把一个会话的一批消息交给 LLM 归纳，写入记忆与技能。"""
+                                 sid: str) -> tuple[int, int, int]:
+        """把一个会话的一批消息交给 LLM 归纳，写入记忆与技能。
+
+        返回 (新记忆数, 新技能数, 更新技能数)。
+        """
         fmt = batch[0].get("platform") or ""
         gid = batch[0].get("group_id") or ""
         known_ids: set[str] = set()
@@ -463,25 +552,52 @@ class HermesCore(Star):
                 lines.append(f"助手: {m['content'][:300]}")
         transcript = "\n".join(lines)[:12000]
 
+        # 把已有技能清单给模型看：否则同一类任务每次都会造一个新名字，
+        # 技能库只会越堆越多，用的时候还得一个个读。
+        existing_skills = self.db.list_skills()
+        skill_hint = ""
+        if existing_skills and self._get_cfg("auto_skill", True):
+            lines_s = "\n".join(
+                f"- {s['name']}：{s['trigger'] or '通用'}" for s in existing_skills[:25]
+            )
+            skill_hint = (
+                "\n\n[已有技能] 若本次流程属于下列某个技能的范畴，name 必须原样沿用该技能名"
+                "（不要造近义新名），content 写该技能合并后的完整版本：\n" + lines_s
+            )
+
         prompt = (self._get_cfg("summary_prompt", "")
                   + "\n\n对话中每位用户都带有 [用户 ID(昵称)] 标记。"
                     "若某条记忆只属于某个特定用户，请在该项追加 \"owner\": \"该用户的ID\"；"
-                    "属于整段对话/全体时省略 owner。\n\n对话记录：\n" + transcript)
+                    "属于整段对话/全体时省略 owner。"
+                  + skill_hint
+                  + "\n\n对话记录：\n" + transcript)
         resp = await provider.text_chat(prompt=prompt, session_id=None)
         text = ""
         try:
             text = resp.completion_text or ""
         except Exception:
             pass
-        made_mem = made_skill = 0
+        made_mem = made_skill = skill_upd = 0
         for item in self._extract_json_array(text):
             if not isinstance(item, dict):
                 continue
             if item.get("skill") and self._get_cfg("auto_skill", True):
                 name = re.sub(r"\s+", "_", str(item.get("name", "")).strip())[:64]
                 if name and item.get("content"):
-                    self.db.upsert_skill(name, str(item.get("trigger", "")), str(item["content"]))
-                    made_skill += 1
+                    trigger = str(item.get("trigger", "")).strip()
+                    new_content = str(item["content"])
+                    old = self.db.peek_skill(name)
+                    if old and bool(self._get_cfg("skill_merge_same_name", True)):
+                        # 同名技能：先读旧版再合并，而不是直接覆盖丢掉旧步骤
+                        merged = await self._merge_skill_content(
+                            provider, name, old.get("trigger", ""), old.get("content", ""),
+                            trigger, new_content,
+                        )
+                        self.db.upsert_skill(name, trigger or old.get("trigger", ""), merged)
+                        skill_upd += 1
+                    else:
+                        self.db.upsert_skill(name, trigger, new_content)
+                        made_skill += 1
             elif item.get("content"):
                 owner = str(item.get("owner", "")).strip()
                 if owner not in known_ids:
@@ -494,7 +610,235 @@ class HermesCore(Star):
                     owner_id=owner, session_id=sid, platform=fmt, group_id=gid,
                 )
                 made_mem += 1
-        return made_mem, made_skill
+        return made_mem, made_skill, skill_upd
+
+    # ============ 记忆巩固（consolidation）============
+
+    async def _consolidate_memories(self, provider, dry_run: bool = False,
+                                    focus_ids: set[int] | None = None) -> str:
+        """把碎片化的记忆合并成更完整的条目。
+
+        两种模式：
+        - focus_ids：只给「刚写入的新记忆」找相似旧记忆（自动模式，省 token）
+        - 不传：全库按相似度聚类（/hermes 整理 手动模式）
+
+        字面相似度只用来「召回候选」，不直接决定合并——「喜欢吃香蕉 / 喜欢吃苹果」
+        只有 0.33，而「养了只猫叫咪咪 / 养了只狗叫旺财」有 0.38，字面分不出该不该合。
+        真正判断交给一次 LLM 调用。
+        """
+        threshold = float(self._get_cfg("consolidate_threshold", 0.3))
+        max_clusters = max(1, int(self._get_cfg("consolidate_max_clusters", 6)))
+        min_total = max(2, int(self._get_cfg("consolidate_min_memories", 6)))
+
+        rows = self.db.all_active_memories()
+        if not rows:
+            return "还没有任何记忆。"
+
+        if focus_ids:
+            clusters: list[list[dict]] = []
+            by_bucket: dict[tuple, list[dict]] = {}
+            for m in rows:
+                by_bucket.setdefault(_scope_bucket(m), []).append(m)
+            for m in rows:
+                if m["id"] not in focus_ids:
+                    continue
+                pool = [r for r in by_bucket[_scope_bucket(m)] if r["id"] != m["id"]]
+                if not pool:
+                    continue
+                scored = sorted(((_similarity(m["content"], r["content"]), r) for r in pool),
+                                key=lambda x: -x[0])
+                picked = [r for s, r in scored[:3] if s >= threshold]
+                if picked:
+                    # 组内按 id 排序，新记忆排最后（LLM 能看出时间顺序）
+                    clusters.append(sorted(picked + [m], key=lambda r: r["id"]))
+        else:
+            if len(rows) < min_total:
+                return f"记忆只有 {len(rows)} 条，暂无整理必要。"
+            buckets: dict[tuple, list[dict]] = {}
+            for m in rows:
+                buckets.setdefault(_scope_bucket(m), []).append(m)
+            clusters = []
+            for items in buckets.values():
+                if len(items) < 2:
+                    continue
+                clusters += _cluster_by_similarity(items, threshold)
+            if not clusters:
+                return f"已检查 {len(rows)} 条记忆，没有发现需要合并的碎片。"
+
+        # 去掉被别的簇完全包含的重复簇
+        seen: set[tuple] = set()
+        uniq: list[list[dict]] = []
+        for g in clusters:
+            key = tuple(sorted(m["id"] for m in g))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(g)
+        clusters = sorted(uniq, key=lambda g: -len(g))[:max_clusters]
+
+        listing: list[str] = []
+        id_to_group: dict[int, int] = {}
+        for idx, group in enumerate(clusters, 1):
+            listing.append(f"组 {idx}：")
+            for m in group:
+                id_to_group[m["id"]] = idx
+                listing.append(f"- #{m['id']} ({m['kind']}) {m['content'][:200]}")
+
+        prompt = (
+            "下面是从长期记忆里挑出的若干组碎片，组内内容高度相似或互补。"
+            "请把每组整理成尽量少、互不重复、信息不丢失的条目。\n"
+            "规则：\n"
+            "1. 信息互补的合并成一条（例如「喜欢吃香蕉」和「喜欢吃苹果」→「喜欢吃香蕉、苹果」）；\n"
+            "2. 后出现的覆盖先前的（先说喜欢猫、后来说不喜欢了），只保留最新状态；\n"
+            "3. 确实无关的保持分开，不要硬凑；\n"
+            "4. 不要编造原文没有的信息，不要丢失具体细节；\n"
+            "5. ids 只能填同一组里的记忆编号，且至少 2 条。\n"
+            "输出 JSON 数组，不要解释：[{\"ids\":[1,2],\"kind\":\"preference\","
+            "\"content\":\"合并后的表述\"}]\n没有需要合并的就输出 []。\n\n"
+            + "\n".join(listing)
+        )
+        resp = await provider.text_chat(prompt=prompt, session_id=None)
+        plan = self._extract_json_array(getattr(resp, "completion_text", "") or "")
+
+        applied: list[str] = []
+        for item in plan:
+            if not isinstance(item, dict):
+                continue
+            try:
+                ids = [int(x) for x in (item.get("ids") or []) if str(x).strip().isdigit()]
+            except Exception:
+                continue
+            content = str(item.get("content") or "").strip()
+            if len(ids) < 2 or not content:
+                continue
+            # 必须是同一组，且 id 都真实存在——防止模型跨组乱填、合并到别人头上
+            gids = {id_to_group.get(i) for i in ids}
+            if len(gids) != 1 or None in gids:
+                continue
+            kinds = [self.db.memory_by_id(i) for i in ids]
+            if any(k is None for k in kinds):
+                continue
+            if len({_scope_bucket(k) for k in kinds}) != 1:
+                continue
+            old_text = " / ".join(k["content"] for k in kinds if k)
+            if dry_run:
+                applied.append(f"#{'/'.join(map(str, ids))}：{old_text[:80]} → {content[:80]}")
+                continue
+            new_id = self.db.merge_memories(ids, content[:500], str(item.get("kind") or ""))
+            if new_id:
+                applied.append(f"#{'/'.join(map(str, ids))} → #{new_id}：{content[:80]}")
+
+        if not applied:
+            return (f"发现 {len(clusters)} 组疑似重复，但没有一组通过校验"
+                    "（可能模型判断不该合，或 ids 跨了用户/群）。")
+
+        head = "记忆整理预览（未写入）" if dry_run else "记忆已整理"
+        return f"{head}：{len(applied)} 组\n" + "\n".join(f"- {a}" for a in applied[:8])
+
+    async def _merge_skill_content(self, provider, name: str, old_trigger: str,
+                                   old_content: str, new_trigger: str,
+                                   new_content: str) -> str:
+        """技能同名的 read-modify-write：保留旧版仍有效的步骤，吸收新版内容。"""
+        prompt = (
+            "你是技能库管理员。下面是同一个技能的两个版本（旧版是之前总结的，新版是刚总结的）。"
+            "请合并成一份完整、不重复、可直接照着执行的 Markdown 步骤文档："
+            "保留旧版里仍然有效的步骤，吸收新版新增的内容，去掉重复描述。"
+            "只输出合并后的 Markdown 正文，不要解释，不要加代码块围栏。\n\n"
+            f"[技能名] {name}\n[旧版触发条件] {old_trigger}\n[旧版]\n{old_content[:4000]}"
+            f"\n\n[新版触发条件] {new_trigger}\n[新版]\n{new_content[:4000]}"
+        )
+        try:
+            resp = await provider.text_chat(prompt=prompt, session_id=None)
+            merged = (resp.completion_text or "").strip()
+        except Exception:
+            logger.error(f"[hermes_core] 技能合并失败:\n{traceback.format_exc()}")
+            merged = ""
+        if not merged or len(merged) < 20:
+            # 合并失败就保守处理：保留旧版，把新版附在后面，绝不丢内容
+            return old_content + "\n\n## 补充（新版）\n" + new_content
+        return merged[:8000]
+
+    async def _consolidate_skills(self, provider, dry_run: bool = False) -> str:
+        """把同一类任务被反复总结出来的多个技能合并成一个。
+
+        技能不是记忆，字面相似度几乎没用（`chrome-cdp-browser-control` 和
+        `chrome_real_profile_cdp` 只有 0.09，但其实是同一件事）。所以技能数不多时
+        直接把全部技能交给模型判断，只有数量过多才用字面相似度粗筛。
+        """
+        skills = self.db.list_skills()
+        if len(skills) < 2:
+            return f"只有 {len(skills)} 个技能，无需整理。"
+
+        max_direct = max(4, int(self._get_cfg("skill_consolidate_max", 40)))
+        threshold = float(self._get_cfg("skill_merge_threshold", 0.2))
+
+        if len(skills) <= max_direct:
+            clusters = [skills]  # 全部丢给模型，靠语义判断
+        else:
+            items = [
+                {
+                    "name": s["name"],
+                    "trigger": s["trigger"] or "",
+                    "text": f"{s['name']} {s['trigger'] or ''}",
+                }
+                for s in skills
+            ]
+            cs = _cluster_by_similarity(items, threshold, text_key="text")
+            if not cs:
+                return f"技能有 {len(skills)} 个，字面没有明显重叠。"
+            name2skill = {s["name"]: s for s in skills}
+            clusters = [[name2skill[i["name"]] for i in g] for g in cs]
+
+        detail = {}
+        for group in clusters:
+            for s in group:
+                detail[s["name"]] = self.db.peek_skill(s["name"]) or s
+
+        listing: list[str] = []
+        for idx, group in enumerate(clusters, 1):
+            listing.append(f"组 {idx}：")
+            for s in group:
+                full = detail[s["name"]]
+                listing.append(
+                    f"- name: {s['name']} | trigger: {s['trigger'] or '通用'}\n"
+                    f"  内容：{str(full.get('content', ''))[:600]}"
+                )
+
+        prompt = (
+            "下面是机器人已经学会的技能，其中一部分是同一类任务被反复总结出来的，"
+            "导致同一个能力有多个技能、用的时候得读好几遍。请把真正重叠的合并。\n"
+            "规则：\n"
+            "1. 只有确实做同一类事情才合并；不同图种（流程图 vs 时序图）、不同工具不要硬合；\n"
+            "2. 合并时必须保留各版本所有不重复的步骤，不能丢细节；\n"
+            "3. name 用英文短名（可沿用其中之一），trigger 写清楚何时使用；\n"
+            "4. names 只能填下面出现过的技能名。\n"
+            "输出 JSON 数组，不要解释：[{\"names\":[\"a\",\"b\"],\"name\":\"new_name\","
+            "\"trigger\":\"何时使用\",\"content\":\"合并后的完整 Markdown\"}]\n"
+            "没有需要合并的就输出 []。\n\n" + "\n".join(listing)
+        )
+        resp = await provider.text_chat(prompt=prompt, session_id=None)
+        plan = self._extract_json_array(getattr(resp, "completion_text", "") or "")
+
+        all_names = {s["name"] for s in skills}
+        done: list[str] = []
+        for item in plan:
+            if not isinstance(item, dict):
+                continue
+            names = [str(n) for n in (item.get("names") or []) if str(n) in all_names]
+            new_name = re.sub(r"\s+", "_", str(item.get("name") or "").strip())[:64]
+            content = str(item.get("content") or "").strip()
+            if len(names) < 2 or not new_name or len(content) < 20:
+                continue
+            if dry_run:
+                done.append(f"{'/'.join(names)} → {new_name}")
+                continue
+            self.db.replace_skills(names, new_name, str(item.get("trigger") or ""), content[:8000])
+            done.append(f"{'/'.join(names)} → {new_name}")
+
+        if not done:
+            return f"检查了 {len(skills)} 个技能，模型判断不需要合并。"
+        head = "技能整理预览（未写入）" if dry_run else "技能已合并"
+        return f"{head}：{len(done)} 组\n" + "\n".join(f"- {d}" for d in done[:8])
 
     @staticmethod
     def _extract_json_array(text: str) -> list:
@@ -529,7 +873,7 @@ class HermesCore(Star):
             f"[Hermes 记忆系统]\n"
             f"版本: v{PLUGIN_VERSION} (code {self._build_hash()})\n"
             f"对话消息: {s['messages']} 条 / {s['sessions']} 个会话\n"
-            f"长期记忆: {s['memories']} 条\n"
+            f"长期记忆: {s['memories']} 条（已合并 {s.get('merged', 0)} 条）\n"
             f"技能: {s['skills']} 个\n"
             f"FTS5 检索: {'开启' if self.db.fts_enabled else '退化 LIKE'}\n"
             f"自动总结: {'每 ' + str(interval) + ' 分钟检查（单会话满 ' + str(min_new)
@@ -542,6 +886,34 @@ class HermesCore(Star):
         yield event.plain_result("正在总结（手动触发会忽略条数阈值，处理全部待总结会话）……")
         result = await self._summarize(force=True)
         yield event.plain_result(result)
+
+    @hermes.command("整理")
+    async def hermes_consolidate(self, event: AstrMessageEvent, mode: str = ""):
+        """/hermes 整理 [预览] —— 把碎片化的相似记忆合并成一条"""
+        provider = self.context.get_using_provider()
+        if provider is None:
+            yield event.plain_result("未配置 LLM Provider，无法整理。")
+            return
+        dry = mode.strip() in ("预览", "试运行", "dry", "dry-run")
+        yield event.plain_result("正在整理记忆（先本地聚类，有候选才会调用模型）……")
+        try:
+            yield event.plain_result(await self._consolidate_memories(provider, dry_run=dry))
+        except Exception:
+            yield event.plain_result(f"整理失败：{traceback.format_exc(limit=3)}")
+
+    @hermes.command("技能整理")
+    async def hermes_skill_consolidate(self, event: AstrMessageEvent, mode: str = ""):
+        """/hermes 技能整理 [预览] —— 把重复的技能合并成一个"""
+        provider = self.context.get_using_provider()
+        if provider is None:
+            yield event.plain_result("未配置 LLM Provider，无法整理。")
+            return
+        dry = mode.strip() in ("预览", "试运行", "dry", "dry-run")
+        yield event.plain_result("正在检查技能重叠情况……")
+        try:
+            yield event.plain_result(await self._consolidate_skills(provider, dry_run=dry))
+        except Exception:
+            yield event.plain_result(f"整理失败：{traceback.format_exc(limit=3)}")
 
     @hermes.command("记住")
     async def hermes_remember(self, event: AstrMessageEvent, *, content: str = ""):

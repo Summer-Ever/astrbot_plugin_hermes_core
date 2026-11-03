@@ -79,6 +79,10 @@ class HermesDB:
             # v0.3.0 迁移：用平台+群/用户原生 ID 作稳定键，避免 umo 随 unique_session 漂移
             "ALTER TABLE memories ADD COLUMN platform TEXT DEFAULT ''",
             "ALTER TABLE memories ADD COLUMN group_id TEXT DEFAULT ''",
+            # v0.6.0 迁移：记忆巩固。合并后旧条不删除，只把 merged_into 指向新条，
+            # 检索时排除。这样误合并可以回滚，也不丢历史。
+            "ALTER TABLE memories ADD COLUMN merged_into INTEGER DEFAULT 0",
+            "ALTER TABLE memories ADD COLUMN updated_ts REAL DEFAULT 0",
         ):
             try:
                 c.execute(ddl)
@@ -255,10 +259,16 @@ class HermesDB:
 
     def stats(self) -> dict:
         m = self.conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
-        mem = self.conn.execute("SELECT COUNT(*) c FROM memories").fetchone()["c"]
+        mem = self.conn.execute(
+            "SELECT COUNT(*) c FROM memories WHERE merged_into = 0"
+        ).fetchone()["c"]
+        merged = self.conn.execute(
+            "SELECT COUNT(*) c FROM memories WHERE merged_into != 0"
+        ).fetchone()["c"]
         sk = self.conn.execute("SELECT COUNT(*) c FROM skills").fetchone()["c"]
         s = self.conn.execute("SELECT COUNT(DISTINCT session_id) c FROM messages").fetchone()["c"]
-        return {"messages": m, "memories": mem, "skills": sk, "sessions": s}
+        return {"messages": m, "memories": mem, "merged": merged,
+                "skills": sk, "sessions": s}
 
     # ---------- memories ----------
 
@@ -274,6 +284,69 @@ class HermesDB:
             )
             self.conn.commit()
             return cur.lastrowid
+
+    def all_active_memories(self, limit: int = 1000) -> list[dict]:
+        """所有未合并的记忆，按 id 升序（即时间顺序），供巩固/去重使用。"""
+        rows = self.conn.execute(
+            "SELECT * FROM memories WHERE merged_into = 0 ORDER BY id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def max_memory_id(self) -> int:
+        row = self.conn.execute("SELECT COALESCE(MAX(id), 0) m FROM memories").fetchone()
+        return int(row["m"] or 0)
+
+    def memory_by_id(self, memory_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def merge_memories(self, ids: list[int], content: str, kind: str = "") -> int:
+        """把一组记忆合成一条新的，旧条只标记 merged_into 指向新条（不物理删除）。
+
+        保留旧条是为了可回滚：误合并时调 unmerge() 就能还原。
+        作用域字段全部继承组内最早的那条，绝不跨用户/跨群合并。
+        """
+        ids = [int(i) for i in ids if i]
+        if not ids:
+            return 0
+        with self._lock:
+            marks = ",".join("?" * len(ids))
+            rows = self.conn.execute(
+                f"SELECT * FROM memories WHERE id IN ({marks})", ids
+            ).fetchall()
+            if not rows:
+                return 0
+            rows = sorted(rows, key=lambda r: r["id"])
+            base = rows[0]
+            now = time.time()
+            cur = self.conn.execute(
+                "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
+                " session_id, platform, group_id, merged_into, updated_ts)"
+                " VALUES(?,?,?,?,?,?,?,?,?,0,?)",
+                (now, kind or base["kind"], base["scope"], content, "consolidate",
+                 base["owner_id"] or "", base["session_id"] or "",
+                 base["platform"] or "", base["group_id"] or "", now),
+            )
+            new_id = cur.lastrowid
+            self.conn.execute(
+                f"UPDATE memories SET merged_into = ?, updated_ts = ? WHERE id IN ({marks})",
+                (new_id, now, *ids),
+            )
+            self.conn.commit()
+            return new_id
+
+    def unmerge(self, new_id: int) -> int:
+        """撤销一次合并：恢复旧条，删除合并产生的条目。返回恢复条数。"""
+        with self._lock:
+            n = self.conn.execute(
+                "UPDATE memories SET merged_into = 0 WHERE merged_into = ?", (new_id,)
+            ).rowcount
+            self.conn.execute("DELETE FROM memories WHERE id = ?", (new_id,))
+            self.conn.commit()
+            return n
 
     def search_memories(self, query: str, limit: int = 5,
                         owner_id: str | None = None,
@@ -328,7 +401,7 @@ class HermesDB:
 
         like = f"%{query.strip()[:100]}%"
         rows = self.conn.execute(
-            f"SELECT * FROM memories WHERE content LIKE ?"
+            f"SELECT * FROM memories WHERE content LIKE ? AND merged_into = 0"
             + (" AND (" + " OR ".join(tiers) + ")" if tiers else "")
             + f" {order} LIMIT ?",
             (like, *args, *order_args, limit),
@@ -384,7 +457,8 @@ class HermesDB:
 
     def all_memories(self, limit: int = 200) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT * FROM memories ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM memories WHERE merged_into = 0 ORDER BY id DESC LIMIT ?",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -422,6 +496,34 @@ class HermesDB:
             "SELECT id, name, trigger, use_count, created_ts FROM skills ORDER BY id"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def peek_skill(self, name: str) -> dict | None:
+        """读取技能但不像 get_skill 那样增加使用计数（写入/合并时用）。"""
+        row = self.conn.execute(
+            "SELECT * FROM skills WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_skill(self, name: str) -> bool:
+        with self._lock:
+            cur = self.conn.execute("DELETE FROM skills WHERE name = ?", (name,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def replace_skills(self, old_names: list[str], name: str, trigger: str,
+                       content: str) -> None:
+        """技能整合：写入合并后的技能，并删除被并入的旧技能。"""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO skills(name, trigger, content, created_ts) VALUES(?,?,?,?)"
+                " ON CONFLICT(name) DO UPDATE SET trigger = excluded.trigger,"
+                " content = excluded.content",
+                (name, trigger, content, time.time()),
+            )
+            for old in old_names:
+                if old and old != name:
+                    self.conn.execute("DELETE FROM skills WHERE name = ?", (old,))
+            self.conn.commit()
 
     def get_skill(self, name: str) -> dict | None:
         row = self.conn.execute(

@@ -12,3 +12,6 @@ MEMORY.md
 # IDE
 .idea/
 .vscode/
+
+# AstrBot 本地运行时误生成（含密钥，绝不入库）
+data/

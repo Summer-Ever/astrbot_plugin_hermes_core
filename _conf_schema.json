@@ -3,7 +3,11 @@
     "type": "string",
     "default": "user",
     "description": "记忆隔离级别：user=按用户隔离（推荐群聊）、group=按群/会话隔离、global=全机器人共享",
-    "options": ["user", "group", "global"]
+    "options": [
+      "user",
+      "group",
+      "global"
+    ]
   },
   "per_user_history": {
     "type": "bool",
@@ -53,6 +57,45 @@
     "default": 6,
     "description": "时间兜底：某个会话的消息超过这么多小时还没被总结，即使不足条数也强制总结，避免低频场景永远不产生记忆",
     "hint": "设为 0 关闭兜底（则只按条数触发）"
+  },
+  "auto_consolidate": {
+    "type": "bool",
+    "default": true,
+    "description": "记忆巩固：总结后把碎片化的相似记忆合并成一条",
+    "hint": "先用本地相似度聚类，只有发现重复才会调用模型，平时几乎不额外花钱"
+  },
+  "consolidate_threshold": {
+    "type": "float",
+    "default": 0.3,
+    "description": "召回相似记忆的阈值（0~1，越低越容易进入候选）",
+    "hint": "字面相似度只用来找候选，真正合并由模型判断。「喜欢吃香蕉/苹果」约 0.33，「喜欢吃香蕉/看动漫」约 0.14"
+  },
+  "consolidate_min_memories": {
+    "type": "int",
+    "default": 6,
+    "description": "记忆少于这个数量时不做整理"
+  },
+  "consolidate_max_clusters": {
+    "type": "int",
+    "default": 6,
+    "description": "每次最多整理几组（控制单次花费）"
+  },
+  "skill_merge_same_name": {
+    "type": "bool",
+    "default": true,
+    "description": "同名技能改为「先读旧版再合并」，避免直接覆盖丢掉旧步骤"
+  },
+  "skill_merge_threshold": {
+    "type": "float",
+    "default": 0.2,
+    "description": "召回重叠技能的阈值（按名字+触发条件的字面相似度）",
+    "hint": "只影响候选范围；是否合并由模型判断。不同图种（流程图/时序图）约 0.22，会被召回但通常不会合并"
+  },
+  "skill_consolidate_max": {
+    "type": "int",
+    "default": 40,
+    "description": "技能不超过这个数量时，整理会全部交给模型判断（不靠字面筛选）",
+    "hint": "技能多于此数才用 skill_merge_threshold 粗筛，避免一次请求过长"
   },
   "auto_skill": {
     "type": "bool",

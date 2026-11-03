@@ -82,7 +82,9 @@ def disk_hash(plugin_dir: str) -> str:
             p = os.path.join(root, fn)
             h.update(os.path.relpath(p, plugin_dir).replace("\\", "/").encode())
             with open(p, "rb") as f:
-                h.update(f.read())
+                # 与插件内 _build_hash 保持一致：统一换行符，否则 CRLF/LF 差异
+                # 会让“代码是否生效”的校验永远报不生效。
+                h.update(f.read().replace(b"\r\n", b"\n"))
     return h.hexdigest()[:10]
 
 
