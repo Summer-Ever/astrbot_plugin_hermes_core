@@ -191,20 +191,29 @@ class SkillHub:
         return None
 
     def read(self, name: str, owner_id: str = "", group_id: str = "") -> dict | None:
-        """个人优先；没有再看系统；返回时带上 source/readonly/shadow 说明。"""
+        """个人优先；没有再看系统。传 `system:xxx` 可强制读系统原版。
+
+        返回时带 source/readonly；个人版若存在同名系统技能，额外标 shadow_of，
+        调用方可以据此提示“还有一份更完整的本体版可参考”。
+        """
         key = str(name or "").strip()
         if not key:
             return None
-        row = self._find_personal(key, owner_id, group_id)
-        if row:
-            row = dict(row)
-            row["source"] = "personal"
-            row["readonly"] = False
-            self.db.get_skill(row["name"], owner_id=owner_id, group_id=group_id)
-            sys_item = self.find_system(key)
-            if sys_item:
-                row["shadow_of"] = sys_item["name"]
-            return row
+        force_system = key.lower().startswith("system:")
+        if force_system:
+            key = key.split(":", 1)[1].strip()
+        if not force_system:
+            row = self._find_personal(key, owner_id, group_id)
+            if row:
+                row = dict(row)
+                row["source"] = "personal"
+                row["readonly"] = False
+                self.db.get_skill(row["name"], owner_id=owner_id, group_id=group_id)
+                sys_item = self.find_system(key)
+                if sys_item:
+                    row["shadow_of"] = sys_item["name"]
+                    row["system_bytes"] = len(sys_item.get("content") or "")
+                return row
         item = self.find_system(key)
         return dict(item) if item else None
 

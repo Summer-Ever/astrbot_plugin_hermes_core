@@ -498,7 +498,9 @@ class HermesCore(Star):
             )
         head = f"[我的技能] {sk['name']}——属于当前用户，可直接用 update_skill 局部修改"
         if sk.get("shadow_of"):
-            head += f"；这是覆盖系统技能 {sk['shadow_of']} 的个人版本"
+            head += (f"；这是覆盖系统技能 {sk['shadow_of']} 的个人版本"
+                     f"（本体原版 {sk.get('system_bytes', 0)} 字符，如需参考完整版可 read_skill "
+                     f"\"system:{sk['shadow_of']}\"）")
         return f"{head}\n\n{sk['content']}"
 
     @filter.llm_tool(name="save_skill")
