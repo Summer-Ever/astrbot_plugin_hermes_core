@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 import traceback
 
@@ -107,7 +108,7 @@ except ImportError:
         SkillHub = _sh_mod.SkillHub
         guess_data_root = _sh_mod.guess_data_root
 
-PLUGIN_VERSION = "0.12.0"
+PLUGIN_VERSION = "0.12.1"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -638,6 +639,57 @@ class HermesCore(Star):
                 await self._summarize()
             except Exception:
                 logger.error(f"[hermes_core] 总结循环异常:\n{traceback.format_exc()}")
+            # 每轮顺带做维护（内部有 24h 节流，实际每天至多跑一次）
+            try:
+                note = await asyncio.to_thread(self._sweep)
+                if note:
+                    logger.info(f"[hermes_core] 例行清理：{note}")
+            except Exception:
+                logger.warning(f"[hermes_core] 例行清理跳过:\n{traceback.format_exc(limit=2)}")
+
+    def _sweep(self) -> str:
+        """每日维护：TTL 修剪过期原始消息 + 清理升级遗留文件。
+
+        只回收「可再生的转写层」和「已废弃功能的遗留物」；记忆/技能/身份
+        是资产，任何情况下不参与清理。全部通过 meta 记录水位，重载后不重复执行。
+        """
+        parts: list[str] = []
+        now = time.time()
+        if now - float(self.db.get_meta("last_sweep_ts", "0") or 0) >= 86400:
+            days = int(self._get_cfg("retention_days", 90))
+            if days > 0:
+                n = self.db.prune_messages(days)
+                if n:
+                    parts.append(f"按 {days} 天保留期修剪 {n} 条过期消息")
+            self.db.set_meta("last_sweep_ts", str(now))
+        # v0.12 一次性清理：渲染模块已移除，这两个目录不再有任何用途
+        if not self.db.get_meta("render_cleanup_v012", ""):
+            removed = self._remove_stale_render_dirs()
+            self.db.set_meta("render_cleanup_v012", "1")
+            if removed:
+                parts.append("清理渲染模块遗留 " + "、".join(removed))
+        return "；".join(parts)
+
+    def _remove_stale_render_dirs(self) -> list[str]:
+        """删除已废弃渲染模块在数据目录下的遗留。
+
+        双保险：目录名硬编码白名单 + realpath 后必须仍位于插件 data 目录内，
+        即使 data_dir 本身被软链或配置异常也不会误删别处。
+        """
+        data_dir = _default_data_dir()
+        root_real = os.path.realpath(data_dir)
+        removed = []
+        for name in ("renderer", "renders"):
+            target_real = os.path.realpath(os.path.join(data_dir, name))
+            if not target_real.startswith(root_real + os.sep):
+                continue
+            if os.path.isdir(target_real):
+                try:
+                    shutil.rmtree(os.path.join(data_dir, name))
+                    removed.append(f"{name}/")
+                except OSError as e:
+                    logger.warning(f"[hermes_core] 清理 {target_real} 失败：{e}")
+        return removed
 
     async def _summarize(self, force: bool = False) -> str:
         """互斥入口：后台循环和 /hermes 总结 可能同时触发。

@@ -300,6 +300,40 @@ class HermesDB:
             self.conn.commit()
             return len(ids)
 
+    def prune_messages(self, days: int, batch: int = 2000) -> int:
+        """TTL 保留期修剪：删除过期原始消息并同步 FTS，随后收缩 WAL。
+
+        只动 messages（原始转写层，可再生）；memories / skills / identities
+        是资产，不受影响。分批提交避免长事务阻塞在线写入。
+        返回删除总条数。days <= 0 时直接返回 0（保留期关闭）。
+        """
+        if int(days) <= 0:
+            return 0
+        cutoff = time.time() - int(days) * 86400
+        total = 0
+        with self._lock:
+            # 海象循环：每批取一批删一批；批次大小受 LIMIT 约束，不会长事务
+            while (ids := [r[0] for r in self.conn.execute(
+                    "SELECT id FROM messages WHERE ts < ? LIMIT ?",
+                    (cutoff, int(batch)),
+            ).fetchall()]):
+                if self._fts_enabled:
+                    self.conn.executemany(
+                        "DELETE FROM messages_fts WHERE rowid = ?",
+                        [(i,) for i in ids])
+                self.conn.executemany(
+                    "DELETE FROM messages WHERE id = ?", [(i,) for i in ids])
+                self.conn.commit()
+                total += len(ids)
+                if len(ids) < int(batch):
+                    break
+            if total:
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
+        return total
+
     def _fts_candidates(self, query: str, cap: int,
                         session_id: str | None,
                         sender_id: str | None) -> list[dict] | None:

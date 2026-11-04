@@ -107,6 +107,21 @@ def main() -> int:
             check(f"safe_join 拒绝 {bad}", True)
     check("safe_join 正常拼接", safe_join(tmp, "a", "b.txt").endswith(os.path.join("a", "b.txt")))
 
+    # --- 保留期修剪（TTL）
+    db.add_message("s1", "user", "很老的一条消息", sender_id="u1")
+    db.conn.execute("UPDATE messages SET ts = ts - 200*86400")
+    db.conn.commit()
+    db.add_message("s1", "user", "新的保留消息", sender_id="u1")
+    pruned = db.prune_messages(90)
+    check("prune_messages 删除过期消息", pruned >= 1, f"删了 {pruned}")
+    left = [r["content"] for r in db.conn.execute("SELECT content FROM messages").fetchall()]
+    check("prune_messages 保留新消息", left == ["新的保留消息"], str(left))
+    fts_left = db.conn.execute("SELECT count(*) FROM messages_fts").fetchone()[0]
+    check("prune_messages 同步 FTS", fts_left == 1, f"FTS 剩 {fts_left}")
+    check("prune_messages 0 天关闭", db.prune_messages(0) == 0)
+    mem_count = db.conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+    check("prune_messages 不碰记忆", mem_count > 0, f"剩 {mem_count} 条")
+
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")
     if FAIL:

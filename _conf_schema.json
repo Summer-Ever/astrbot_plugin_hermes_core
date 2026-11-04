@@ -214,5 +214,11 @@
         "type": "text",
         "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
         "description": "总结器使用的提示词"
+    },
+    "retention_days": {
+        "type": "int",
+        "default": 90,
+        "description": "原始对话消息保留天数：超期自动清理（记忆/技能/身份不受影响）。0 = 永不清理",
+        "hint": "已总结成记忆的信息不受影响；只清原始消息转写层"
     }
 }
