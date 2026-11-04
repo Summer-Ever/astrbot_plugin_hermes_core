@@ -226,9 +226,9 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 
 | 约束 | 为什么 | 怎么做的 |
 |---|---|---|
-| **切片** | 100 条记忆一次喂进去，prompt 长、出结果慢，一超时整批全丢 | 每片最多 `consolidate_chunk_size`（默认 40）条，超时只损失一片；大桶先跑 |
-| **单片硬顶** | 3 个模型 × 3 次尝试 × 30 秒 = 270 秒，一片就能吃光整次预算 | `consolidate_unit_seconds`（默认 90 秒）：一片到点就放弃，继续下一片 |
-| **总预算** | 片数多时可能无限拖 | `consolidate_budget_seconds`（默认 600 秒）到点就停，如实报告"跑到第几片" |
+| **切片** | 100 条记忆一次喂进去，prompt 长、出结果慢，一超时整批全丢 | 每片最多 `consolidate_chunk_size`（默认 30）条——**不是"总共分几片"，是按每个作用域的条数切**；大桶先跑 |
+| **单片硬顶** | 3 个模型 × 3 次尝试 × 60 秒 = 540 秒，一片就能吃光整次预算 | `consolidate_unit_seconds`（默认 180 秒）：一片到点就放弃，继续下一片 |
+| **总预算** | 片数多时可能无限拖 | `consolidate_budget_seconds`（默认 900 秒）到点就停，如实报告"跑到第几片" |
 | **连续失败止损** | 模型链整体挂了还继续跑，只是把 429 撞得更狠 | 连续 `consolidate_max_fail_streak`（默认 2）片失败就停，文案说明原因 |
 | **断点续跑** | 跑到一半被 kill，重发会从第一片重来，白烧 token | 每跑完一片记进 `meta.consolidate_checkpoint`；记忆内容没变就只补没跑的片，`/hermes 整理 深度 重来` 可强制从头 |
 
@@ -241,17 +241,27 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 - **冷却有硬下限**：限流 ≥120 秒、超时 ≥90 秒、鉴权 ≥300 秒。把 `llm_cooldown_seconds` 调成 5 秒
   等于每片都把坏模型重新撞一遍，所以这几个下限不受配置影响。
 
-实测对比（真实库 102 条活跃记忆，7 个作用域）：
+实测（同一份 prompt：40 条记忆 ≈ 2.1k 字，走 AstrBot 的 provider 通道）：
+
+| 模型 | 短提示 | 长提示 |
+|---|---|---|
+| `deepseek/deepseek-flash` | 0.7 秒 | **9.5 秒** |
+| `openai/qwen3.7-flash` | 2.3 秒 | **32.5 秒** |
+| `openrouter/nvidia/nemotron-3.5-super-vl:free` | 1.9 秒 | **51.9 秒** |
+| `zhipu/glm-4.7-flash` | 超时 | 超时（429 风暴） |
+
+结论：**30 秒超时等于只允许主模型成功**，降级模型全部被当成"不通"。
+同时 AstrBot 的 provider 默认在内部重试 5 次（指数退避，单次最长等 30 秒），
+一次 429 会变成 1-2 分钟静默等待，外层只能看到"超时"——所以插件调用统一传
+`request_max_retries=1`，退避与换模型全部由本层负责。
 
 | | 改造前 | 改造后 |
 |---|---|---|
-| 单次调用超时 | 90 秒 | 30 秒 |
-| 每模型重试 | 2 次（共 3 次） | 1 次（共 2 次） |
-| 整链尝试上限 | 8 次 | 4 次 |
-| 单片硬顶 | 无 | 90 秒 |
-| 最坏单片成本 | 4 次 × 45 秒 = 180 秒 | 90 秒（硬顶） |
-| 最坏总耗时 | 12 分钟（且全失败） | 10 分钟总闸 + 2 片失败即停 |
-| 429 之后 | 原地重试 2 次，越撞越死 | 立即换模型 + 冷却 180 秒起 |
+| 单次调用超时 | 30 秒 | **60 秒** |
+| AstrBot 内部重试 | 5 次（静默，最长几分钟） | **1 次**，由本插件决定重试 |
+| 单片硬顶 | 90 秒 | **180 秒** |
+| 每片条数 | 40 | **30**（生成更短更快） |
+| 429 之后 | 内部重试到超时 | **立即换模型** + 冷却 180 秒起 |
 
 ## 技能双域：个人技能 vs 本体技能（v0.9.0）
 
@@ -404,7 +414,7 @@ python tests/smoke_db.py
 
 ```bash
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 18 项：节流、429 退避、冷却下限、两级预算
-D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 20 项：切片、断点、单片超时、连续失败止损
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 25 项：切片、断点、单片超时、连续失败止损、模型落款
 ```
 
 ### 提交前自检

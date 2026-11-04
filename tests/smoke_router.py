@@ -51,7 +51,7 @@ class FakeProvider:
         self.calls: list[float] = []
         self.plan = list(plan or [])
 
-    async def text_chat(self, prompt=None, session_id=None):
+    async def text_chat(self, prompt=None, session_id=None, request_max_retries=None):
         self.calls.append(time.time())
         if self.plan:
             action = self.plan.pop(0)

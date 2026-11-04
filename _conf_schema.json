@@ -109,15 +109,15 @@
     },
     "consolidate_chunk_size": {
         "type": "int",
-        "default": 40,
+        "default": 30,
         "min": 10,
         "max": 80,
         "description": "深度整理时一个作用域最多几条记忆交给同一次模型调用",
-        "hint": "超出就切片分别调用。40 条约 6-8k 字符，单次 10-20 秒能出结果；调大能减少调用次数（更省 RPM 配额），但单次更容易超时"
+        "hint": "一片多少条记忆。越小生成越短越快（30 条约 2k 字，deepseek 7 秒、nemotron 40 秒）；越大一次能合并更多，但慢模型容易顶到超时"
     },
     "consolidate_budget_seconds": {
         "type": "int",
-        "default": 600,
+        "default": 900,
         "min": 60,
         "max": 1800,
         "description": "一次整理最多跑多少秒（时间到就停下并报告进度）",
@@ -125,11 +125,11 @@
     },
     "consolidate_unit_seconds": {
         "type": "int",
-        "default": 90,
+        "default": 180,
         "min": 20,
         "max": 600,
         "description": "单片记忆最多花多少秒（到点就放弃这一片，继续下一片）",
-        "hint": "这是最关键的一项：单片最坏耗时 ≈ 超时 × 尝试次数。默认 90 秒，配合 30 秒超时正好够走完两个模型；模型链很慢时可调到 120-150"
+        "hint": "单片最坏耗时 ≈ 超时 × 尝试次数。默认 180 秒：够「主模型 10s → 降级 33s → 兜底 52s」走完一圈；到点就放弃这一片继续下一片"
     },
     "consolidate_max_fail_streak": {
         "type": "int",
@@ -138,6 +138,12 @@
         "max": 10,
         "description": "连续几片调用失败就停止整次整理",
         "hint": "连续失败通常说明模型链整体不可用，继续跑只会空等并加重限流"
+    },
+    "consolidate_progress_push": {
+        "type": "bool",
+        "default": true,
+        "description": "深度整理时每跑完一片就发一条进度给发起人",
+        "hint": "关掉就只有最终结果一条消息。群聊没有主动消息权限时推送会静默失败，进度仍可用 /hermes 整理结果 查询"
     },
     "skill_merge_same_name": {
         "type": "bool",
@@ -200,11 +206,11 @@
     },
     "llm_timeout": {
         "type": "float",
-        "default": 30,
+        "default": 60,
         "min": 5,
         "max": 600,
         "description": "单次请求超时秒数",
-        "hint": "正常归纳 5-20 秒出结果；30 秒不吐字多半是免费档排队或不通。这个值会乘以尝试次数成为单片成本，调大前先看「单片预算」"
+        "hint": "实测 40 条记忆的长 prompt：deepseek 9.5s、qwen3.7-flash 32.5s、nemotron free 51.9s。给 60 秒才够降级模型跑完；设 30 秒等于只允许主模型成功。单片另有硬顶，调大不会把一次整理拖成十几分钟"
     },
     "llm_backoff": {
         "type": "float",
@@ -264,6 +270,18 @@
         "max": 60,
         "description": "同一个模型两次调用的最小间隔秒数",
         "hint": "防瞬时连击；0 = 不间隔"
+    },
+    "llm_debug_trace": {
+        "type": "bool",
+        "default": false,
+        "description": "记录每次模型调用的开始与耗时（排查超时用）",
+        "hint": "打开后日志里会有「调用开始 model=… prompt=…字」和「调用成功 …s」，能分清是请求发不出去还是模型生成慢。正常使用时关闭，否则日志会很吵"
+    },
+    "llm_probe_on_start": {
+        "type": "bool",
+        "default": false,
+        "description": "插件启动时自动探测每个模型（短提示 + 长提示）",
+        "hint": "排查「整理全部超时」时打开：短提示也超时是链路问题，短快长慢是生成慢（推理模型），日志关键词「探针」"
     },
     "summary_prompt": {
         "type": "text",

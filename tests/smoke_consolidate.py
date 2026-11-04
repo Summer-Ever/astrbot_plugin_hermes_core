@@ -78,8 +78,8 @@ async def case_chunk(tmp: str) -> None:
     check("100 条按 40 切片 → 3 次调用", len(router.calls) == 3, str(len(router.calls)))
     counts = [c["prompt"].count("- #") for c in router.calls]
     check("每片条目数不超过 40", max(counts) <= 40, str(counts))
-    check("单片带 30s 超时与 3 次尝试上限",
-          all(c["timeout"] == 30.0 and c["max_attempts"] == 3 for c in router.calls))
+    check("单片带 60s 超时与 3 次尝试上限",
+          all(c["timeout"] == 60.0 and c["max_attempts"] == 3 for c in router.calls))
     check("每片有自己的 soft_deadline", all(c["soft_deadline"] is not None
                                           for c in router.calls))
     check("整次整理带 deadline", all(c["deadline"] is not None for c in router.calls))
@@ -164,8 +164,43 @@ async def case_merge(tmp: str) -> None:
     check("合并计数正确", "合并 1 组" in out, out[:60])
 
 
+
+async def case_footer(tmp: str) -> None:
+    """模型落款：单模型、多模型、降级层级都要标清楚。"""
+    core = new_core(tmp)
+
+    class R:
+        def __init__(self, info):
+            self.info = info
+
+        def last_call_info(self):
+            return dict(self.info or {})
+
+        def footer(self):
+            i = self.info or {}
+            if not i:
+                return ""
+            tier = i.get("tier") or 0
+            return f"> {i['provider']}（{'主模型' if tier <= 0 else f'降级 {tier}'}）"
+
+    core.router = R({"provider": "deepseek/deepseek-flash", "tier": 0})
+    check("单模型落款是主模型", core._footer() == "> deepseek/deepseek-flash（主模型）", core._footer())
+    check("落款拼在末行", core._with_footer("结果").endswith("\n> deepseek/deepseek-flash（主模型）"))
+
+    core.router = R({"provider": "openai/qwen3.7-flash", "tier": 2})
+    check("降级层级正确", core._footer() == "> openai/qwen3.7-flash（降级 2）", core._footer())
+
+    used = {"deepseek/deepseek-flash": {"tier": 0, "slices": 3},
+            "openai/qwen3.7-flash": {"tier": 2, "slices": 1}}
+    txt = core._models_footer(used)
+    check("多模型逐个列出", "deepseek/deepseek-flash（主模型，3 片）" in txt
+          and "openai/qwen3.7-flash（降级 2）" in txt, txt)
+    check("多模型落款以 > 开头", txt.startswith("> "))
+
+
 async def main() -> int:
-    for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip, case_merge):
+    for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
+               case_merge, case_footer):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:
             await fn(tmp)

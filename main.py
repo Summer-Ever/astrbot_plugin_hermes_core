@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.11"
+PLUGIN_VERSION = "0.12.12"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -308,8 +308,42 @@ class HermesCore(Star):
         except Exception:
             logger.warning(f"[hermes_core] 读取冷却状态失败:\n{traceback.format_exc(limit=2)}")
         self._register_web_apis()
+        if bool(self._get_cfg("llm_probe_on_start", False)):
+            asyncio.create_task(self._probe_models())
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
+
+    async def _probe_models(self):
+        """启动自检：用「短提示 + 长提示」各打一次模型链，把真实耗时写进日志。
+
+        排查「整理全都超时」时必须区分两种情况，否则会误判成 Key/网络问题：
+        - 短提示也超时 → 请求根本没发出去（客户端、代理、provider 实例的问题）；
+        - 短提示很快、长提示超时 → 是生成慢（推理模型 + 不限输出长度），
+          该调的是超时值和输出规模，不是换 Key。
+        """
+        await asyncio.sleep(3)
+        long_prompt = (
+            "下面是同一位用户的全部长期记忆。请做一次彻底整理，输出 JSON 数组：\n"
+            + "\n".join(
+                f"- #{1000 + i} (preference) 用户偏好记录第{i}条：这是一段用于测量"
+                "的样例记忆正文，长度接近真实条目，用来观察长 prompt 下的耗时表现。"
+                for i in range(40))
+        )
+        try:
+            chain = self.router.effective_chain(ignore_cooldown=True)
+        except Exception:
+            logger.warning(f"[hermes_core] 探针无法获取模型链:\n{traceback.format_exc(limit=2)}")
+            return
+        for entry in chain:
+            pid = entry["id"]
+            for label, prompt, tmo in (("短", "只回复两个字母：OK", 30.0),
+                                       ("长", long_prompt, 60.0)):
+                r = await self.router.test(pid, timeout=tmo, prompt=prompt)
+                state = "OK" if r.get("ok") else "FAIL"
+                logger.info(
+                    f"[hermes_core] 探针 {pid} {label}提示 {state} {r.get('ms')}ms "
+                    f"{str(r.get('error') or '')[:80]}")
+        logger.info("[hermes_core] 探针结束")
 
     def _register_web_apis(self):
         """把 WebUI 接口挂到 dashboard 上（页面见 views/hermes/）。
@@ -431,6 +465,67 @@ class HermesCore(Star):
             return
         rep["progress"] = {"done": int(done), "total": int(total)}
         self.db.set_meta("consolidate_report", json.dumps(rep, ensure_ascii=False))
+
+    # ---- 进度推送 + 模型落款 ----
+
+    def _note_consolidate_model(self, used: dict[str, dict]) -> None:
+        """记下这次整理实际用了哪个模型（主模型还是第几级降级）。"""
+        info = self.router.last_call_info() if hasattr(self.router, "last_call_info") else {}
+        pid = str(info.get("provider") or "")
+        if not pid:
+            return
+        slot = used.setdefault(pid, {"tier": int(info.get("tier") or 0),
+                                     "slices": 0, "ms": 0})
+        slot["slices"] += 1
+        slot["ms"] += int(info.get("ms") or 0)
+
+    def _models_footer(self, used: dict[str, dict]) -> str:
+        """把「这一轮用了哪些模型」渲染成末行落款。
+
+        多模型时逐个列出（整理会逐片降级，只报最后一个会掩盖前面的失败）；
+        只有一个模型时就是 `> 供应商/模型（主模型）`。
+        """
+        if not used:
+            return ""
+        parts = []
+        for pid, info in used.items():
+            tier = int(info.get("tier") or 0)
+            label = "主模型" if tier <= 0 else f"降级 {tier}"
+            n = int(info.get("slices") or 0)
+            extra = f"，{n} 片" if n > 1 else ""
+            parts.append(f"{pid}（{label}{extra}）")
+        return "> " + "；".join(parts)
+
+    def _footer(self, used: dict[str, dict] | None = None) -> str:
+        """单条消息的模型落款；有 used 就用它，否则取最近一次调用。"""
+        if used:
+            return self._models_footer(used)
+        try:
+            return self.router.footer()
+        except Exception:
+            return ""
+
+    def _with_footer(self, text: str, used: dict[str, dict] | None = None) -> str:
+        """在消息末行加上 `> 模型（主模型/降级 N）`。"""
+        foot = self._footer(used)
+        if not foot:
+            return text
+        return f"{text}\n{foot}"
+
+    async def _push_progress(self, text: str) -> bool:
+        """把一行进度主动发回发起会话（失败只记 warn，不影响整理本身）。"""
+        origin = getattr(self, "_consolidate_origin", "") or ""
+        if not origin or MessageChain is None or Plain is None:
+            return False
+        if not bool(self._get_cfg("consolidate_progress_push", True)):
+            return False
+        try:
+            await self.context.send_message(origin, MessageChain([Plain(text)]))
+            return True
+        except Exception:
+            logger.warning("[hermes_core] 进度推送失败（不影响整理继续）:\n"
+                           f"{traceback.format_exc(limit=2)}")
+            return False
 
     # ---- 整理断点：中断后重发只补没跑的部分 ----
     #
@@ -1583,13 +1678,14 @@ class HermesCore(Star):
 
         # 普通整理只有一次调用，用「单片预算」而不是整次预算：
         # 它是挂在总结之后的自动任务，卡十分钟会把整个后台队列堵死。
-        _unit = max(30, int(self._get_cfg("consolidate_unit_seconds", 90)))
+        _unit = max(30, int(self._get_cfg("consolidate_unit_seconds", 180)))
         text = await self.router.chat(
             builder=build, purpose="整理记忆",
-            timeout=min(30.0, float(_unit)),
+            timeout=min(60.0, float(_unit)),
             max_attempts=3,
             deadline=time.monotonic() + _unit,
         )
+        foot = self._footer()
         plan = self._extract_json_array(text)
 
         applied: list[str] = []
@@ -1622,10 +1718,13 @@ class HermesCore(Star):
 
         if not applied:
             return (f"发现 {len(clusters)} 组疑似重复，但没有一组通过校验"
-                    "（可能模型判断不该合，或 ids 跨了用户/群）。")
+                    "（可能模型判断不该合，或 ids 跨了用户/群）。"
+                    + (f"\n{foot}" if foot else ""))
 
         head = "记忆整理预览（未写入）" if dry_run else "记忆已整理"
-        return f"{head}：{len(applied)} 组\n" + "\n".join(f"- {a}" for a in applied[:8])
+        return (f"{head}：{len(applied)} 组\n"
+                + "\n".join(f"- {a}" for a in applied[:8])
+                + (f"\n{foot}" if foot else ""))
 
     async def _deep_consolidate(self, rows: list[dict], dry_run: bool,
                                 force: bool = False) -> str:
@@ -1670,7 +1769,7 @@ class HermesCore(Star):
         # ---- 切片：单桶 100+ 条一次喂进去，prompt 长、出结果慢、超时全丢 ----
         # 40 条约 6-8k 字符，多数模型 10-20 秒能收敛；记忆按写入时间排序，
         # 同一话题产生的重复条目大概率落在相邻的片里。
-        chunk = max(10, min(80, int(self._get_cfg("consolidate_chunk_size", 40))))
+        chunk = max(10, min(80, int(self._get_cfg("consolidate_chunk_size", 30))))
         units: list[list[dict]] = []
         for bucket, items in buckets.items():
             if len(items) < 2:
@@ -1695,9 +1794,9 @@ class HermesCore(Star):
         # 两层预算：整次的总闸（默认 10 分钟）与单片硬顶（默认 90 秒）。
         # 单片硬顶是关键——没有它，一个坏模型 × 3 次尝试 × 30 秒就能吃掉 90 秒，
         # 4 片就是 6 分钟，整次预算再大也跑不完。
-        budget = max(60, int(self._get_cfg("consolidate_budget_seconds", 600)))
+        budget = max(60, int(self._get_cfg("consolidate_budget_seconds", 900)))
         deadline = time.monotonic() + budget
-        unit_budget = max(20, int(self._get_cfg("consolidate_unit_seconds", 90)))
+        unit_budget = max(20, int(self._get_cfg("consolidate_unit_seconds", 180)))
         max_streak = max(1, int(self._get_cfg("consolidate_max_fail_streak", 2)))
 
         def fail_note() -> str:
@@ -1710,6 +1809,8 @@ class HermesCore(Star):
         fail_streak = 0
         stopped = ""
         idx = 0
+        run_started = time.monotonic()
+        used_models: dict[str, dict] = {}
 
         for idx, items in enumerate(units, 1):
             if all(int(m["id"]) in done_ids for m in items):
@@ -1724,9 +1825,11 @@ class HermesCore(Star):
                     + _l[:max(600, budget_chars - len(head) - 40)],
                     purpose="深度整理记忆",
                     # 单片硬顶：一片最多耗 unit_budget 秒，到点就放弃这片刻去写库。
-                    # 实测「3 个模型 × 3 次 × 45 秒」一片能烧 180 秒，
-                    # 4 片就是 12 分钟——预算再大也跑不完，所以必须按片封顶。
-                    timeout=30.0,
+                    # 实测（40 条记忆 ≈ 2.1k 字 prompt）：deepseek 9.5s、
+                    # qwen3.7-flash 32.5s、nemotron free 51.9s、glm 直接不通。
+                    # 超时按 60 秒给，才能让前两个降级模型有机会跑完；
+                    # 3 次尝试 × 60 秒会被单片硬顶拦住，不会无限拖。
+                    timeout=60.0,
                     max_attempts=3,
                     deadline=deadline,
                     soft_deadline=time.monotonic() + unit_budget,
@@ -1796,6 +1899,15 @@ class HermesCore(Star):
                         applied.append(
                             f"#{'/'.join(map(str, ids))} → {content[:80]}")
 
+            # 每跑完一片就汇报一次：整理动辄几分钟，只在最后给结果的话，
+            # 用户无法判断它是"在处理"还是"卡死了"。
+            self._note_consolidate_model(used_models)
+            await self._push_progress(
+                f"整理进度 {idx}/{total_units}：这一片 {len(items)} 条记忆，"
+                f"累计合并 {total_merge} 组、丢弃 {total_drop} 条"
+                f"（{round(time.monotonic() - run_started)} 秒）\n"
+                + self._models_footer(used_models))
+
         if applied and not dry_run:
             self._resident_cache.clear()
         # 全部跑完且没跳片：断点作废，下次是全新一轮
@@ -1810,15 +1922,19 @@ class HermesCore(Star):
         if stopped:
             notes.append(stopped)
         miss = ("；" + "，".join(notes)) if notes else ""
+        foot = self._models_footer(used_models)
         if not applied and not stopped:
             return (f"深度整理完成：{total_units} 片，"
-                    f"模型认为没有需要合并或丢弃的条目{miss}。")
+                    f"模型认为没有需要合并或丢弃的条目{miss}。"
+                    + (f"\n{foot}" if foot else ""))
         tag = "深度整理预览（未写入）" if dry_run else "深度整理完成"
         if stopped:
             tag = "深度整理未跑完"
         line = f"{tag}：合并 {total_merge} 组、丢弃 {total_drop} 条，共 {total_units} 片{miss}"
         if applied:
             line += "\n" + "\n".join(f"- {a}" for a in applied[:10])
+        if foot:
+            line += f"\n{foot}"
         return line
 
     async def _run_consolidate_job(self, deep: bool, dry_run: bool, origin: str,
@@ -1833,6 +1949,9 @@ class HermesCore(Star):
         self.db.set_meta("consolidate_report", json.dumps(
             {"ts": started, "running": True, "deep": bool(deep), "dry": bool(dry_run)},
             ensure_ascii=False))
+        # 逐片进度就推到这个会话；任务结束（含异常）都要清掉，
+        # 否则下一次整理会把进度推到上一次的会话里。
+        self._consolidate_origin = origin or ""
         ok = True
         try:
             out = await self._consolidate_memories(dry_run=dry_run, deep=deep,
@@ -1842,6 +1961,8 @@ class HermesCore(Star):
         except Exception:
             ok = False
             out = f"整理失败：{traceback.format_exc(limit=3)}"
+        finally:
+            self._consolidate_origin = ""
         report = {"ts": started, "running": False, "ok": ok, "deep": bool(deep),
                   "dry": bool(dry_run), "text": out, "pushed": False}
         # 主动消息：QQ 官方在被动回复过期后会自动降级到主动接口；群聊没有主动
@@ -2168,7 +2289,7 @@ class HermesCore(Star):
             return
         yield event.plain_result("正在总结（手动触发会忽略条数阈值，处理全部待总结会话）……")
         result = await self._summarize(force=True)
-        yield event.plain_result(result)
+        yield event.plain_result(self._with_footer(result))
 
     @hermes.command("整理")
     async def hermes_consolidate(self, event: AstrMessageEvent, mode: str = ""):

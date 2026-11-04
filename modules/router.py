@@ -240,6 +240,8 @@ class ModelRouter:
         self._throttle = _Throttle()
         self._last_used: str = ""
         self._last_skipped: list[dict] = []
+        # 最近一次成功调用的落款信息：消息末尾的 `> 模型名（主/降级）` 从这里取。
+        self._last_call: dict = {}
         # 汇总计数：页面上要能看出「主模型到底成不成、降级用了多少次」
         self.counters = {"calls": 0, "ok": 0, "fail": 0,
                          "attempts": 0, "fallback_ok": 0, "throttled": 0}
@@ -251,6 +253,38 @@ class ModelRouter:
             return self.plugin._get_cfg(key, default)
         except Exception:
             return default
+
+    def _debug_trace(self) -> bool:
+        """逐次调用的明细日志（调用开始 / 成功耗时）。
+
+        默认关闭：正常运行时每次总结、每片整理都打一行会把日志刷满。
+        排查「为什么全都在超时」时打开，就能看出是发不出去还是生成长。
+        """
+        return bool(self._cfg("llm_debug_trace", False))
+
+    # ---------- 落款：这条回复是哪个模型给的 ----------
+
+    @staticmethod
+    def tier_label(index: int) -> str:
+        """0 = 主模型，1.. = 降级第几个。"""
+        return "主模型" if index <= 0 else f"降级 {index}"
+
+    def last_call_info(self) -> dict:
+        return dict(self._last_call or {})
+
+    def footer(self, extra: str = "") -> str:
+        """消息末行的模型落款：`> 供应商/模型（主模型）`。
+
+        群聊里 `>` 不一定渲染成引用，但作为普通文本也读得懂，
+        所以不去掉符号——用户要的就是这个格式。
+        """
+        info = self._last_call or {}
+        pid = str(info.get("provider") or "")
+        if not pid:
+            return ""
+        tier = self.tier_label(int(info.get("tier") or 0))
+        suffix = f"，{extra}" if extra else ""
+        return f"> {pid}（{tier}{suffix}）"
 
     def policy(self) -> dict:
         retry_on = self._cfg("llm_retry_on", DEFAULT_RETRY_ON)
@@ -265,7 +299,9 @@ class ModelRouter:
             "max_retries": max(0, min(9, _as_int(self._cfg("llm_max_retries", 1), 1))),
             # 30 秒：正常归纳 5-20 秒出结果；30 秒一个字不吐的，多半是免费档排队
             # 或者根本不通，给 90 秒只是把整次整理拖长。
-            "timeout": max(5.0, min(600.0, _as_float(self._cfg("llm_timeout", 30), 30))),
+            # 实测长 prompt：deepseek 9.5s、qwen3.7-flash 32.5s、nemotron 51.9s。
+            # 给 60 秒才够降级模型跑完；30 秒等于只允许主模型成功。
+            "timeout": max(5.0, min(600.0, _as_float(self._cfg("llm_timeout", 60), 60))),
             "backoff": max(0.0, min(30.0, _as_float(self._cfg("llm_backoff", 1.5), 1.5))),
             "total_attempts": max(1, min(30, _as_int(self._cfg("llm_total_attempts", 4), 4))),
             "cooldown": max(0, min(3600, _as_int(self._cfg("llm_cooldown_seconds", 180), 180))),
@@ -528,6 +564,24 @@ class ModelRouter:
 
     # ---------- 主入口 ----------
 
+    @staticmethod
+    async def _invoke(inst, prompt: str):
+        """调用 provider，并把 AstrBot 的内部重试压到 1 次。
+
+        AstrBot 的 openai provider 默认在内部重试 5 次（指数退避，单次最长等
+        30 秒）。对本插件是灾难：一次 429 会变成 1-2 分钟的静默等待，外层只看到
+        「超时」，既认不出是限流、也无法及时换模型。退避与换模型统一由本层负责。
+
+        老版本 provider 不认这个参数，会抛 TypeError，退回普通调用即可。
+        """
+        try:
+            return await inst.text_chat(prompt=prompt, session_id=None,
+                                        request_max_retries=1)
+        except TypeError as exc:
+            if "request_max_retries" not in str(exc):
+                raise
+            return await inst.text_chat(prompt=prompt, session_id=None)
+
     async def chat(
         self,
         prompt: str | None = None,
@@ -644,9 +698,13 @@ class ModelRouter:
                 self.counters["attempts"] += 1
                 self._throttle.record(pid, pol["min_interval"])
                 started = time.time()
+                if self._debug_trace():
+                    logger.info(
+                        f"[hermes_core] 调用开始 {purpose} model={pid} 第{i + 1}次 "
+                        f"prompt={len(model_prompt)}字 limit={eff_limit:.0f}s")
                 try:
                     resp = await asyncio.wait_for(
-                        inst.text_chat(prompt=model_prompt, session_id=None),
+                        self._invoke(inst, model_prompt),
                         timeout=eff_limit,
                     )
                     text = _completion_text(resp)
@@ -654,6 +712,18 @@ class ModelRouter:
                         raise _EmptyResponse("模型返回空内容")
                     self._log(purpose, pid, entry["model"], i + 1, started, True, "", "")
                     self._last_used = pid
+                    self._last_call = {
+                        "provider": pid,
+                        "model": entry["model"],
+                        "tier": fallback_index,
+                        "ms": int((time.time() - started) * 1000),
+                        "purpose": purpose,
+                        "prompt_chars": len(model_prompt),
+                    }
+                    if self._debug_trace():
+                        logger.info(
+                            f"[hermes_core] 调用成功 {purpose} model={pid} "
+                            f"{(time.time() - started):.1f}s 输出{len(text)}字")
                     self._cooldown_until.pop(pid, None)
                     self.counters["ok"] += 1
                     if fallback_index > 0:
@@ -703,7 +773,8 @@ class ModelRouter:
 
     # ---------- 测试 ----------
 
-    async def test(self, pid: str, timeout: float = 25.0) -> dict:
+    async def test(self, pid: str, timeout: float = 25.0,
+                   prompt: str = "只回复两个字母：OK") -> dict:
         inst = self._inst(pid)
         if inst is None:
             return {"id": pid, "ok": False, "kind": "no_provider",
@@ -711,7 +782,7 @@ class ModelRouter:
         started = time.time()
         try:
             resp = await asyncio.wait_for(
-                inst.text_chat(prompt="只回复两个字母：OK", session_id=None),
+                self._invoke(inst, prompt),
                 timeout=timeout,
             )
             text = _completion_text(resp).strip()
