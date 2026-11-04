@@ -527,6 +527,26 @@ D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 29 项�
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 38 项：切片、断点、单片超时、连续失败止损、模型落款
 ```
 
+### 生产库体检（只读副本）
+
+上面三套是「代码对不对」，这个脚本是「库里现在有没有坏数据」：
+
+```bash
+python tests/inspect_db.py --db D:/…/plugin_data/astrbot_plugin_hermes_core/hermes.db
+python tests/inspect_db.py --db …/hermes.db --repair   # 在副本上跑一次启动修复，看效果
+```
+
+它先把库快照到临时目录（走 SQLite backup API，不在 WAL 上边写边拷），然后在副本上量：
+
+- 孤儿私聊记忆（`owner` 缺失 → 按人和常驻都读不到，永久沉底）
+- 分层错位（`private` + 无群 + `scope='group'` → 群层按可见性过滤、按人层 scope 不匹配，两边都空）
+- 悬空合并链（`merged_into > 0` 但父条不存在；`-1` 是删除哨兵，不计入）
+- 空 `visibility`（会被当成 `public`，比预期更公开）
+- 跨群探针：用真库里的真实条目检索一次，确认 `group` 只在本群命中、无身份时取不到 `private`
+- `integrity_check` 与消息/FTS 行数对齐
+
+原库始终只读，`--repair` 也只改副本。
+
 ### 提交前自检
 
 提交前建议跑一遍语法编译与存储层自检，避免把明显问题带进版本库：
