@@ -193,3 +193,31 @@ def rank_messages(query: str, docs: list[dict[str, Any]], *, k: int = 3,
                   now: float | None = None) -> list[dict]:
     """历史消息排序。消息没有 kind，衰减也更快（聊过的话时效性更强）。"""
     return rank(query, docs, k=k, half_life_days=90.0, now=now)
+
+
+def filter_in_window(history: list[dict[str, Any]],
+                     window_ids: set[int]) -> list[dict[str, Any]]:
+    """剔除已在当前上下文窗口内的历史命中。
+
+    这些原始消息本轮请求本来就带着（req.contexts），再注入一份纯属重复计费。
+    window_ids 为空（拿不到窗口信息）时原样返回——宁可多注不可漏注。
+    """
+    if not window_ids or not history:
+        return history
+    return [h for h in history if int(h["id"]) not in window_ids]
+
+
+def suppress_repeats(items: list[dict[str, Any]], seen: dict[int, int],
+                     cur_turn: int, gap: int = 4) -> list[dict[str, Any]]:
+    """重复抑制：近 gap 轮注入过的记忆本轮跳过。
+
+    注入走临时 part 不进会话历史，下一轮模型确实看不到，所以注入本身不能省；
+    但相邻几轮查询措辞相近时同几条记忆反复入选是浪费。全被抑制时保留排名
+    最高的第一条，避免相关记忆彻底断供。
+    """
+    if not items:
+        return items
+    fresh = [x for x in items if cur_turn - seen.get(int(x["id"]), -10**9) >= gap]
+    if not fresh:
+        fresh = items[:1]
+    return fresh

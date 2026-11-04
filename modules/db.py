@@ -334,6 +334,20 @@ class HermesDB:
                     pass
         return total
 
+    def recent_message_ids(self, session_id: str | None, sender_id: str | None,
+                           n: int) -> list[int]:
+        """取本会话最近 n 条消息的 id（与消息查询同口径），用于注入窗口去重。
+
+        这批消息就是 AstrBot 会随本轮请求原样发出去的内容，命中它们的历史
+        不需要再注入一份。
+        """
+        where, args = self._msg_where(session_id, sender_id)
+        rows = self.conn.execute(
+            f"SELECT id FROM messages{where} ORDER BY id DESC LIMIT ?",
+            (*args, max(0, int(n))),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
     def _fts_candidates(self, query: str, cap: int,
                         session_id: str | None,
                         sender_id: str | None) -> list[dict] | None:

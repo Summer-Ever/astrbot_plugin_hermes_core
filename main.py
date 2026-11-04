@@ -108,7 +108,25 @@ except ImportError:
         SkillHub = _sh_mod.SkillHub
         guess_data_root = _sh_mod.guess_data_root
 
-PLUGIN_VERSION = "0.12.1"
+# 检索排序与去重纯函数，同样三级兜底
+try:
+    from .modules.recall import filter_in_window, suppress_repeats
+except ImportError:
+    try:
+        from modules.recall import filter_in_window, suppress_repeats
+    except ImportError:
+        import importlib.util as _ilu5
+
+        _rc_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "modules", "recall.py"
+        )
+        _rc_spec = _ilu5.spec_from_file_location("astrbot_plugin_hermes_core_recall", _rc_file)
+        _rc_mod = _ilu5.module_from_spec(_rc_spec)
+        _rc_spec.loader.exec_module(_rc_mod)
+        filter_in_window = _rc_mod.filter_in_window
+        suppress_repeats = _rc_mod.suppress_repeats
+
+PLUGIN_VERSION = "0.12.2"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -204,6 +222,8 @@ class HermesCore(Star):
         self._sum_lock = asyncio.Lock()
         self._resident_cache: dict[str, tuple[float, list[dict]]] = {}
         self._inject_guard: dict[str, float] = {}
+        # 注入去重：会话 -> {turn: 轮次, seen: {记忆id: 上次注入轮次}}
+        self._inj_state: dict[str, dict] = {}
         # 观测指标：内存累加、低频落库。没有指标就只能翻日志猜「注入到底起没起作用」。
         try:
             self._metrics = json.loads(self.db.get_meta("metrics_json", "{}") or "{}")
@@ -376,7 +396,7 @@ class HermesCore(Star):
             if len(self._inject_guard) > 200:
                 cutoff = now - 300
                 self._inject_guard = {k: v for k, v in self._inject_guard.items() if v > cutoff}
-            block = self._build_context_block(event, query)
+            block = self._build_context_block(event, query, req)
             if not block:
                 return
             if TextPart is not None and hasattr(req, "extra_user_content_parts"):
@@ -389,7 +409,8 @@ class HermesCore(Star):
         except Exception:
             logger.error(f"[hermes_core] 注入失败:\n{traceback.format_exc()}")
 
-    def _build_context_block(self, event: AstrMessageEvent, query: str) -> str:
+    def _build_context_block(self, event: AstrMessageEvent, query: str,
+                             req: ProviderRequest | None = None) -> str:
         t0 = time.perf_counter()
         lines: list[str] = []
         sc = self._scope_keys(event)
@@ -398,6 +419,14 @@ class HermesCore(Star):
         hist_k = int(self._get_cfg("inject_history_topk", 3))
         scope = str(self._get_cfg("memory_scope", "user"))
         per_user_hist = bool(self._get_cfg("per_user_history", True))
+
+        # 注入去重状态：每个会话一个轮次计数 + 近期已注入记忆表
+        state = self._inj_state.setdefault(sid, {"turn": 0, "seen": {}})
+        state["turn"] += 1
+        if len(self._inj_state) > 100:
+            keep = sorted(self._inj_state.items(),
+                          key=lambda kv: -kv[1]["turn"])[:50]
+            self._inj_state = {k: v for k, v in keep}
 
         # 第一层：常驻「关于你」。Hermes 的做法是 MEMORY.md / USER.md 整块加载，
         # 不依赖关键词命中——「机器人记得你」的基线不能建立在碰巧搜到之上。
@@ -417,18 +446,37 @@ class HermesCore(Star):
                 platform=sc["platform"], group_id=sc["group_id"] or None)
         else:
             memories = self.db.search_memories(query, limit=mem_k)
+        raw_mem = len(memories)
+        memories = suppress_repeats(memories, state["seen"], state["turn"])
+        if raw_mem > len(memories):
+            self._bump_metric("recall_mem_suppressed", raw_mem - len(memories))
         if memories:
             lines.append("[长期记忆参考]")
             lines += [f"- ({m['kind']}) {m['content']}" for m in memories]
             self._bump_metric("recall_memories", len(memories))
+            for m in memories:
+                state["seen"][int(m["id"])] = state["turn"]
             try:
                 self.db.bump_hits([int(m["id"]) for m in memories])
             except Exception:
                 pass
 
-        # 第三层：相关历史对话（只在本会话、默认只看本人，避免混入群友的话）
+        # 第三层：相关历史对话（只在本会话、默认只看本人，避免混入群友的话）。
+        # 上下文窗口去重：AstrBot 本来就会把最近若干条消息随请求发出，
+        # 命中窗口内的消息不再注入——那等于同一段原文算两遍 token。
         sender_filter = sc["raw_id"] if (scope == "user" and per_user_hist) else None
         history = self.db.search_messages(query, limit=hist_k, session_id=sid, sender_id=sender_filter)
+        window_ids: set[int] = set()
+        try:
+            n_ctx = len(getattr(req, "contexts", None) or [])
+        except Exception:
+            n_ctx = 0
+        if n_ctx and history:
+            window_ids = set(self.db.recent_message_ids(sid, sender_filter, n_ctx + 2))
+        raw_hist = len(history)
+        history = filter_in_window(history, window_ids)
+        if raw_hist > len(history):
+            self._bump_metric("recall_hist_dedup", raw_hist - len(history))
         if history:
             lines.append("[相关历史对话]")
             for h in reversed(history):

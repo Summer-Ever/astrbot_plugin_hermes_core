@@ -122,6 +122,22 @@ def main() -> int:
     mem_count = db.conn.execute("SELECT count(*) FROM memories").fetchone()[0]
     check("prune_messages 不碰记忆", mem_count > 0, f"剩 {mem_count} 条")
 
+    # --- 注入去重：窗口过滤 + 重复抑制
+    from modules.recall import filter_in_window, suppress_repeats
+    all_ids = db.recent_message_ids("s1", None, 100)
+    check("recent_message_ids 返回全部", len(all_ids) == 1, str(all_ids))
+    newest = db.recent_message_ids("s1", None, 1)
+    hits = [{"id": newest[0], "content": "窗口内"}, {"id": 99999, "content": "窗口外"}]
+    kept = filter_in_window(hits, set(all_ids))
+    check("filter_in_window 剔除窗口内命中", [h["content"] for h in kept] == ["窗口外"], str(kept))
+    check("filter_in_window 空窗口不动作", len(filter_in_window(hits, set())) == 2)
+    items = [{"id": 1, "s": 0.9}, {"id": 2, "s": 0.8}, {"id": 3, "s": 0.7}]
+    fresh = suppress_repeats(items, {1: 9}, cur_turn=10, gap=4)
+    check("suppress_repeats 跳过近期已注入", [x["id"] for x in fresh] == [2, 3], str(fresh))
+    all_seen = suppress_repeats(items, {1: 10, 2: 10, 3: 10}, cur_turn=10, gap=4)
+    check("suppress_repeats 全抑制保留头部", [x["id"] for x in all_seen] == [1], str(all_seen))
+    check("suppress_repeats 首次全保留", len(suppress_repeats(items, {}, 10, 4)) == 3)
+
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")
     if FAIL:
