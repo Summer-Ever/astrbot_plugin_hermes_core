@@ -231,6 +231,28 @@ class HermesDB:
             c.commit()
         except sqlite3.OperationalError:
             pass
+        # v0.12.13 修正：0.12.12 及更早的 merge_memories 没有写 visibility 列，
+        # 合并产物落成空串；而群聊过滤判的是「!= 'private'」，空串挡不住，
+        # 等于把并进组里的私聊条目搬到了群里。组内只要有一条 private 就按
+        # private 处理——宁可群聊少引用一条，也不把私事当众念出来。
+        # 用 meta 打标记，只跑一次，避免把用户手动改回的可见性又压回去。
+        try:
+            if not c.execute("SELECT 1 FROM meta WHERE key = ?",
+                             ("mig_merge_vis_v01213",)).fetchone():
+                c.execute(
+                    "UPDATE memories SET visibility = 'private'"
+                    " WHERE COALESCE(visibility, '') != 'private'"
+                    "   AND source = 'consolidate'"
+                    "   AND group_id != '' AND COALESCE(merged_into, 0) = 0"
+                    "   AND EXISTS (SELECT 1 FROM memories o"
+                    "     WHERE o.merged_into = memories.id"
+                    "       AND COALESCE(o.visibility, '') = 'private')"
+                )
+                c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)",
+                          ("mig_merge_vis_v01213", str(int(time.time()))))
+                c.commit()
+        except sqlite3.OperationalError:
+            pass
         # v0.3.0 迁移：消息也记录群原生 ID，供总结器写入群级记忆时定位
         try:
             c.execute("ALTER TABLE messages ADD COLUMN group_id TEXT DEFAULT ''")
@@ -937,14 +959,19 @@ class HermesDB:
                 return 0
             rows = sorted(rows, key=lambda r: r["id"])
             base = rows[0]
+            # 可见性必须显式继承：漏写这一列会落成空串，而群聊过滤判的是
+            # 「!= 'private'」，空串照样被召回——并进组里的私聊条目就漏到群里了。
+            vis = self._norm_visibility(
+                base["visibility"], base["owner_id"] or "", base["group_id"] or "")
             now = time.time()
             cur = self.conn.execute(
                 "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
-                " session_id, platform, group_id, merged_into, updated_ts)"
-                " VALUES(?,?,?,?,?,?,?,?,?,0,?)",
+                " session_id, platform, group_id, merged_into, updated_ts,"
+                " visibility)"
+                " VALUES(?,?,?,?,?,?,?,?,?,0,?,?)",
                 (now, kind or base["kind"], base["scope"], content, "consolidate",
                  base["owner_id"] or "", base["session_id"] or "",
-                 base["platform"] or "", base["group_id"] or "", now),
+                 base["platform"] or "", base["group_id"] or "", now, vis),
             )
             new_id = cur.lastrowid
             self.conn.execute(

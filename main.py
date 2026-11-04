@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.12"
+PLUGIN_VERSION = "0.12.13"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -256,14 +256,23 @@ def _cluster_by_similarity(items: list[dict], threshold: float,
 
 
 def _scope_bucket(m: dict) -> tuple:
-    """巩固的作用域桶：绝不把不同用户、不同群的记忆合到一起。"""
+    """巩固的作用域桶：绝不把不同用户、不同群、不同可见性的记忆合到一起。
+
+    可见性必须进桶。同一个人私聊说的私事和群里说的公开偏好如果并进一条，
+    合并结果只能二选一：要么私事变成群可见，要么群里的信息从此在群里消失。
+    merge_memories 继承组内最早那条的作用域字段，所以分桶阶段就得先切开。
+    """
     owner = (m.get("owner_id") or "").strip()
     gid = (m.get("group_id") or "").strip()
+    vis = str(m.get("visibility") or "").strip().lower()
+    if vis not in ("private", "group", "public"):
+        # 老数据没有 visibility，按写入位置推断，与 HermesDB._norm_visibility 一致
+        vis = "group" if gid else ("private" if owner else "public")
     if owner:
-        return ("user", owner, m.get("platform") or "")
+        return ("user", owner, m.get("platform") or "", vis)
     if gid:
-        return ("group", gid, m.get("platform") or "")
-    return ("global",)
+        return ("group", gid, m.get("platform") or "", vis)
+    return ("global", vis)
 
 
 @register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", PLUGIN_VERSION)

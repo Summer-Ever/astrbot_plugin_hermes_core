@@ -164,6 +164,43 @@ async def case_merge(tmp: str) -> None:
     check("合并计数正确", "合并 1 组" in out, out[:60])
 
 
+async def case_visibility(tmp: str) -> None:
+    """同一个人私聊的私事与群里的公开偏好必须分开整理。
+
+    并成一条就只能二选一：私事流到群里，或群里的信息在群里消失。
+    """
+    core = new_core(tmp)
+    core.db.add_memory("fact", "私聊里说的：下周要做手术", owner_id="u9",
+                       visibility="private")
+    core.db.add_memory("fact", "私聊里说的：身份证号后四位 8823", owner_id="u9",
+                       visibility="private")
+    core.db.add_memory("preference", "群里说的：喜欢喝美式咖啡", owner_id="u9",
+                       group_id="g1", visibility="group")
+    core.db.add_memory("preference", "群里说的：爱喝美式不加糖", owner_id="u9",
+                       group_id="g1", visibility="group")
+    seen: list[str] = []
+
+    def behavior(i, p):
+        seen.append(p)
+        return "[]"
+
+    core.router = FakeRouter(behavior)
+    await core._deep_consolidate(core.db.all_active_memories(), dry_run=False)
+    check("私聊与群按两个桶分别整理", len(seen) == 2, str(len(seen)))
+    priv_prompts = [p for p in seen if "手术" in p]
+    group_prompts = [p for p in seen if "美式" in p]
+    check("私聊片不含群里的条目", priv_prompts and "美式" not in priv_prompts[0],
+          (priv_prompts[0][-80:] if priv_prompts else "无"))
+    check("群片不含私聊的条目", group_prompts and "手术" not in group_prompts[0],
+          (group_prompts[0][-80:] if group_prompts else "无"))
+
+    # 合并产物必须继承可见性，不能落成空串（空串在群聊里挡不住注入）
+    ids = [r["id"] for r in core.db.all_active_memories() if r["visibility"] == "private"]
+    new_id = core.db.merge_memories(ids, "下周要做手术，身份证后四位 8823")
+    row = [r for r in core.db.all_active_memories() if int(r["id"]) == int(new_id)][0]
+    check("合并产物继承 private", row["visibility"] == "private", str(row["visibility"]))
+
+
 
 async def case_footer(tmp: str) -> None:
     """模型落款：单模型、多模型、降级层级都要标清楚。"""
@@ -200,7 +237,7 @@ async def case_footer(tmp: str) -> None:
 
 async def main() -> int:
     for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
-               case_merge, case_footer):
+               case_merge, case_visibility, case_footer):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:
             await fn(tmp)
