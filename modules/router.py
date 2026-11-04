@@ -26,12 +26,7 @@ import traceback
 from collections import deque
 from typing import Any, Callable
 
-try:
-    from astrbot.api import logger
-except Exception:  # pragma: no cover - 非 AstrBot 环境
-    import logging
-
-    logger = logging.getLogger("hermes_core.router")
+from astrbot.api import logger
 
 # 错误类别 → 中文说明。顺序即 UI 展示顺序。
 ERROR_LABELS = {
@@ -159,6 +154,9 @@ class ModelRouter:
         self._cooldown_until: dict[str, float] = {}
         self._last_used: str = ""
         self._last_skipped: list[dict] = []
+        # 汇总计数：页面上要能看出「主模型到底成不成、降级用了多少次」
+        self.counters = {"calls": 0, "ok": 0, "fail": 0,
+                         "attempts": 0, "fallback_ok": 0}
 
     # ---------- 配置 ----------
 
@@ -406,8 +404,11 @@ class ModelRouter:
         attempts = 0
         tried: list[dict] = []
         limit = timeout if timeout is not None else pol["timeout"]
+        self.counters["calls"] += 1
+        fallback_index = -1
 
         for entry in chain:
+            fallback_index += 1
             pid = entry["id"]
             inst = entry["inst"]
             try:
@@ -421,6 +422,7 @@ class ModelRouter:
                 if attempts >= total_cap:
                     break
                 attempts += 1
+                self.counters["attempts"] += 1
                 started = time.time()
                 try:
                     resp = await asyncio.wait_for(
@@ -433,6 +435,9 @@ class ModelRouter:
                     self._log(purpose, pid, entry["model"], i + 1, started, True, "", "")
                     self._last_used = pid
                     self._cooldown_until.pop(pid, None)
+                    self.counters["ok"] += 1
+                    if fallback_index > 0:
+                        self.counters["fallback_ok"] += 1
                     return text
                 except Exception as exc:
                     kind = classify_error(exc)
@@ -461,6 +466,7 @@ class ModelRouter:
             f"{t['provider']}（{ERROR_LABELS.get(t['kind'], t['kind'])}）"
             for t in tried[-4:]
         ) or "无尝试记录"
+        self.counters["fail"] += 1
         raise ModelError("all_failed",
                          f"全部 {len(chain)} 个模型都失败了：{detail}。"
                          f"可在「模型」页检查配置或点「测试」定位问题。",

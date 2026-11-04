@@ -68,9 +68,11 @@ except ImportError:
 # 渲染模块与 db 同层，复用同样的三级兜底
 try:
     from .modules.render import RenderError, render_mermaid
+    from .modules.render import warmup as warmup_renderer
 except ImportError:
     try:
         from modules.render import RenderError, render_mermaid
+        from modules.render import warmup as warmup_renderer
     except ImportError:
         import importlib.util as _ilu2
 
@@ -82,6 +84,7 @@ except ImportError:
         _rd_spec.loader.exec_module(_rd_mod)
         RenderError = _rd_mod.RenderError
         render_mermaid = _rd_mod.render_mermaid
+        warmup_renderer = _rd_mod.warmup
 
 # 模型路由：主模型 + 降级链 + 重试/错误分类，同样三级兜底
 try:
@@ -125,7 +128,7 @@ except ImportError:
         SkillHub = _sh_mod.SkillHub
         guess_data_root = _sh_mod.guess_data_root
 
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.10.0"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -219,6 +222,16 @@ class HermesCore(Star):
         # 所有总结/整理都走它：主模型失败自动降级，不依赖「当前对话模型」
         self.router = ModelRouter(self)
         self._bg_task: asyncio.Task | None = None
+        self._warm_task: asyncio.Task | None = None
+        self._sum_lock = asyncio.Lock()
+        self._resident_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._inject_guard: dict[str, float] = {}
+        # 观测指标：内存累加、低频落库。没有指标就只能翻日志猜「注入到底起没起作用」。
+        try:
+            self._metrics = json.loads(self.db.get_meta("metrics_json", "{}") or "{}")
+        except Exception:
+            self._metrics = {}
+        self._metrics_dirty = 0
         self._last_origin: str | None = None  # 最近活跃会话，用于技能生成通知
 
     async def initialize(self):
@@ -229,6 +242,18 @@ class HermesCore(Star):
         self._register_web_apis()
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
+        # 渲染依赖（mermaid.min.js / puppeteer-core）放到后台预下载：
+        # 用户第一次要图时不用等几分钟，也不会阻塞事件循环。
+        if bool(self._get_cfg("render_warmup", True)):
+            self._warm_task = asyncio.create_task(self._warmup_renderer())
+
+    async def _warmup_renderer(self):
+        """后台预热渲染依赖。失败只提示，不影响插件其他功能。"""
+        try:
+            ok, err = await warmup_renderer(_default_data_dir())
+            logger.info(f"[hermes_core] 渲染依赖{'已就绪' if ok else '预热失败：' + err}")
+        except Exception:
+            logger.warning(f"[hermes_core] 渲染预热跳过:\n{traceback.format_exc(limit=2)}")
 
     def _register_web_apis(self):
         """把 WebUI 接口挂到 dashboard 上（页面见 views/hermes/）。
@@ -319,6 +344,36 @@ class HermesCore(Star):
 
     # ============ 钩子：请求前注入记忆 ============
 
+    # ============ 观测指标 ============
+
+    def _bump_metric(self, key: str, n: int = 1) -> None:
+        """轻量计数：内存累加，攒够 100 次再落库，避免每条消息都写一次 meta。"""
+        try:
+            self._metrics[key] = int(self._metrics.get(key, 0)) + int(n)
+            self._metrics_dirty += 1
+            if self._metrics_dirty >= 100:
+                self._flush_metrics()
+        except Exception:
+            pass
+
+    def _flush_metrics(self) -> None:
+        if not self._metrics_dirty:
+            return
+        try:
+            self.db.set_meta("metrics_json", json.dumps(self._metrics, ensure_ascii=False))
+            self._metrics_dirty = 0
+        except Exception:
+            pass
+
+    def metrics_snapshot(self) -> dict:
+        """给 WebUI 概览用：原始计数 + 派生均值。"""
+        m = dict(self._metrics)
+        req = max(1, int(m.get("inject_requests", 0)))
+        m["avg_recall_ms"] = round(int(m.get("recall_ms", 0)) / req, 2)
+        m["avg_inject_chars"] = int(int(m.get("inject_chars", 0)) / req)
+        m["avg_memories"] = round(int(m.get("recall_memories", 0)) / req, 2)
+        return m
+
     def _scope_keys(self, event: AstrMessageEvent) -> dict:
         """解析当前消息的作用域键。
 
@@ -344,6 +399,17 @@ class HermesCore(Star):
             query = (event.message_str or "").strip()
             if not query:
                 return
+            # 一次用户发言可能触发多轮 LLM 请求（工具调用循环），每轮都注入
+            # 会把同一段记忆反复塞进上下文，既费 token 又干扰模型。同一句话在
+            # 5 分钟内只注入一次；换了新问题（内容不同）照常注入。
+            key = f"{event.unified_msg_origin}\u0000{hash(query)}"
+            now = time.time()
+            if now - self._inject_guard.get(key, 0) < 300:
+                return
+            self._inject_guard[key] = now
+            if len(self._inject_guard) > 200:
+                cutoff = now - 300
+                self._inject_guard = {k: v for k, v in self._inject_guard.items() if v > cutoff}
             block = self._build_context_block(event, query)
             if not block:
                 return
@@ -358,6 +424,7 @@ class HermesCore(Star):
             logger.error(f"[hermes_core] 注入失败:\n{traceback.format_exc()}")
 
     def _build_context_block(self, event: AstrMessageEvent, query: str) -> str:
+        t0 = time.perf_counter()
         lines: list[str] = []
         sc = self._scope_keys(event)
         owner_id, sid = sc["owner_id"], sc["sid"]
@@ -366,7 +433,14 @@ class HermesCore(Star):
         scope = str(self._get_cfg("memory_scope", "user"))
         per_user_hist = bool(self._get_cfg("per_user_history", True))
 
-        # 记忆：user 模式按 用户>群>全局 三级召回；group 模式按 群>全局；global 模式全量
+        # 第一层：常驻「关于你」。Hermes 的做法是 MEMORY.md / USER.md 整块加载，
+        # 不依赖关键词命中——「机器人记得你」的基线不能建立在碰巧搜到之上。
+        resident = self._resident_block(owner_id)
+        if resident:
+            lines.append("[关于这位用户（长期稳定信息）]")
+            lines.extend(f"- ({r['kind']}) {r['content']}" for r in resident)
+
+        # 第二层：按当前这句话检索相关记忆（用户 > 群 > 全局逐级补）
         if scope == "user":
             memories = self.db.search_memories(
                 query, limit=mem_k, owner_id=owner_id,
@@ -380,8 +454,13 @@ class HermesCore(Star):
         if memories:
             lines.append("[长期记忆参考]")
             lines += [f"- ({m['kind']}) {m['content']}" for m in memories]
+            self._bump_metric("recall_memories", len(memories))
+            try:
+                self.db.bump_hits([int(m["id"]) for m in memories])
+            except Exception:
+                pass
 
-        # 历史：默认只看本人在本群的历史，避免混入其他群友的对话
+        # 第三层：相关历史对话（只在本会话、默认只看本人，避免混入群友的话）
         sender_filter = sc["raw_id"] if (scope == "user" and per_user_hist) else None
         history = self.db.search_messages(query, limit=hist_k, session_id=sid, sender_id=sender_filter)
         if history:
@@ -390,21 +469,46 @@ class HermesCore(Star):
                 who = "你" if h["role"] == "user" else "你之前回复"
                 text = h["content"][:200]
                 lines.append(f"- {who}: {text}")
+            self._bump_metric("recall_messages", len(history))
 
+        # 第四层：技能清单。只给「够用的索引」，正文按需 read_skill 读取（渐进披露），
+        # 不然 20 多个技能名每轮都在烧常驻 token。
         skills = self.hub.list_for(owner_id, sc["group_id"])
         if skills:
             personal = [s for s in skills if s.get("source") == "personal"]
             system = [s for s in skills if s.get("source") == "system"]
             parts: list[str] = []
             if personal:
-                parts.append("我的技能：" + "、".join(s["name"] for s in personal[:15]))
+                names = "、".join(s["name"] for s in personal[:12])
+                more = f" 等 {len(personal)} 个" if len(personal) > 12 else ""
+                parts.append(f"我的技能：{names}{more}")
             if system:
-                parts.append("系统技能(本体装的,只读)：" + "、".join(s["name"] for s in system[:10]))
-            lines.append(f"[已掌握技能] {'；'.join(parts)}（可用 read_skill 查看全文）")
+                parts.append(f"系统技能（本体安装，只读）：{len(system)} 个")
+            lines.append(f"[已掌握技能] {'；'.join(parts)}（可用 list_skills / read_skill 查看）")
 
         if not lines:
             return ""
-        return "\n".join(["[记忆系统上下文，仅作参考]"] + lines + ["[/记忆系统上下文]"])
+        block = "\n".join(["[记忆系统上下文，仅作参考]"] + lines + ["[/记忆系统上下文]"])
+        self._bump_metric("inject_requests")
+        self._bump_metric("inject_chars", len(block))
+        self._bump_metric("recall_ms", max(0, int((time.perf_counter() - t0) * 1000)))
+        return block
+
+    def _resident_block(self, owner_id: str) -> list[dict]:
+        """常驻条目（60 秒缓存）。写记忆/整理后由调用方清缓存。"""
+        if not owner_id or not bool(self._get_cfg("resident_notes", True)):
+            return []
+        now = time.time()
+        cached = self._resident_cache.get(owner_id)
+        if cached and now - cached[0] < 60:
+            return cached[1]
+        items = self.db.resident_notes(
+            owner_id,
+            limit=max(1, int(self._get_cfg("resident_max_items", 12))),
+            max_chars=max(120, int(self._get_cfg("resident_max_chars", 800))),
+        )
+        self._resident_cache[owner_id] = (now, items)
+        return items
 
     # ============ 钩子：响应后落库 ============
 
@@ -446,6 +550,11 @@ class HermesCore(Star):
         mems = self.db.search_memories(
             query, limit=5, owner_id=sc["owner_id"], session_id=sc["sid"],
             platform=sc["platform"], group_id=sc["group_id"] or None)
+        if mems:
+            try:
+                self.db.bump_hits([int(m["id"]) for m in mems])
+            except Exception:
+                pass
         msgs = self.db.search_messages(query, limit=5, session_id=sc["sid"], sender_id=sc["raw_id"])
         out = []
         if mems:
@@ -463,12 +572,16 @@ class HermesCore(Star):
             kind (string): 类型，fact/preference/profile/summary 之一
         """
         sc = self._scope_keys(event)
-        mid = self.db.add_memory(kind or "fact", content, scope="user",
-                                 source="llm_tool", owner_id=sc["owner_id"],
-                                 session_id=sc["sid"], platform=sc["platform"],
-                                 group_id=sc["group_id"])
-        self._queue_memories([mid])  # 手动存的也进整理队列，攒够阈值一起合并
-        return f"已保存记忆 #{mid}。"
+        mid, created = self.db.add_memory_smart(
+            kind or "fact", content, scope="user", source="llm_tool",
+            owner_id=sc["owner_id"], session_id=sc["sid"],
+            platform=sc["platform"], group_id=sc["group_id"],
+        )
+        self._resident_cache.pop(sc["owner_id"], None)
+        if created:
+            self._queue_memories([mid])  # 手动存的也进整理队列，攒够阈值一起合并
+            return f"已保存记忆 #{mid}。"
+        return f"这条和已有记忆 #{mid} 高度重合，已合并强化，没有新增。"
 
     @filter.llm_tool(name="list_skills")
     async def tool_list_skills(self, event: AstrMessageEvent) -> str:
@@ -591,6 +704,17 @@ class HermesCore(Star):
                 logger.error(f"[hermes_core] 总结循环异常:\n{traceback.format_exc()}")
 
     async def _summarize(self, force: bool = False) -> str:
+        """互斥入口：后台循环和 /hermes 总结 可能同时触发。
+
+        没有锁时两边会读到同一个水位、把同一批消息总结两遍——重复写记忆、
+        重复提炼技能、多花一倍 token。拿不到锁就直接放弃本次，不排队。
+        """
+        if self._sum_lock.locked():
+            return "已有一轮总结正在进行，本次跳过（避免重复写入）。"
+        async with self._sum_lock:
+            return await self._summarize_impl(force=force)
+
+    async def _summarize_impl(self, force: bool = False) -> str:
         """按会话独立判断是否值得总结：各自攒够条数、或超时兜底、或手动强制。
 
         每个会话有自己的水位（meta 键 summarized:<sid>），互不干扰，避免
@@ -644,6 +768,11 @@ class HermesCore(Star):
 
         summary = (f"[hermes_core] 总结完成：{len(details)} 个会话 / {done_msgs} 条消息，"
                    f"新记忆 {made_mem} 条，技能 新增 {made_skill} / 更新 {skill_upd} 个。")
+        self._bump_metric("summarize_runs")
+        self._bump_metric("summarize_messages", done_msgs)
+        self._bump_metric("summarize_memories", made_mem)
+        self._bump_metric("summarize_skills", made_skill)
+        self._flush_metrics()
 
         # 记忆巩固：攒够 N 条新记忆才整理一次（一次整理 = 一次模型调用，别每条都调）
         new_ids = {m["id"] for m in self.db.all_active_memories() if m["id"] > before_max}
@@ -741,11 +870,15 @@ class HermesCore(Star):
             room = max(600, budget - len(head) - 60)
             body = transcript
             if len(body) > room:
-                body = body[:room]
-                cut = body.rfind("\n")
-                if cut > room * 0.6:
-                    body = body[:cut]
-                body += "\n…（对话过长，已按当前模型上下文截断，保留最早部分）"
+                # 旧实现只保留开头（body[:room]），结果最新的对话被砍掉——
+                # 越活跃的群，记忆反而越滞后。总结是给未来用的，最近的事权重更高；
+                # 但开头常含任务背景，也不能全丢，所以 3:7 首尾保留。
+                keep_head = max(200, int(room * 0.3))
+                keep_tail = room - keep_head
+                mid = max(keep_head, len(body) - keep_tail)
+                body = (body[:keep_head]
+                        + f"\n…（中间省略 {mid - keep_head} 字，保留最早与最新部分）…\n"
+                        + body[mid:])
             return head + body
 
         text = await self.router.chat(builder=build, purpose="总结记忆")
@@ -778,12 +911,15 @@ class HermesCore(Star):
                     owner = ""  # 归属不明 → 降级为群公共记忆
                 if owner:
                     owner = self.db.resolve_owner(owner, fmt)
-                self.db.add_memory(
+                mid, created = self.db.add_memory_smart(
                     str(item.get("kind", "fact")), str(item["content"]),
                     scope="user" if owner else "group", source="auto_summary",
                     owner_id=owner, session_id=sid, platform=fmt, group_id=gid,
                 )
-                made_mem += 1
+                if created:
+                    made_mem += 1
+        # 新记忆可能改变「关于你」的内容，清掉缓存让下一条消息用上
+        self._resident_cache.clear()
         return made_mem, made_skill, skill_upd
 
     # ============ 整理队列：攒够 N 条才合并 ============
@@ -1258,12 +1394,17 @@ class HermesCore(Star):
             yield event.plain_result("用法：/hermes 记住 <内容>")
             return
         sc = self._scope_keys(event)
-        mid = self.db.add_memory("fact", content.strip(), scope="user",
-                                 source="manual", owner_id=sc["owner_id"],
-                                 session_id=sc["sid"], platform=sc["platform"],
-                                 group_id=sc["group_id"])
-        self._queue_memories([mid])
-        yield event.plain_result(f"已记住（#{mid}）：{content.strip()}")
+        mid, created = self.db.add_memory_smart(
+            "fact", content.strip(), scope="user", source="manual",
+            owner_id=sc["owner_id"], session_id=sc["sid"],
+            platform=sc["platform"], group_id=sc["group_id"],
+        )
+        self._resident_cache.pop(sc["owner_id"], None)
+        if created:
+            self._queue_memories([mid])
+            yield event.plain_result(f"已记住（#{mid}）：{content.strip()}")
+        else:
+            yield event.plain_result(f"这条和已有记忆 #{mid} 重合，已合并强化，没有重复新增。")
 
     @hermes.command("忘记")
     async def hermes_forget(self, event: AstrMessageEvent, memory_id: int):
@@ -1516,7 +1657,9 @@ class HermesCore(Star):
             f"下一次对话会照常召回。")
 
     async def terminate(self):
-        if self._bg_task:
-            self._bg_task.cancel()
+        for task in (self._bg_task, self._warm_task):
+            if task and not task.done():
+                task.cancel()
+        self._flush_metrics()
         self.db.close()
         logger.info("[hermes_core] 已卸载")

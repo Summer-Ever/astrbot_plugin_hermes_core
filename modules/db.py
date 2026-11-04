@@ -13,6 +13,33 @@ import sqlite3
 import threading
 import time
 
+try:  # 正常情况（包内导入）
+    from . import recall as _recall
+except ImportError:  # 插件被按文件路径加载时，退化为同名模块
+    try:
+        from modules import recall as _recall  # type: ignore
+    except ImportError:  # 最后兜底：按路径加载，不污染 sys.path
+        import importlib.util as _ilu
+
+        _rc_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recall.py")
+        _rc_spec = _ilu.spec_from_file_location("astrbot_plugin_hermes_core_recall", _rc_file)
+        _rc_mod = _ilu.module_from_spec(_rc_spec)
+        _rc_spec.loader.exec_module(_rc_mod)
+        _recall = _rc_mod
+
+# 记忆类型白名单。模型偶尔会自创类型（历史上出现过 conclusion），
+# 不校验的话会污染统计和 UI 筛选；未知类型统一归为 fact。
+ALLOWED_KINDS = ("fact", "preference", "profile", "summary",
+                 "event", "plan", "conclusion", "relation")
+DEFAULT_KIND = "fact"
+
+# 去重时的否定词哨兵。只用于「两边是否同极性」的比较，不做语义分析。
+_NEG_WORDS = ("不", "没", "无", "别", "禁止", "取消", "勿", "无需")
+
+
+def _neg_words(text: str) -> set[str]:
+    return {w for w in _NEG_WORDS if w in str(text or "")}
+
 
 # 技能表：唯一键是 (owner_id, name)，同一个人不能有两条同名技能，
 # 但不同的人可以各自持有同名技能（比如两个人都改过 computer-power）。
@@ -118,6 +145,10 @@ class HermesDB:
             # 检索时排除。这样误合并可以回滚，也不丢历史。
             "ALTER TABLE memories ADD COLUMN merged_into INTEGER DEFAULT 0",
             "ALTER TABLE memories ADD COLUMN updated_ts REAL DEFAULT 0",
+            # v0.10.0：检索加权需要「被召回次数」和「重要度」；last_hit_ts 供衰减判断
+            "ALTER TABLE memories ADD COLUMN hits INTEGER DEFAULT 0",
+            "ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0",
+            "ALTER TABLE memories ADD COLUMN last_hit_ts REAL DEFAULT 0",
         ):
             try:
                 c.execute(ddl)
@@ -137,6 +168,18 @@ class HermesDB:
                 platform TEXT DEFAULT '',
                 ts REAL NOT NULL
             );
+            """
+        )
+        # 检索/统计的支撑索引。memories 原来一个索引都没有，134 条时全表扫还能撑，
+        # 上千条后每次注入都在拖慢事件循环。
+        c.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mem_active
+                ON memories(merged_into, owner_id, group_id);
+            CREATE INDEX IF NOT EXISTS idx_mem_kind
+                ON memories(merged_into, kind, id);
+            CREATE INDEX IF NOT EXISTS idx_msg_sender
+                ON messages(session_id, sender_id, id);
             """
         )
         c.commit()
@@ -241,37 +284,24 @@ class HermesDB:
 
     def search_messages(self, query: str, limit: int = 5,
                         session_id: str | None = None,
-                        sender_id: str | None = None) -> list[dict]:
-        """优先 FTS5 trigram 匹配，失败/无结果时退回 LIKE。可按会话和发言人过滤。"""
-        extra_sql = ""
-        extra_args: list = []
-        if session_id is not None:
-            extra_sql += " AND m.session_id = ?"
-            extra_args.append(session_id)
-        if sender_id is not None:
-            extra_sql += " AND m.sender_id = ?"
-            extra_args.append(sender_id)
-        if self._fts_enabled:
-            try:
-                q = query.strip().replace('"', ' ')
-                if len(q) >= 3:
-                    rows = self.conn.execute(
-                        "SELECT m.* FROM messages_fts f JOIN messages m ON m.id = f.rowid"
-                        " WHERE messages_fts MATCH ?" + extra_sql +
-                        " ORDER BY m.id DESC LIMIT ?",
-                        (f'"{q}"', *extra_args, limit),
-                    ).fetchall()
-                    if rows:
-                        return [dict(r) for r in rows]
-            except sqlite3.OperationalError:
-                pass
-        like = f"%{query.strip()[:100]}%"
+                        sender_id: str | None = None,
+                        scan: int = 1500) -> list[dict]:
+        """按相关度检索历史消息（bigram + IDF），不再要求整句作为子串出现。
+
+        候选集只取最近 scan 条：越久远的对话越不可能被需要，同时也避免全表扫描。
+        返回按 id 倒序（最新在前），与旧实现保持一致，调用方无需调整。
+        """
+        if len(_recall.norm(query)) < 4:
+            # 两三个字的寒暄没有区分度，检索只会带回噪声
+            return []
+        where, args = self._msg_where(session_id, sender_id)
         rows = self.conn.execute(
-            "SELECT * FROM messages m WHERE m.content LIKE ?" + extra_sql +
-            " ORDER BY m.id DESC LIMIT ?",
-            (like, *extra_args, limit),
+            f"SELECT * FROM messages{where} ORDER BY id DESC LIMIT ?",
+            (*args, max(50, int(scan))),
         ).fetchall()
-        return [dict(r) for r in rows]
+        docs = [dict(r) for r in rows]
+        hits = _recall.rank_messages(query, docs, k=max(1, int(limit)))
+        return sorted(hits, key=lambda x: -int(x["id"]))
 
     def recent_messages(self, session_id: str, limit: int = 20) -> list[dict]:
         rows = self.conn.execute(
@@ -353,11 +383,111 @@ class HermesDB:
             cur = self.conn.execute(
                 "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
                 " session_id, platform, group_id) VALUES(?,?,?,?,?,?,?,?,?)",
-                (time.time(), kind, scope, content, source, owner_id or "",
-                 session_id or "", platform or "", group_id or ""),
+                (time.time(), self._norm_kind(kind), scope, content, source,
+                 owner_id or "", session_id or "", platform or "", group_id or ""),
             )
             self.conn.commit()
             return cur.lastrowid
+
+    @staticmethod
+    def _norm_kind(kind: str) -> str:
+        k = str(kind or "").strip().lower()
+        return k if k in ALLOWED_KINDS else DEFAULT_KIND
+
+    def add_memory_smart(self, kind: str, content: str, scope: str = "global",
+                         source: str = "", owner_id: str = "", session_id: str = "",
+                         platform: str = "", group_id: str = "",
+                         threshold: float = 0.70) -> tuple[int, bool]:
+        """写入记忆前先判断「这条是不是已经说过了」。
+
+        返回 (id, 是否新建)。同一作用域里已有高度相似的条目时，不再插一条新的，
+        而是强化旧条：内容取更完整的那个，重要度上调。
+        这样注入质量不会在「攒够 10 条再合并」的窗口期里一路下滑。
+        """
+        content = str(content or "").strip()
+        if not content:
+            return 0, False
+        kind = self._norm_kind(kind)
+        rows = self.conn.execute(
+            "SELECT id, content, importance FROM memories WHERE merged_into = 0"
+            " AND owner_id = ? AND group_id = ? AND session_id = ?"
+            " ORDER BY id DESC LIMIT 300",
+            (owner_id or "", group_id or "", session_id or ""),
+        ).fetchall()
+        best_id, best_sim = 0, 0.0
+        for r in rows:
+            s = _recall.jaccard(content, r["content"] or "")
+            # 否定词不一致时绝不去重：「喜欢猫」和「不喜欢猫」字面相似度 0.71，
+            # 但语义相反，合并会把偏好记反。
+            if _neg_words(content) != _neg_words(r["content"] or ""):
+                continue
+            if s > best_sim:
+                best_id, best_sim = int(r["id"]), s
+        if best_id and best_sim >= threshold:
+            old = self.conn.execute(
+                "SELECT content, importance FROM memories WHERE id = ?", (best_id,)
+            ).fetchone()
+            merged = old["content"] if len(old["content"]) >= len(content) else content
+            with self._lock:
+                self.conn.execute(
+                    "UPDATE memories SET content = ?, updated_ts = ?,"
+                    " importance = MIN(1.0, COALESCE(importance, 0) + 0.15),"
+                    " kind = CASE WHEN kind = 'fact' THEN ? ELSE kind END WHERE id = ?",
+                    (merged, time.time(), kind, best_id),
+                )
+                self.conn.commit()
+            return best_id, False
+        return self.add_memory(kind, content, scope=scope, source=source,
+                               owner_id=owner_id, session_id=session_id,
+                               platform=platform, group_id=group_id), True
+
+    def bump_hits(self, ids: list[int]) -> None:
+        """注入/检索命中后累加访问计数，供后续排序加权。"""
+        ids = [int(i) for i in ids if i]
+        if not ids:
+            return
+        with self._lock:
+            marks = ",".join("?" * len(ids))
+            self.conn.execute(
+                f"UPDATE memories SET hits = COALESCE(hits, 0) + 1,"
+                f" last_hit_ts = ? WHERE id IN ({marks})",
+                (time.time(), *ids),
+            )
+            self.conn.commit()
+
+    def resident_notes(self, owner_id: str, limit: int = 12,
+                       max_chars: int = 800,
+                       kinds: tuple[str, ...] = ("profile", "preference", "fact")
+                        ) -> list[dict]:
+        """常驻「关于你」条目：不依赖检索命中，每次对话固定注入。
+
+        Hermes 的做法是把 MEMORY.md / USER.md 整块加载——「机器人记得你」的
+        基线不该建立在「这次的关键词恰好撞上」之上。这里取稳定的画像/偏好，
+        按重要度与命中次数排序，最后按字符预算截断。
+        """
+        if not owner_id:
+            return []
+        marks = ",".join("?" * len(kinds))
+        rows = self.conn.execute(
+            f"SELECT id, kind, content, importance, hits FROM memories"
+            f" WHERE merged_into = 0 AND owner_id = ? AND kind IN ({marks})"
+            # 画像/偏好优先于一次性事实：常驻区块就那么点预算，先放「这个人是谁」
+            f" ORDER BY CASE kind WHEN 'profile' THEN 0 WHEN 'preference' THEN 1 ELSE 2 END,"
+            f" COALESCE(importance, 0) DESC, COALESCE(hits, 0) DESC, id DESC"
+            f" LIMIT ?",
+            (owner_id, *kinds, max(1, int(limit))),
+        ).fetchall()
+        out: list[dict] = []
+        used = 0
+        for r in rows:
+            text = str(r["content"] or "").strip()
+            if not text:
+                continue
+            if used + len(text) > max_chars and out:
+                break
+            out.append(dict(r))
+            used += len(text) + 3
+        return out
 
     def all_active_memories(self, limit: int = 1000) -> list[dict]:
         """所有未合并的记忆，按 id 升序（即时间顺序），供巩固/去重使用。"""
@@ -426,61 +556,52 @@ class HermesDB:
                         owner_id: str | None = None,
                         session_id: str | None = None,
                         platform: str | None = None,
-                        group_id: str | None = None) -> list[dict]:
-        """记忆检索，支持三级作用域隔离（优先级：用户 > 群 > 全局）。
+                        group_id: str | None = None,
+                        scan: int = 1200) -> list[dict]:
+        """记忆检索：作用域分层 + 本地相关性排序（bigram/IDF/时间衰减/去冗余）。
 
         群公共记忆的键用 (platform, group_id) 而不是 session_id(umo)，
         因此开启/关闭 unique_session 不会让既有群记忆失联；session_id 仅作老数据兼容。
+
+        分层逐级补：用户私有 > 群共享 > 全局。分层后各自排序再串起来，
+        比给不同层级乘系数更直观，也不会出现「全局的高分记忆把用户偏好挤出前 5」。
         """
-        tiers: list[str] = []
-        args: list = []
-        order = ""
-        order_args: list = []
-        group_key_sql = ""
-        group_key_args: list = []
-        if group_id is not None:
-            group_key_sql = "((group_id = ? AND platform = ?)"
-            group_key_args = [group_id, platform or ""]
-            if session_id is not None:
-                group_key_sql += " OR (session_id = ? AND group_id = ''))"
-                group_key_args.append(session_id)
-            else:
-                group_key_sql += ")"
-        global_sql = "owner_id = '' AND session_id = '' AND group_id = ''"
-
-        if owner_id is not None and group_id is not None:
-            tiers.append("owner_id = ?")
-            args.append(owner_id)
-            if group_key_sql:
-                tiers.append(group_key_sql)
-                args += group_key_args
-            tiers.append(global_sql)
-            order = ("ORDER BY CASE WHEN owner_id = ? THEN 0"
-                     " WHEN owner_id = '' AND group_id != '' THEN 1 ELSE 2 END, id DESC")
-            order_args = [owner_id]
-        elif owner_id is not None:
-            tiers.append("owner_id = ?")
-            args.append(owner_id)
-            tiers.append(global_sql)
-            order = "ORDER BY CASE WHEN owner_id = ? THEN 0 ELSE 1 END, id DESC"
-            order_args = [owner_id]
-        elif group_id is not None:
-            if group_key_sql:
-                tiers.append(group_key_sql)
-                args += group_key_args
-            tiers.append(global_sql)
-            order = "ORDER BY id DESC"
+        tiers: list[tuple[str, list]] = []
+        if owner_id is None and group_id is None:
+            tiers.append(("merged_into = 0", []))
         else:
-            order = "ORDER BY id DESC"
+            if owner_id is not None:
+                tiers.append(("merged_into = 0 AND owner_id = ?", [owner_id]))
+            if group_id is not None:
+                cond = "merged_into = 0 AND ((group_id = ? AND platform = ?)"
+                args: list = [group_id, platform or ""]
+                if session_id is not None:
+                    cond += " OR (session_id = ? AND group_id = ''))"
+                    args.append(session_id)
+                else:
+                    cond += ")"
+                tiers.append((cond, args))
+            tiers.append(
+                ("merged_into = 0 AND owner_id = '' AND session_id = ''"
+                 " AND group_id = ''", [])
+            )
 
-        like = f"%{query.strip()[:100]}%"
-        rows = self.conn.execute(
-            f"SELECT * FROM memories WHERE content LIKE ? AND merged_into = 0"
-            + (" AND (" + " OR ".join(tiers) + ")" if tiers else "")
-            + f" {order} LIMIT ?",
-            (like, *args, *order_args, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict] = []
+        for cond, args in tiers:
+            if len(out) >= limit:
+                break
+            try:
+                rows = self.conn.execute(
+                    f"SELECT * FROM memories WHERE {cond} ORDER BY id DESC LIMIT ?",
+                    (*args, max(200, int(scan))),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            docs = [dict(r) for r in rows]
+            if not docs:
+                continue
+            out.extend(_recall.rank(query, docs, k=limit - len(out)))
+        return out[:limit]
 
     # ---------- 身份别名 ----------
 
@@ -816,6 +937,19 @@ class HermesDB:
                 (key, str(value)),
             )
             self.conn.commit()
+
+    def bump_meta_int(self, key: str, n: int = 1) -> int:
+        """原子累加一个计数型 meta，用于长期指标（避免高频写入，调用方自行控频）。"""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = CAST("
+                "  CAST(meta.value AS INTEGER) + ? AS TEXT)",
+                (key, str(int(n)), int(n)),
+            )
+            self.conn.commit()
+            row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            return int(row["value"]) if row else 0
 
     def export_memories_markdown(self) -> str:
         """导出 MEMORY.md 风格的长期记忆文件内容。"""

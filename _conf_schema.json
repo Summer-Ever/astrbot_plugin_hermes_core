@@ -36,6 +36,21 @@
         "default": 3,
         "description": "每次注入的相关历史对话条数上限"
     },
+    "resident_notes": {
+        "type": "bool",
+        "description": "常驻「关于你」：每次对话固定注入用户的画像/偏好（不依赖关键词命中），这是「机器人记得你」的基线",
+        "default": true
+    },
+    "resident_max_items": {
+        "type": "int",
+        "description": "常驻条目数量上限",
+        "default": 12
+    },
+    "resident_max_chars": {
+        "type": "int",
+        "description": "常驻区块字符上限（越小越省 token，建议 400-1200）",
+        "default": 800
+    },
     "auto_summarize": {
         "type": "bool",
         "default": true,
@@ -199,5 +214,10 @@
         "type": "text",
         "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
         "description": "总结器使用的提示词"
+    },
+    "render_warmup": {
+        "type": "bool",
+        "description": "启动后在后台预下载 mermaid 渲染依赖（需要发图时不用等，且不阻塞事件循环）",
+        "default": true
     }
 }

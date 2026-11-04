@@ -217,6 +217,8 @@ class HermesWebAPI:
                 "personal": len(skills),
                 "system": len(self.plugin.hub.system_skills()),
             },
+            "metrics": self.plugin.metrics_snapshot(),
+            "router": dict(getattr(self.plugin.router, "counters", {})),
             "now": time.time(),
         })
 

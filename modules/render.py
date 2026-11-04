@@ -111,6 +111,40 @@ class RenderError(Exception):
     pass
 
 
+# ---------------------------------------------------------------- 准备阶段
+#
+# 首次渲染要先下 mermaid.min.js（几 MB）再 npm i puppeteer-core，两个都是
+# 同步网络 IO，动辄几十秒到几分钟。这些**绝不能**在事件循环里直接跑：
+# 会卡住 AstrBot 全部适配器与所有 dashboard 请求。所以：
+#   1. 本文件其余函数保持同步（命令行自测、后台线程都能用）；
+#   2. 所有 async 入口统一走 asyncio.to_thread；
+#   3. 用 _prep_lock() 串行化准备过程，避免并发渲染重复下载；
+#   4. 提供 warmup()，插件启动后在后台把依赖备好，用户第一次要图就不用等。
+
+_MERMAID_MIN_BYTES = 100_000
+_LOCK: "asyncio.Lock | None" = None
+_LOCK_LOOP: "object | None" = None
+# 记录"已经确认就绪"的目录，避免每次都 stat 一遍磁盘
+_READY: set[str] = set()
+
+
+def _prep_lock() -> "asyncio.Lock":
+    """惰性创建锁，并绑定到当前事件循环。
+
+    插件热重载会重新执行本模块，但旧 Lock 可能仍绑定在旧循环上；Python 3.10+
+    在跨循环使用时会直接抛 RuntimeError。这里按循环重建，避免重载后首次渲染报错。
+    """
+    global _LOCK, _LOCK_LOOP
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _LOCK is None or (_LOCK_LOOP is not None and loop is not None and _LOCK_LOOP is not loop):
+        _LOCK = asyncio.Lock()
+        _LOCK_LOOP = loop
+    return _LOCK
+
+
 def _find_browser() -> str | None:
     for p in _BROWSER_CANDIDATES:
         if os.path.exists(p):
@@ -118,32 +152,51 @@ def _find_browser() -> str | None:
     return None
 
 
-def _download(url: str, dest: str, timeout: int = 60) -> None:
+def _find_node() -> str | None:
+    return shutil.which("node")
+
+
+def _download(url: str, dest: str, timeout: int = 20) -> None:
+    """下载到临时文件，校验通过后再原子替换，避免半截文件被当缓存。"""
+    tmp = dest + ".part"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as f:
         f.write(resp.read())
+    try:
+        if os.path.getsize(tmp) < _MERMAID_MIN_BYTES:
+            raise RenderError(f"下载内容过小（{os.path.getsize(tmp)}B），可能被拦截")
+        with open(tmp, "rb") as f:
+            head = f.read(200).lstrip()
+        if head.startswith(b"<") or head.startswith(b"{"):
+            raise RenderError("下载到的不是 JS（可能是错误页）")
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def ensure_mermaid_js(data_dir: str) -> str:
-    """确保 mermaid.min.js 已缓存，返回其路径。"""
+    """确保 mermaid.min.js 已缓存，返回其路径。**同步**，只在工作线程里调用。"""
     d = os.path.join(data_dir, "renderer")
     os.makedirs(d, exist_ok=True)
     js = os.path.join(d, "mermaid.min.js")
-    if os.path.exists(js) and os.path.getsize(js) > 100_000:
+    if os.path.exists(js) and os.path.getsize(js) > _MERMAID_MIN_BYTES:
         return js
     last_err: Exception | None = None
     for url in _MERMAID_URLS:
         try:
-            _download(url, js)
-            if os.path.getsize(js) > 100_000:
-                return js
+            _download(url, js, timeout=20)
+            return js
         except Exception as e:  # noqa: BLE001
             last_err = e
     raise RenderError(f"无法下载 mermaid.min.js（检查网络）：{last_err}")
 
 
 def _ensure_node_deps(data_dir: str) -> str:
-    """确保 puppeteer-core 已安装到 renderer 目录，返回该目录。
+    """确保 puppeteer-core 已安装到 renderer 目录，返回该目录。**同步**，只在工作线程里调用。
 
     注意：ESM import 不认 NODE_PATH，必须让 render.mjs 与 node_modules
     处于同一目录树，node 才能解析到 puppeteer-core。
@@ -159,43 +212,79 @@ def _ensure_node_deps(data_dir: str) -> str:
     proc = subprocess.run(
         [npm, "i", "puppeteer-core", "--no-audit", "--no-fund",
          "--registry", "https://registry.npmmirror.com"],
-        cwd=d, capture_output=True, text=True, timeout=300,
+        cwd=d, capture_output=True, text=True, timeout=180,
     )
     if proc.returncode != 0 or not os.path.isdir(nm):
         raise RenderError(f"puppeteer-core 安装失败：{proc.stderr[-500:] or proc.stdout[-500:]}")
     return d
 
 
-def _find_node() -> str | None:
+def _needs_prepare(data_dir: str) -> bool:
+    if data_dir in _READY:
+        return False
+    d = os.path.join(data_dir, "renderer")
+    js = os.path.join(d, "mermaid.min.js")
+    nm = os.path.join(d, "node_modules", "puppeteer-core")
+    if (os.path.exists(js) and os.path.getsize(js) > _MERMAID_MIN_BYTES
+            and os.path.isdir(nm)):
+        _READY.add(data_dir)
+        return False
+    return True
 
-    return shutil.which("node")
+
+def _prepare_blocking(data_dir: str) -> None:
+    """下载/安装，纯同步。只能通过 asyncio.to_thread 调用。"""
+    ensure_mermaid_js(data_dir)
+    _ensure_node_deps(data_dir)
+    _READY.add(data_dir)
+
+
+async def warmup(data_dir: str) -> tuple[bool, str]:
+    """后台预热（插件 initialize 时挂成 task）。返回 (是否就绪, 失败原因)。"""
+    try:
+        if _needs_prepare(data_dir):
+            async with _prep_lock():
+                if _needs_prepare(data_dir):
+                    await asyncio.to_thread(_prepare_blocking, data_dir)
+        return True, ""
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
 
 
 async def render_mermaid(code: str, out_png: str, data_dir: str,
                          theme: str = "default", width: int = 1000,
                          scale: int = 2) -> str:
-    """把 mermaid 源码渲染为 PNG。成功返回 out_png。"""
-    node = _find_node()
+    """把 mermaid 源码渲染为 PNG。成功返回 out_png。
+
+    所有磁盘/网络/子进程准备工作都在线程或子进程里完成，事件循环只 await。
+    """
+    node = await asyncio.to_thread(_find_node)
     if not node:
         raise RenderError("未找到 Node.js，请先安装（https://nodejs.org 或 winget install OpenJS.NodeJS.LTS）")
-    if not _find_browser():
+    if not await asyncio.to_thread(_find_browser):
         raise RenderError("未找到 Chrome/Edge，无法本地渲染")
 
-    js = ensure_mermaid_js(data_dir)
-    vendor = _ensure_node_deps(data_dir)
+    if _needs_prepare(data_dir):
+        async with _prep_lock():
+            # 双检：等锁期间别人可能已经装好了
+            if _needs_prepare(data_dir):
+                await asyncio.to_thread(_prepare_blocking, data_dir)
 
     d = os.path.join(data_dir, "renderer")
-    os.makedirs(d, exist_ok=True)
     mjs = os.path.join(d, "render.mjs")
-    with open(mjs, "w", encoding="utf-8") as f:
-        f.write(_RENDER_MJS)
-
     html = (_HTML_TMPL
             .replace("__THEME__", json.dumps(theme))
             .replace("__CODE__", json.dumps(code)))
     html_path = os.path.join(d, f"r_{hashlib.md5(code.encode()).hexdigest()[:12]}.html")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+
+    def _write_inputs() -> None:
+        os.makedirs(d, exist_ok=True)
+        with open(mjs, "w", encoding="utf-8") as f:
+            f.write(_RENDER_MJS)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+    await asyncio.to_thread(_write_inputs)
 
     env = dict(os.environ)
     proc = await asyncio.create_subprocess_exec(

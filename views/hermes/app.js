@@ -266,7 +266,19 @@
     $("#run-version").textContent = `v${d.version || "?"} · code ${d.code_hash || "?"}`;
 
     $("#run-kv").innerHTML = [
-      ["检索方式", d.fts ? '<span class="chip ok">FTS5 全文索引</span>' : '<span class="chip warn">LIKE 退化</span>'],
+      ["检索方式", '<span class="chip ok">字符二元组 · IDF · 时间衰减</span>'],
+      ["注入效果", (() => {
+        const mt = d.metrics || {};
+        if (!mt.inject_requests) return '<span class="faint">还没有请求</span>';
+        return `${fmtNum(mt.inject_requests)} 次 · 平均 ${mt.avg_memories} 条 / ${fmtNum(mt.avg_inject_chars)} 字`
+          + ` <span class="faint">· 检索 ${mt.avg_recall_ms}ms</span>`;
+      })()],
+      ["模型调用", (() => {
+        const r = d.router || {};
+        if (!r.calls) return '<span class="faint">还没有调用</span>';
+        return `成功 ${fmtNum(r.ok)} <span class="faint">（其中降级 ${fmtNum(r.fallback_ok)}）</span>`
+          + ` · 失败 ${fmtNum(r.fail)} · 尝试 ${fmtNum(r.attempts)} 次`;
+      })()],
       ["数据库", `${fmtBytes(d.db_bytes)} <span class="faint">（含 WAL）</span>`],
       ["自动总结", sm.auto
         ? `每 ${sm.interval} 分钟检查；单会话满 ${sm.min_new} 条或超 ${sm.grace_hours} 小时兜底`
