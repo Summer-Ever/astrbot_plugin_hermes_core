@@ -185,10 +185,52 @@ async def case_all_cooling() -> None:
         check("全模型冷却时没有再撞一次", len(a.calls) == 1, str(len(a.calls)))
 
 
+async def case_cooldown_floor() -> None:
+    """冷却是系统防线，不该被过小的配置值架空。
+
+    实测把 llm_cooldown_seconds 设成 5 之后，每片整理都能把三个坏模型重新撞
+    一遍（4 片 = 24 次无效调用），比完全不冷却更糟。
+    """
+    a = FakeProvider("a", [RateLimited()])
+    b = FakeProvider("b")
+    r = make_router({"llm_rpm": 0, "llm_min_interval": 0.0,
+                     "llm_cooldown_seconds": 5}, {"a": a, "b": b})
+    await r.chat("hi")
+    left = r.cooldown_left("a")
+    check("cooldown=5 时限流仍冷却 >=120s", left >= 120, f"{left}s")
+
+    a2 = FakeProvider("a", [TimeoutError("request timeout")])
+    r2 = make_router({"llm_rpm": 0, "llm_min_interval": 0.0,
+                      "llm_cooldown_seconds": 5, "llm_max_retries": 0,
+                      "llm_total_attempts": 1}, {"a": a2, "b": FakeProvider("b")})
+    try:
+        await r2.chat("hi")
+    except ModelError:
+        pass
+    left2 = r2.cooldown_left("a")
+    check("cooldown=5 时超时仍冷却 >=90s", left2 >= 90, f"{left2}s")
+
+
+async def case_soft_deadline() -> None:
+    """单片预算用尽应报 unit_deadline，让调用方跳过这一片而不是停整批。"""
+    a = FakeProvider("a", ["sleep", "sleep", "sleep"])
+    r = make_router({"llm_max_retries": 2, "llm_total_attempts": 6,
+                     "llm_timeout": 30, "llm_cooldown_seconds": 0,
+                     "llm_rpm": 0, "llm_min_interval": 0.0}, {"a": a})
+    t0 = time.monotonic()
+    try:
+        await r.chat("hi", deadline=t0 + 60, soft_deadline=t0 + 1.5)
+        check("单片预算用尽抛 unit_deadline", False, "没有抛异常")
+    except ModelError as exc:
+        cost = time.monotonic() - t0
+        check("单片预算用尽抛 unit_deadline", exc.kind == "unit_deadline", exc.kind)
+        check("单片预算没有明显超支（<4s）", cost < 4.0, f"{cost:.2f}s")
+
+
 async def main() -> int:
     for fn in (case_interval, case_rpm_deadline, case_rate_no_retry,
                case_rate_cooldown, case_retry_after_parse, case_deadline_stop,
-               case_all_cooling):
+               case_all_cooling, case_cooldown_floor, case_soft_deadline):
         try:
             await fn()
         except Exception as exc:

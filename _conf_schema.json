@@ -117,15 +117,23 @@
     },
     "consolidate_budget_seconds": {
         "type": "int",
-        "default": 240,
-        "min": 30,
+        "default": 600,
+        "min": 60,
         "max": 1800,
         "description": "一次整理最多跑多少秒（时间到就停下并报告进度）",
-        "hint": "防止模型链慢的时候一次整理拖成十几分钟；没跑完的片下次重发会接着跑，已完成的不重复调用"
+        "hint": "总闸。单片另有硬顶（见下一项），所以这个值主要防止「片数多时无限拖」。没跑完的片下次重发会接着跑"
+    },
+    "consolidate_unit_seconds": {
+        "type": "int",
+        "default": 90,
+        "min": 20,
+        "max": 600,
+        "description": "单片记忆最多花多少秒（到点就放弃这一片，继续下一片）",
+        "hint": "这是最关键的一项：单片最坏耗时 ≈ 超时 × 尝试次数。默认 90 秒，配合 30 秒超时正好够走完两个模型；模型链很慢时可调到 120-150"
     },
     "consolidate_max_fail_streak": {
         "type": "int",
-        "default": 3,
+        "default": 2,
         "min": 1,
         "max": 10,
         "description": "连续几片调用失败就停止整次整理",
@@ -184,7 +192,7 @@
     },
     "llm_max_retries": {
         "type": "int",
-        "default": 2,
+        "default": 1,
         "min": 0,
         "max": 9,
         "description": "每个模型的重试次数（不含首次，0 = 失败立刻换下一个）",
@@ -192,11 +200,11 @@
     },
     "llm_timeout": {
         "type": "float",
-        "default": 45,
+        "default": 30,
         "min": 5,
         "max": 600,
         "description": "单次请求超时秒数",
-        "hint": "后台总结/整理用 45 秒足够；90 秒会把一次多片整理拖成十几分钟。模型链慢时可调到 60-90"
+        "hint": "正常归纳 5-20 秒出结果；30 秒不吐字多半是免费档排队或不通。这个值会乘以尝试次数成为单片成本，调大前先看「单片预算」"
     },
     "llm_backoff": {
         "type": "float",
@@ -216,7 +224,7 @@
     "llm_cooldown_seconds": {
         "type": "int",
         "default": 180,
-        "min": 0,
+        "min": 30,
         "max": 3600,
         "description": "模型失败后冷却多少秒（冷却期内跳过它，避免每轮总结都先撞坏模型）",
         "hint": "鉴权失败会自动按 4 倍冷却；0 = 不冷却"

@@ -227,8 +227,9 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 | 约束 | 为什么 | 怎么做的 |
 |---|---|---|
 | **切片** | 100 条记忆一次喂进去，prompt 长、出结果慢，一超时整批全丢 | 每片最多 `consolidate_chunk_size`（默认 40）条，超时只损失一片；大桶先跑 |
-| **总预算** | 一片 45 秒 × 10 片 = 7 分钟，远超平台被动回复窗口 | `consolidate_budget_seconds`（默认 240 秒）到点就停，如实报告"跑到第几片" |
-| **连续失败止损** | 模型链整体挂了还继续跑，只是把 429 撞得更狠 | 连续 `consolidate_max_fail_streak`（默认 3）片失败就停，文案说明原因 |
+| **单片硬顶** | 3 个模型 × 3 次尝试 × 30 秒 = 270 秒，一片就能吃光整次预算 | `consolidate_unit_seconds`（默认 90 秒）：一片到点就放弃，继续下一片 |
+| **总预算** | 片数多时可能无限拖 | `consolidate_budget_seconds`（默认 600 秒）到点就停，如实报告"跑到第几片" |
+| **连续失败止损** | 模型链整体挂了还继续跑，只是把 429 撞得更狠 | 连续 `consolidate_max_fail_streak`（默认 2）片失败就停，文案说明原因 |
 | **断点续跑** | 跑到一半被 kill，重发会从第一片重来，白烧 token | 每跑完一片记进 `meta.consolidate_checkpoint`；记忆内容没变就只补没跑的片，`/hermes 整理 深度 重来` 可强制从头 |
 
 配套的两条链路行为：
@@ -237,15 +238,19 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
   配额快满时**不会干等**——剩余预算不够就直接停下，留给下一次整理。
 - **429 不重试**：识别到限流立刻换下一个模型，并按 `Retry-After`（HTTP 头或正文里的 "try again in 12s"）冷却该模型，
   冷却时长 = max(3 倍基础冷却, Retry-After)。冷却状态写进 meta，重启不会再去撞同一个坏模型。
+- **冷却有硬下限**：限流 ≥120 秒、超时 ≥90 秒、鉴权 ≥300 秒。把 `llm_cooldown_seconds` 调成 5 秒
+  等于每片都把坏模型重新撞一遍，所以这几个下限不受配置影响。
 
 实测对比（真实库 102 条活跃记忆，7 个作用域）：
 
 | | 改造前 | 改造后 |
 |---|---|---|
-| 单次调用超时 | 90 秒 | 45 秒 |
+| 单次调用超时 | 90 秒 | 30 秒 |
+| 每模型重试 | 2 次（共 3 次） | 1 次（共 2 次） |
 | 整链尝试上限 | 8 次 | 4 次 |
-| 单片尝试上限 | 4 次 | 3 次 |
-| 最坏总耗时 | 12 分钟（且全失败） | 4 分钟（到点停 + 报告进度） |
+| 单片硬顶 | 无 | 90 秒 |
+| 最坏单片成本 | 4 次 × 45 秒 = 180 秒 | 90 秒（硬顶） |
+| 最坏总耗时 | 12 分钟（且全失败） | 10 分钟总闸 + 2 片失败即停 |
 | 429 之后 | 原地重试 2 次，越撞越死 | 立即换模型 + 冷却 180 秒起 |
 
 ## 技能双域：个人技能 vs 本体技能（v0.9.0）
@@ -398,8 +403,8 @@ python tests/smoke_db.py
 模型链与整理编排另有两个冒烟脚本（不联网，用假 provider 模拟各种失败）：
 
 ```bash
-D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 14 项：节流、429 退避、总预算
-D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 16 项：切片、断点、连续失败止损
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 18 项：节流、429 退避、冷却下限、两级预算
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 20 项：切片、断点、单片超时、连续失败止损
 ```
 
 ### 提交前自检

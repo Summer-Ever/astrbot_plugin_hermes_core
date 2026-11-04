@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.10"
+PLUGIN_VERSION = "0.12.11"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -436,27 +436,15 @@ class HermesCore(Star):
     #
     # 不这样做的话，一次跑到 5/7 被 kill，重发会从第 1 片重新调模型：
     # 已经整理过的片白烧一遍 token，还可能被限流挡在门外。
-    # 只认「记忆内容签名一致」的断点——用户又聊了几句、记忆变了就重头算，
-    # 否则新记忆会永远进不了整理范围。
+    #
+    # 记的是「已经整理过的记忆 id」，不是「片的哈希」：整理本身会合并条目、
+    # 产生新 id，用片哈希的话每次合并完断点就自动作废，等于白记。
+    # 换成 id 集合后，新记忆只会让包含它的那片重跑，旧片照旧跳过。
 
     _CHECKPOINT_META = "consolidate_checkpoint"
     _CHECKPOINT_TTL = 6 * 3600
 
-    @staticmethod
-    def _unit_key(items: list[dict]) -> str:
-        h = hashlib.md5()
-        for i in sorted(int(m["id"]) for m in items):
-            h.update(f"{i},".encode())
-        return h.hexdigest()[:12]
-
-    @staticmethod
-    def _mem_signature(rows: list[dict]) -> str:
-        h = hashlib.md5()
-        for m in sorted(rows, key=lambda r: int(r["id"])):
-            h.update(f"{m['id']}:{m.get('content') or ''}".encode())
-        return h.hexdigest()[:12]
-
-    def _load_consolidate_checkpoint(self, sig: str) -> set[str]:
+    def _load_consolidate_checkpoint(self) -> set[int]:
         raw = self.db.get_meta(self._CHECKPOINT_META, "")
         if not raw:
             return set()
@@ -464,18 +452,18 @@ class HermesCore(Star):
             cp = json.loads(raw)
         except Exception:
             return set()
-        if not isinstance(cp, dict) or cp.get("sig") != sig:
+        if not isinstance(cp, dict):
             return set()
         try:
             if time.time() - float(cp.get("ts") or 0) > self._CHECKPOINT_TTL:
                 return set()
-            return {str(k) for k in (cp.get("done") or [])}
+            return {int(x) for x in (cp.get("ids") or [])}
         except Exception:
             return set()
 
-    def _save_consolidate_checkpoint(self, sig: str, done: set[str]) -> None:
+    def _save_consolidate_checkpoint(self, ids: set[int]) -> None:
         self.db.set_meta(self._CHECKPOINT_META, json.dumps(
-            {"sig": sig, "ts": int(time.time()), "done": sorted(done)},
+            {"ts": int(time.time()), "ids": sorted(ids)},
             ensure_ascii=False))
 
     def _write_build_stamp(self) -> None:
@@ -1190,8 +1178,11 @@ class HermesCore(Star):
                 if note and not note.startswith("记忆只有"):
                     summary += "\n" + note
                 self._reset_memory_queue()
+                self._clear_auto_consolidate_backoff()
             except Exception:
-                # 出错不清队列，下一轮重试
+                # 出错不清队列，下一轮重试；但连续失败要退避，否则模型链坏掉时
+                # 每一轮总结都多烧几次调用、还持续撞限流。
+                self._mark_auto_consolidate_failed()
                 logger.error(f"[hermes_core] 记忆巩固失败:\n{traceback.format_exc()}")
 
         # 技能合并：同理，攒够 N 个新增/更新技能才跑一次（技能整理是全量发给模型，更贵）
@@ -1204,7 +1195,9 @@ class HermesCore(Star):
                 note = await self._consolidate_skills()
                 summary += "\n" + note
                 self.db.set_meta("skill_consolidate_pending", "0")
+                self._clear_auto_consolidate_backoff()
             except Exception:
+                self._mark_auto_consolidate_failed()
                 logger.error(f"[hermes_core] 技能整理失败:\n{traceback.format_exc()}")
 
         logger.info(summary + " | " + "；".join(details))
@@ -1427,11 +1420,46 @@ class HermesCore(Star):
         every = self._mem_every()
         if every <= 0 or not bool(self._get_cfg("auto_consolidate", True)):
             return False
+        if self._auto_consolidate_blocked() > 0:
+            return False
         return queued >= every
+
+    # ---- 自动整理失败退避 ----
+    #
+    # 自动整理失败时不清队列（下一轮重试），本意是「别丢任务」，但模型链坏掉时
+    # 会变成每轮总结都多烧几次调用、还持续撞限流。退避让它在坏窗口里安静下来，
+    # 手动 /hermes 整理 仍然随时可用。
+
+    def _auto_consolidate_blocked(self) -> int:
+        """还要多少秒才允许自动整理；0 = 现在就可以。"""
+        try:
+            until = float(self.db.get_meta("auto_consolidate_blocked_until", "0") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, int(until - time.time()))
+
+    def _mark_auto_consolidate_failed(self) -> None:
+        try:
+            streak = int(self.db.get_meta("auto_consolidate_fail_streak", "0") or 0) + 1
+        except (TypeError, ValueError):
+            streak = 1
+        wait = min(3600, 900 * (2 ** min(3, streak - 1)))  # 15 / 30 / 60 分钟
+        self.db.set_meta("auto_consolidate_fail_streak", str(streak))
+        self.db.set_meta("auto_consolidate_blocked_until", str(int(time.time() + wait)))
+        logger.warning(f"[hermes_core] 自动整理连续失败 {streak} 次，"
+                       f"{wait // 60} 分钟内不再自动尝试（手动 /hermes 整理 仍可用）")
+
+    def _clear_auto_consolidate_backoff(self) -> None:
+        if self.db.get_meta("auto_consolidate_fail_streak", "0") not in ("", "0") \
+                or self.db.get_meta("auto_consolidate_blocked_until", "0") not in ("", "0"):
+            self.db.set_meta("auto_consolidate_fail_streak", "0")
+            self.db.set_meta("auto_consolidate_blocked_until", "0")
 
     def _should_consolidate_skills(self, queued: int) -> bool:
         every = self._skill_every()
         if every <= 0:
+            return False
+        if self._auto_consolidate_blocked() > 0:
             return False
         return queued >= every and self.db.stats()["skills"] >= 2
 
@@ -1442,6 +1470,10 @@ class HermesCore(Star):
         mem_txt = f"记忆 {self._queued_memory_count()}/{mem_every} 条" if mem_on else "记忆 关闭"
         sk_n = int(self.db.get_meta("skill_consolidate_pending", "0") or 0)
         sk_txt = f"技能 {sk_n}/{sk_every} 个" if sk_every > 0 else "技能 关闭"
+        blocked = self._auto_consolidate_blocked()
+        if blocked > 0:
+            return (f"{mem_txt}、{sk_txt}；模型连续失败，"
+                    f"自动整理暂停 {blocked // 60} 分钟（可手动 /hermes 整理）")
         return f"{mem_txt}、{sk_txt} 触发一次（每次约 1 次模型调用）"
 
     # ============ 记忆巩固（consolidation）============
@@ -1549,14 +1581,14 @@ class HermesCore(Star):
                 body += "\n（其余组因当前模型上下文不足未列出，可换更大上下文的模型再整理）"
             return head + body
 
-        # 普通整理只有一次调用，但仍要限住总时长：自动整理是挂在总结之后的，
-        # 卡上几分钟会把整个后台队列堵死。
-        _budget = max(30, int(self._get_cfg("consolidate_budget_seconds", 240)))
+        # 普通整理只有一次调用，用「单片预算」而不是整次预算：
+        # 它是挂在总结之后的自动任务，卡十分钟会把整个后台队列堵死。
+        _unit = max(30, int(self._get_cfg("consolidate_unit_seconds", 90)))
         text = await self.router.chat(
             builder=build, purpose="整理记忆",
-            timeout=min(45.0, float(_budget)),
+            timeout=min(30.0, float(_unit)),
             max_attempts=3,
-            deadline=time.monotonic() + _budget,
+            deadline=time.monotonic() + _unit,
         )
         plan = self._extract_json_array(text)
 
@@ -1639,31 +1671,34 @@ class HermesCore(Star):
         # 40 条约 6-8k 字符，多数模型 10-20 秒能收敛；记忆按写入时间排序，
         # 同一话题产生的重复条目大概率落在相邻的片里。
         chunk = max(10, min(80, int(self._get_cfg("consolidate_chunk_size", 40))))
-        units: list[tuple[str, list[dict]]] = []
+        units: list[list[dict]] = []
         for bucket, items in buckets.items():
             if len(items) < 2:
                 continue
             if len(items) <= chunk:
-                units.append((self._unit_key(items), items))
+                units.append(items)
                 continue
             for off in range(0, len(items), chunk):
                 part = items[off:off + chunk]
                 if len(part) >= 2:
-                    units.append((self._unit_key(part), part))
+                    units.append(part)
         # 大块先跑：预算耗尽时优先保住影响面最大的那片
-        units.sort(key=lambda u: -len(u[1]))
+        units.sort(key=len, reverse=True)
         total_units = len(units)
         if not total_units:
             return "没有需要整理的作用域（每个作用域都只有 1 条记忆）。"
 
-        # ---- 断点：记忆内容没变才复用上次进度 ----
-        sig = self._mem_signature(rows)
-        done_keys = set() if force else self._load_consolidate_checkpoint(sig)
-        reused = sum(1 for k, _ in units if k in done_keys)
+        # ---- 断点：整片都整理过的才跳过 ----
+        done_ids = set() if force else self._load_consolidate_checkpoint()
+        reused = sum(1 for u in units if all(int(m["id"]) in done_ids for m in u))
 
-        budget = max(30, int(self._get_cfg("consolidate_budget_seconds", 240)))
+        # 两层预算：整次的总闸（默认 10 分钟）与单片硬顶（默认 90 秒）。
+        # 单片硬顶是关键——没有它，一个坏模型 × 3 次尝试 × 30 秒就能吃掉 90 秒，
+        # 4 片就是 6 分钟，整次预算再大也跑不完。
+        budget = max(60, int(self._get_cfg("consolidate_budget_seconds", 600)))
         deadline = time.monotonic() + budget
-        max_streak = max(1, int(self._get_cfg("consolidate_max_fail_streak", 3)))
+        unit_budget = max(20, int(self._get_cfg("consolidate_unit_seconds", 90)))
+        max_streak = max(1, int(self._get_cfg("consolidate_max_fail_streak", 2)))
 
         def fail_note() -> str:
             self._bump_consolidate_progress(idx, total_units)
@@ -1676,8 +1711,8 @@ class HermesCore(Star):
         stopped = ""
         idx = 0
 
-        for idx, (ukey, items) in enumerate(units, 1):
-            if ukey in done_keys:
+        for idx, items in enumerate(units, 1):
+            if all(int(m["id"]) in done_ids for m in items):
                 continue
             listing = "\n".join(
                 f"- #{m['id']} ({m['kind']}) {str(m['content'])[:160]}"
@@ -1688,16 +1723,21 @@ class HermesCore(Star):
                     builder=lambda budget_chars, _l=listing: head
                     + _l[:max(600, budget_chars - len(head) - 40)],
                     purpose="深度整理记忆",
-                    # 单次 45 秒、单片最多 3 次尝试：整理是逐片串行的，
-                    # 按 90 秒 × 8 次算，几片就能把一次整理拖到十几分钟。
-                    timeout=45.0,
+                    # 单片硬顶：一片最多耗 unit_budget 秒，到点就放弃这片刻去写库。
+                    # 实测「3 个模型 × 3 次 × 45 秒」一片能烧 180 秒，
+                    # 4 片就是 12 分钟——预算再大也跑不完，所以必须按片封顶。
+                    timeout=30.0,
                     max_attempts=3,
                     deadline=deadline,
+                    soft_deadline=time.monotonic() + unit_budget,
                 )
             except Exception as exc:
-                # deadline（预算用尽 / 限流保护等不到）是「停止整批」的信号，
-                # 不是「跳过这一片」——继续拿下一片去撞同一个限流模型只会更糟。
-                if isinstance(exc, ModelError) and exc.kind == "deadline":
+                # 两级预算，两种反应：
+                # - unit_deadline：这一片自己到点了（模型太慢/一直失败），
+                #   跳过它继续下一片，别因为一片拖垮整次；
+                # - deadline：整次的总闸到点（或全模型限流等不到），整批收工。
+                kind = getattr(exc, "kind", "")
+                if kind == "deadline":
                     stopped = str(exc)
                     self._bump_consolidate_progress(idx - 1, total_units)
                     break
@@ -1711,9 +1751,9 @@ class HermesCore(Star):
                 continue
 
             fail_streak = 0
-            done_keys.add(ukey)
+            done_ids.update(int(m["id"]) for m in items)
             if not dry_run:
-                self._save_consolidate_checkpoint(sig, done_keys)
+                self._save_consolidate_checkpoint(done_ids)
             self._bump_consolidate_progress(idx, total_units)
 
             valid_ids = {int(m["id"]) for m in items}

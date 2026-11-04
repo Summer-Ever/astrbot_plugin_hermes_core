@@ -45,11 +45,11 @@ class FakeRouter:
         self.behavior = behavior
 
     async def chat(self, builder=None, prompt=None, *, purpose="", timeout=None,
-                   max_attempts=None, deadline=None, **_kw):
+                   max_attempts=None, deadline=None, soft_deadline=None, **_kw):
         text = builder(4000) if builder else (prompt or "")
         self.calls.append({"purpose": purpose, "prompt": text,
                            "timeout": timeout, "max_attempts": max_attempts,
-                           "deadline": deadline})
+                           "deadline": deadline, "soft_deadline": soft_deadline})
         return self.behavior(len(self.calls), text)
 
 
@@ -78,8 +78,10 @@ async def case_chunk(tmp: str) -> None:
     check("100 条按 40 切片 → 3 次调用", len(router.calls) == 3, str(len(router.calls)))
     counts = [c["prompt"].count("- #") for c in router.calls]
     check("每片条目数不超过 40", max(counts) <= 40, str(counts))
-    check("单次调用带 45s 超时与 3 次尝试上限",
-          all(c["timeout"] == 45.0 and c["max_attempts"] == 3 for c in router.calls))
+    check("单片带 30s 超时与 3 次尝试上限",
+          all(c["timeout"] == 30.0 and c["max_attempts"] == 3 for c in router.calls))
+    check("每片有自己的 soft_deadline", all(c["soft_deadline"] is not None
+                                          for c in router.calls))
     check("整次整理带 deadline", all(c["deadline"] is not None for c in router.calls))
     check("完整跑完清掉断点", core.db.get_meta("consolidate_checkpoint", "") == "")
     check("完成文案含片数", "3 片" in out, out[:60])
@@ -102,7 +104,7 @@ async def case_resume(tmp: str) -> None:
           str(len(core.router.calls)))
     check("未跑完文案", "未跑完" in out1, out1[:40])
     cp = core.db.get_meta("consolidate_checkpoint", "")
-    check("写入断点", bool(cp) and len(json.loads(cp)["done"]) == 1, cp[:60])
+    check("写入断点", bool(cp) and len(json.loads(cp)["ids"]) == 40, cp[:60])
 
     core.router = FakeRouter(lambda i, p: "[]")
     out2 = await core._deep_consolidate(core.db.all_active_memories(), dry_run=False)
@@ -124,8 +126,28 @@ async def case_streak(tmp: str) -> None:
     router = FakeRouter(lambda i, p: (_ for _ in ()).throw(RuntimeError("connection reset")))
     core.router = router
     out = await core._deep_consolidate(core.db.all_active_memories(), dry_run=False)
-    check("连续 3 片失败后停止", len(router.calls) == 3, str(len(router.calls)))
-    check("文案说明已停止", "连续 3 片" in out, out[:80])
+    check("连续 2 片失败后停止", len(router.calls) == 2, str(len(router.calls)))
+    check("文案说明已停止", "连续 2 片" in out, out[:80])
+
+
+async def case_unit_deadline_skip(tmp: str) -> None:
+    """单片预算用尽只该跳过那一片，不该停整批。"""
+    core = new_core(tmp)
+    seed(core.db, 100)
+    core.config = types.SimpleNamespace(get=lambda k, d=None: (
+        40 if k == "consolidate_chunk_size" else d))
+
+    def behavior(i, p):
+        if i == 1:
+            raise m.ModelError("unit_deadline", "这一片超时了")
+        return "[]"
+
+    router = FakeRouter(behavior)
+    core.router = router
+    out = await core._deep_consolidate(core.db.all_active_memories(), dry_run=False)
+    check("单片超时后继续跑完剩余片", len(router.calls) == 3, str(len(router.calls)))
+    check("单片超时计入跳过数", "1 片因模型失败跳过" in out, out[:80])
+    check("单片超时不触发整体停止", "连续" not in out, out[:80])
 
 
 async def case_merge(tmp: str) -> None:
@@ -143,7 +165,7 @@ async def case_merge(tmp: str) -> None:
 
 
 async def main() -> int:
-    for fn in (case_chunk, case_resume, case_streak, case_merge):
+    for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip, case_merge):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:
             await fn(tmp)

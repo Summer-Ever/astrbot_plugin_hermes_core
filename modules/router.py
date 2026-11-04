@@ -260,10 +260,12 @@ class ModelRouter:
             retry_on = DEFAULT_RETRY_ON
         retry_on = [k for k in retry_on if k in ERROR_LABELS]
         return {
-            "max_retries": max(0, min(9, _as_int(self._cfg("llm_max_retries", 2), 2))),
-            # 整理/总结是后台任务，45 秒还没吐字就说明这个模型今天不行，
-            # 90 秒只是把整次整理拖长（一次整理 6 个桶 = 白等 9 分钟）。
-            "timeout": max(5.0, min(600.0, _as_float(self._cfg("llm_timeout", 45), 45))),
+            # 后台任务（总结/整理）不需要 3 次容错：链上还有别的模型，
+            # 在一个超时的模型上重试 3 次 = 白等 90 秒。重试只治瞬时抖动。
+            "max_retries": max(0, min(9, _as_int(self._cfg("llm_max_retries", 1), 1))),
+            # 30 秒：正常归纳 5-20 秒出结果；30 秒一个字不吐的，多半是免费档排队
+            # 或者根本不通，给 90 秒只是把整次整理拖长。
+            "timeout": max(5.0, min(600.0, _as_float(self._cfg("llm_timeout", 30), 30))),
             "backoff": max(0.0, min(30.0, _as_float(self._cfg("llm_backoff", 1.5), 1.5))),
             "total_attempts": max(1, min(30, _as_int(self._cfg("llm_total_attempts", 4), 4))),
             "cooldown": max(0, min(3600, _as_int(self._cfg("llm_cooldown_seconds", 180), 180))),
@@ -457,6 +459,15 @@ class ModelRouter:
             # 限流冷却要比普通失败更久，且尊重服务端给的 Retry-After：
             # 对面说等 60 秒，我们 180 秒后再来才安全。
             sec = max(sec * 3, int(retry_after_of(exc) if exc else 0))
+        # 系统硬下限：这几个错误说明「对面现在真的不行」，冷却过短等于没有冷却。
+        # 实测把 llm_cooldown_seconds 设成 5 之后，每一片整理都能把三个坏模型
+        # 重新撞一遍，4 片就是 24 次无效调用——比不冷却更糟。
+        if kind == "timeout":
+            sec = max(sec, 90)
+        elif kind == "rate":
+            sec = max(sec, 120)
+        elif kind == "auth":
+            sec = max(sec, 300)
         self._cooldown_until[pid] = time.time() + sec
         self._persist_cooldowns()
 
@@ -527,6 +538,7 @@ class ModelRouter:
         timeout: float | None = None,
         max_attempts: int | None = None,
         deadline: float | None = None,
+        soft_deadline: float | None = None,
     ) -> str:
         """按链调用，返回第一个成功模型的文本。
 
@@ -537,20 +549,42 @@ class ModelRouter:
         全库整理会一个作用域一次调用，若每次都能烧满 8 次尝试，光超时就能耗掉
         十几分钟，而调用方的消息早就过了平台有效期。
 
-        deadline 是 time.monotonic() 的绝对时刻，整次调用（含节流等待与重试）
-        不会越过它。用尽时抛 ModelError(kind="deadline")，调用方据此停止整批，
-        而不是继续拿下一个桶去撞同一个限流中的模型。
+        两级 deadline（都是 time.monotonic() 的绝对时刻）：
+        - deadline：整批的总闸。用尽抛 ModelError(kind="deadline")，调用方应停止整批。
+        - soft_deadline：单个任务单元（如一片记忆）的硬顶。用尽抛
+          ModelError(kind="unit_deadline")，调用方应跳过这个单元、继续下一个。
+        分开是因为两者的正确反应完全不同：总闸到点该整批收工，单片到点只该放弃那片。
         """
         pol = self.policy()
+        hard, soft = deadline, soft_deadline
+
+        def cutoff() -> float | None:
+            vals = [d for d in (hard, soft) if d is not None]
+            return min(vals) if vals else None
+
+        def remaining() -> float | None:
+            c = cutoff()
+            return None if c is None else c - time.monotonic()
+
+        def expired_kind() -> str:
+            """当前更紧的是哪一级预算：总闸（deadline）还是单片（unit_deadline）。
+
+            调用方对这两种的反应不同——总闸到点整批收工，单片到点只放弃这一片。
+            """
+            now = time.monotonic()
+            hard_left = (hard - now) if hard is not None else float("inf")
+            soft_left = (soft - now) if soft is not None else float("inf")
+            return "deadline" if hard_left <= soft_left else "unit_deadline"
+
         started_call = time.monotonic()
-        left = (deadline - started_call) if deadline is not None else None
+        left = remaining()
         if left is not None and left <= 1.0:
-            raise ModelError("deadline", "本次整理的时间预算已用尽（未开始调用）")
+            raise ModelError(expired_kind(), "本次整理的时间预算已用尽（未开始调用）")
         chain = self.effective_chain(ignore_cooldown=ignore_cooldown,
-                                     strict_cooldown=deadline is not None)
+                                     strict_cooldown=cutoff() is not None)
         if not chain:
-            if deadline is not None and self._last_skipped:
-                raise ModelError("deadline",
+            if cutoff() is not None and self._last_skipped:
+                raise ModelError(expired_kind(),
                                  "所有模型都在限流/失败冷却中，先不调用以免加重风控："
                                  + "；".join(f"{s['id']} {s['reason']}"
                                             for s in self._last_skipped[:3]))
@@ -567,9 +601,6 @@ class ModelRouter:
         limit = timeout if timeout is not None else pol["timeout"]
         self.counters["calls"] += 1
         fallback_index = -1
-
-        def remaining() -> float | None:
-            return None if deadline is None else deadline - time.monotonic()
 
         for entry in chain:
             fallback_index += 1
@@ -597,7 +628,7 @@ class ModelRouter:
                         # 而不是在这里睡到超时再报错。
                         self.counters["throttled"] += 1
                         raise ModelError(
-                            "deadline",
+                            expired_kind(),
                             f"{pid} 触发限流保护（每分钟最多 {pol['rpm']} 次），"
                             f"还需等待 {int(wait)} 秒；本次整理先停在这里")
                     logger.info(f"[hermes_core] {purpose} 节流等待 {wait:.1f}s（{pid}）")
@@ -606,7 +637,7 @@ class ModelRouter:
                 left_now = remaining()
                 if left_now is not None and left_now < 5.0:
                     # 剩下不到一次最短请求的时间，打出去也必然超时，直接收工。
-                    raise ModelError("deadline", "本次整理的时间预算已用尽")
+                    raise ModelError(expired_kind(), "本次整理的时间预算已用尽")
                 eff_limit = limit if left_now is None else min(limit, left_now)
 
                 attempts += 1
@@ -650,7 +681,7 @@ class ModelRouter:
                         delay = min(10.0, pol["backoff"] * (2 ** i)) + random.uniform(0, 0.3)
                         left_now = remaining()
                         if left_now is not None and delay > left_now - 1.0:
-                            raise ModelError("deadline", "本次整理的时间预算已用尽")
+                            raise ModelError(expired_kind(), "本次整理的时间预算已用尽")
                         if delay > 0:
                             await asyncio.sleep(delay)
 
