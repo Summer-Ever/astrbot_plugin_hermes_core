@@ -307,6 +307,43 @@ AstrBot 本体有一套技能目录（`data/skills/<slug>/SKILL.md`，全局共�
 
 真正会让 ID 变化、导致记忆变成孤儿的情况只有三种：换机器人 AppID（openid 命名空间随 bot 变化）、换适配器（`qq_official` ↔ `aiocqhttp/NapCat`，后者返回真实 QQ 号）、用户换号。这三种都无法自动迁移，需要重新建立记忆或做数据映射。
 
+## 安全与自检（v0.11.0）
+
+插件会被别人的机器人安装，所以安全约束做进代码，而不是只写在文档里。
+
+### 路径约束
+
+所有运行时写入统一走 `modules/paths.py::safe_join`，把目标限制在插件 data 目录内：
+拒绝绝对路径、盘符路径和 `../` 上跳。即使将来某个调用方把用户输入接进文件名，
+也写不出 data 目录。
+
+### 存储层自检
+
+```bash
+python tests/smoke_db.py
+```
+
+22 项断言：消息写入与检索、FTS trigram 快路径、记忆去重、常驻区块按身份隔离、
+技能按身份隔离与同名共存、导出、`safe_join` 反例。改完 `modules/db.py` 先跑一遍。
+
+### 提交前自检
+
+提交前建议跑一遍语法编译与存储层自检，避免把明显问题带进版本库：
+
+```bash
+python -m py_compile main.py webapi.py hot_reload.py modules/*.py
+python tests/smoke_db.py
+```
+
+改动涉及异步链路时要额外确认：`async` 函数体内不出现同步网络 IO、同步子进程
+和长耗时文件操作，一律交给 `asyncio.to_thread` 或 `create_subprocess_exec`。
+
+### 检索：FTS 索引真正接上了
+
+v0.10.0 建了 `messages_fts`（trigram）但只写不读，等于每条消息多付一次写入成本。
+v0.11.0 把它接成检索快路径：短语命中足够时直接用索引结果，命中不足自动回退到
+「最近 1500 条」扫描，召回不受影响，常见短语查询省掉一次全扫。
+
 ## 开发：改完代码怎么生效（热重载，不用重启）
 
 AstrBot **没有文件监听**——把新代码放到 `data/plugins/` 下不会自动生效，

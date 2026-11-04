@@ -50,6 +50,11 @@ except ImportError:
 # db 模块位于 ./modules/db.py。AstrBot 以 data.plugins.<name>.main 的形式加载插件，
 # 正常情况下相对导入即可；不同版本/安装方式的加载路径有差异，故逐级兜底。
 try:
+    from .modules.paths import safe_join
+except ImportError:
+    from modules.paths import safe_join
+
+try:
     from .modules.db import HermesDB
 except ImportError:
     try:
@@ -128,7 +133,7 @@ except ImportError:
         SkillHub = _sh_mod.SkillHub
         guess_data_root = _sh_mod.guess_data_root
 
-PLUGIN_VERSION = "0.10.0"
+PLUGIN_VERSION = "0.11.0"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -335,7 +340,7 @@ class HermesCore(Star):
                 "loaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "pid": os.getpid(),
             }
-            path = os.path.join(_default_data_dir(), "build_stamp.json")
+            path = safe_join(_default_data_dir(), "build_stamp.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(info, f, ensure_ascii=False, indent=2)
             logger.info(f"[hermes_core] 已加载 v{PLUGIN_VERSION} code={info['code_hash']}")
@@ -1456,7 +1461,7 @@ class HermesCore(Star):
     @hermes.command("导出")
     async def hermes_export(self, event: AstrMessageEvent):
         md = self.db.export_memories_markdown()
-        path = os.path.join(_default_data_dir(), "MEMORY.md")
+        path = safe_join(_default_data_dir(), "MEMORY.md")
         with open(path, "w", encoding="utf-8") as f:
             f.write(md)
         yield event.plain_result(f"已导出到插件数据目录 MEMORY.md（{len(md)} 字符）。")

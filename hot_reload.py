@@ -31,6 +31,7 @@ DEFAULT_DATA_DIR = os.path.expanduser(r"~\.astrbot")
 
 
 def load_dashboard_cfg(data_dir: str) -> dict:
+    # 本地热重载 CLI：读取 dashboard 的 port 与 jwt_secret 以调用重载接口，不写日志不外发
     path = os.path.join(data_dir, "data", "cmd_config.json")
     if not os.path.exists(path):
         raise SystemExit(f"找不到 AstrBot 配置：{path}\n用 --data 指定 .astrbot 目录")
@@ -104,7 +105,7 @@ def main() -> int:
     if args.pull:
         print("[1/3] git pull ...")
         r = subprocess.run(["git", "pull", "--ff-only"], cwd=plugin_dir,
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=120)
         print((r.stdout or r.stderr).strip()[-300:])
 
     db = load_dashboard_cfg(args.data)

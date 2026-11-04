@@ -26,6 +26,11 @@ try:
 except ImportError:  # pragma: no cover - 极老版本没有 web 模块
     error_response = json_response = request = None
 
+try:
+    from .modules.paths import safe_join
+except ImportError:
+    from modules.paths import safe_join
+
 PLUGIN_NAME = "astrbot_plugin_hermes_core"
 
 # 配置项分组：只影响页面上的展示顺序
@@ -600,8 +605,10 @@ class HermesWebAPI:
         md = self.plugin.db.export_memories_markdown()
         if self.data_dir_fn is None:
             return self._fail("插件数据目录不可用", 500)
-        path = os.path.join(self.data_dir_fn(), "MEMORY.md")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        path = safe_join(self.data_dir_fn(), "MEMORY.md")
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(md)
         return json_response({"path": path, "chars": len(md), "preview": md[:1500]})

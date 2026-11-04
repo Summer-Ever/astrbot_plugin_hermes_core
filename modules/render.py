@@ -16,6 +16,11 @@ import subprocess
 import sys
 import urllib.request
 
+try:  # 作为 modules 包内模块被导入时的相对路径
+    from .paths import safe_join
+except ImportError:  # pragma: no cover - 扁平导入兜底
+    from paths import safe_join
+
 _MERMAID_URLS = [
     "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js",
     "https://unpkg.com/mermaid@11/dist/mermaid.min.js",
@@ -270,12 +275,12 @@ async def render_mermaid(code: str, out_png: str, data_dir: str,
             if _needs_prepare(data_dir):
                 await asyncio.to_thread(_prepare_blocking, data_dir)
 
-    d = os.path.join(data_dir, "renderer")
-    mjs = os.path.join(d, "render.mjs")
+    d = safe_join(data_dir, "renderer")
+    mjs = safe_join(d, "render.mjs")
     html = (_HTML_TMPL
             .replace("__THEME__", json.dumps(theme))
             .replace("__CODE__", json.dumps(code)))
-    html_path = os.path.join(d, f"r_{hashlib.md5(code.encode()).hexdigest()[:12]}.html")
+    html_path = safe_join(d, f"r_{hashlib.md5(code.encode()).hexdigest()[:12]}.html")
 
     def _write_inputs() -> None:
         os.makedirs(d, exist_ok=True)

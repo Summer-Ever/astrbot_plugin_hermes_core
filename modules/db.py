@@ -37,8 +37,26 @@ DEFAULT_KIND = "fact"
 _NEG_WORDS = ("不", "没", "无", "别", "禁止", "取消", "勿", "无需")
 
 
-def _neg_words(text: str) -> set[str]:
-    return {w for w in _NEG_WORDS if w in str(text or "")}
+def _ph(n: int) -> str:
+    """生成 n 个逗号分隔的 SQL 占位符（`?,?,?`）。
+
+    只由整数决定，不接受任何外部字符串，所以拼进 SQL 也不会引入注入面。
+    集中在这里是为了避免各处手写 `",".join("?" * len(x))` 时数错个数。
+    """
+    n = max(1, int(n))
+    return ",".join("?" * n)
+
+
+def _where(conds: list[str]) -> str:
+    """把若干固定条件片段拼成 WHERE 子句。
+
+    ``conds`` 必须是本文件内硬编码的片段（形如 ``owner_id = ?``），
+    值一律走占位符；不要把外部输入拼进来。
+    """
+    return (" WHERE " + " AND ".join(conds)) if conds else ""
+
+
+def _neg_words(text: str) -> set[str]:    return {w for w in _NEG_WORDS if w in str(text or "")}
 
 
 # 技能表：唯一键是 (owner_id, name)，同一个人不能有两条同名技能，
@@ -258,7 +276,7 @@ class HermesDB:
         if sender_id is not None:
             conds.append("sender_id = ?")
             args.append(sender_id)
-        return ((" WHERE " + " AND ".join(conds)) if conds else ""), args
+        return _where(conds), args
 
     def count_messages(self, session_id: str | None = None,
                        sender_id: str | None = None) -> int:
@@ -282,24 +300,66 @@ class HermesDB:
             self.conn.commit()
             return len(ids)
 
+    def _fts_candidates(self, query: str, cap: int,
+                        session_id: str | None,
+                        sender_id: str | None) -> list[dict] | None:
+        """用 FTS5 trigram 取「包含查询短语」的消息，作为检索快路径。
+
+        返回 None 表示索引不可用（老库没建表 / SQLite 无 trigram），
+        调用方据此回退全扫。命中不足时调用方同样回退，所以不会损失召回，
+        只在短语确实出现过时省掉一次 1500 行的扫描。
+        """
+        if not self._fts_enabled:
+            return None
+        q = " ".join(str(query).split())
+        if len(q) < 3:
+            return None
+        # trigram 下用短语查询，引号内的特殊字符需要转义
+        phrase = '"' + q.replace('"', '""') + '"'
+        # FTS5 要求 MATCH 左侧写表名，别名不可用；rank 只在 MATCH 时存在
+        sql = ("SELECT m.* FROM messages_fts"
+               " JOIN messages m ON m.id = messages_fts.rowid"
+               " WHERE messages_fts MATCH ?")
+        args: list = [phrase]
+        if session_id is not None:
+            sql += " AND m.session_id = ?"
+            args.append(session_id)
+        if sender_id is not None:
+            sql += " AND m.sender_id = ?"
+            args.append(sender_id)
+        sql += " ORDER BY messages_fts.rank LIMIT ?"
+        args.append(max(1, int(cap)))
+        try:
+            return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+        except sqlite3.OperationalError:
+            return None
+
     def search_messages(self, query: str, limit: int = 5,
                         session_id: str | None = None,
                         sender_id: str | None = None,
                         scan: int = 1500) -> list[dict]:
         """按相关度检索历史消息（bigram + IDF），不再要求整句作为子串出现。
 
-        候选集只取最近 scan 条：越久远的对话越不可能被需要，同时也避免全表扫描。
+        候选集优先取 FTS 短语命中，命中不足时回退到最近 scan 条：
+        越久远的对话越不可能被需要，同时也避免全表扫描。
         返回按 id 倒序（最新在前），与旧实现保持一致，调用方无需调整。
         """
         if len(_recall.norm(query)) < 4:
             # 两三个字的寒暄没有区分度，检索只会带回噪声
             return []
-        where, args = self._msg_where(session_id, sender_id)
-        rows = self.conn.execute(
-            f"SELECT * FROM messages{where} ORDER BY id DESC LIMIT ?",
-            (*args, max(50, int(scan))),
-        ).fetchall()
-        docs = [dict(r) for r in rows]
+        cap = max(50, int(scan))
+        docs = self._fts_candidates(query, cap, session_id, sender_id)
+        if docs is None or len(docs) < max(24, int(limit) * 4):
+            where, args = self._msg_where(session_id, sender_id)
+            rows = self.conn.execute(
+                f"SELECT * FROM messages{where} ORDER BY id DESC LIMIT ?",
+                (*args, cap),
+            ).fetchall()
+            scanned = [dict(r) for r in rows]
+            if docs:
+                seen = {d["id"] for d in scanned}
+                scanned.extend([d for d in docs if d["id"] not in seen])
+            docs = scanned
         hits = _recall.rank_messages(query, docs, k=max(1, int(limit)))
         return sorted(hits, key=lambda x: -int(x["id"]))
 
@@ -447,7 +507,7 @@ class HermesDB:
         if not ids:
             return
         with self._lock:
-            marks = ",".join("?" * len(ids))
+            marks = _ph(len(ids))
             self.conn.execute(
                 f"UPDATE memories SET hits = COALESCE(hits, 0) + 1,"
                 f" last_hit_ts = ? WHERE id IN ({marks})",
@@ -467,7 +527,7 @@ class HermesDB:
         """
         if not owner_id:
             return []
-        marks = ",".join("?" * len(kinds))
+        marks = _ph(len(kinds))
         rows = self.conn.execute(
             f"SELECT id, kind, content, importance, hits FROM memories"
             f" WHERE merged_into = 0 AND owner_id = ? AND kind IN ({marks})"
@@ -517,7 +577,7 @@ class HermesDB:
         if not ids:
             return 0
         with self._lock:
-            marks = ",".join("?" * len(ids))
+            marks = _ph(len(ids))
             rows = self.conn.execute(
                 f"SELECT * FROM memories WHERE id IN ({marks})", ids
             ).fetchall()
@@ -795,7 +855,7 @@ class HermesDB:
         if group_id is not None:
             conds.append("group_id = ?")
             args.append(group_id)
-        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        where = _where(conds)
         rows = self.conn.execute(
             "SELECT * FROM skills" + where + " ORDER BY use_count DESC, id", args
         ).fetchall()

@@ -315,6 +315,7 @@ def guess_data_root(plugin_data_dir: str) -> str:
         cur = os.path.dirname(cur)
         if not cur or cur == os.path.dirname(cur):
             break
+        # 仅存在性探测，用于向上定位 AstrBot 数据根，不读取文件内容
         if os.path.isdir(os.path.join(cur, "skills")) or \
                 os.path.exists(os.path.join(cur, "cmd_config.json")):
             return cur
