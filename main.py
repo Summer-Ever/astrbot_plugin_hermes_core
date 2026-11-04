@@ -120,10 +120,10 @@ except ImportError:
 
 # 检索排序与去重纯函数，同样三级兜底
 try:
-    from .modules.recall import filter_in_window, suppress_repeats
+    from .modules.recall import filter_in_window, format_memory_lines, suppress_repeats
 except ImportError:
     try:
-        from modules.recall import filter_in_window, suppress_repeats
+        from modules.recall import filter_in_window, format_memory_lines, suppress_repeats
     except ImportError:
         import importlib.util as _ilu5
 
@@ -134,9 +134,10 @@ except ImportError:
         _rc_mod = _ilu5.module_from_spec(_rc_spec)
         _rc_spec.loader.exec_module(_rc_mod)
         filter_in_window = _rc_mod.filter_in_window
+        format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.6"
+PLUGIN_VERSION = "0.12.7"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -526,14 +527,9 @@ class HermesCore(Star):
             if any(int(r.get("pinned") or 0) for r in resident):
                 lines.append("（「钉」= 用户曾要求一直记住的旧信息；与之冲突时以本人本轮说法为准，"
                              "并调用 save_memory(replaces=旧编号) 更新，不要两种说法同时沿用）")
-            # 带 #编号：模型可以据此调用 pin_memory（钉住重要信息）等管理工具
-            for r in resident:
-                if int(r.get("pinned") or 0):
-                    d = _short_date(r.get("pinned_ts"))
-                    kind = f"{r['kind']}，钉于 {d}" if d else f"{r['kind']}，钉住"
-                else:
-                    kind = str(r["kind"])
-                lines.append(f"- #{r['id']} ({kind}) {_clean_memory_text(r['content'])}")
+            # 编号保留（pin_memory / save_memory(replaces=) 要用），但放行尾：
+            # 正文优先，行首不出现 #，也省掉逐条 (kind) 标注——类型提到分组标题。
+            lines += format_memory_lines([self._inject_item(r) for r in resident])
 
         # 第二层：按当前这句话检索相关记忆（用户 > 群 > 全局逐级补）
         if scope == "user":
@@ -553,8 +549,7 @@ class HermesCore(Star):
             self._bump_metric("recall_mem_suppressed", raw_mem - len(memories))
         if memories:
             lines.append("[长期记忆参考]")
-            lines += [f"- #{m['id']} ({m['kind']}) {_clean_memory_text(m['content'])}"
-                      for m in memories]
+            lines += format_memory_lines([self._inject_item(m) for m in memories])
             self._bump_metric("recall_memories", len(memories))
             for m in memories:
                 state["seen"][int(m["id"])] = state["turn"]
@@ -595,12 +590,25 @@ class HermesCore(Star):
             system = [s for s in skills if s.get("source") == "system"]
             parts: list[str] = []
             if personal:
-                names = "、".join(s["name"] for s in personal[:12])
-                more = f" 等 {len(personal)} 个" if len(personal) > 12 else ""
-                parts.append(f"我的技能：{names}{more}")
+                # 同一技能常被存成两种名字（chrome_cdp_browser_control /
+                # chrome-cdp-browser-control），全列出来是纯噪声。按去掉分隔符
+                # 的小写名归一后去重，只留第一个。
+                seen_keys: set[str] = set()
+                names: list[str] = []
+                for s in personal:
+                    key = (str(s["name"]).lower()
+                           .replace("-", "").replace("_", "").replace(" ", ""))
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    names.append(str(s["name"]))
+                    if len(names) >= 12:
+                        break
+                more = f" 等 {len(seen_keys)} 个" if len(seen_keys) > len(names) else ""
+                parts.append(f"我的技能：{'、'.join(names)}{more}")
             if system:
                 parts.append(f"系统技能（本体安装，只读）：{len(system)} 个")
-            lines.append(f"[已掌握技能] {'；'.join(parts)}（可用 list_skills / read_skill 查看）")
+            lines.append(f"[已掌握技能] {'；'.join(parts)}（list_skills 查看全文）")
 
         if not lines:
             return ""
@@ -614,6 +622,25 @@ class HermesCore(Star):
         self._bump_metric("inject_chars", len(block))
         self._bump_metric("recall_ms", max(0, int((time.perf_counter() - t0) * 1000)))
         return block
+
+    @staticmethod
+    def _inject_item(row: dict) -> dict:
+        """把数据库行压成注入用的最小结构：净化正文 + 钉住附注。
+
+        注入前必须再净化一遍：记忆内容来自历史对话，可能被群友写进去过，
+        入库拦截是概率性的，渲染侧不能假设库里全是干净的。
+        """
+        pinned = int(row.get("pinned") or 0)
+        note = ""
+        if pinned:
+            d = _short_date(row.get("pinned_ts"))
+            note = f"钉于 {d}" if d else "钉住"
+        return {
+            "id": int(row["id"]),
+            "kind": str(row.get("kind") or "fact"),
+            "content": _clean_memory_text(str(row.get("content") or "")),
+            "note": note,
+        }
 
     def _resident_block(self, owner_id: str, allow_private: bool = True) -> list[dict]:
         """常驻条目（60 秒缓存）。写记忆/整理后由调用方清缓存。

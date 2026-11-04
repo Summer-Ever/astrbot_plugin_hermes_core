@@ -166,6 +166,28 @@ def main() -> int:
     check("suppress_repeats 全抑制保留头部", [x["id"] for x in all_seen] == [1], str(all_seen))
     check("suppress_repeats 首次全保留", len(suppress_repeats(items, {}, 10, 4)) == 3)
 
+    # --- 注入块渲染：类型提到分组标题、编号放行尾（正文优先）
+    from modules.recall import format_memory_lines
+    rows = [
+        {"id": 140, "kind": "preference", "content": "称呼他为哥哥", "note": "钉于 2026-11"},
+        {"id": 52, "kind": "profile", "content": "CPU 为 i5-1240P"},
+        {"id": 32, "kind": "preference", "content": "目标不清时先问"},
+    ]
+    rendered = format_memory_lines(rows)
+    check("渲染：多类型加分组标题", rendered[0] == "画像：", str(rendered[:1]))
+    check("渲染：编号在行尾且带钉住附注",
+          rendered[1] == "- CPU 为 i5-1240P（#52）"
+          and rendered[3] == "- 称呼他为哥哥（#140，钉于 2026-11）", str(rendered))
+    check("渲染：不再出现逐条 (kind) 标注", "(profile)" not in "\n".join(rendered))
+    single = format_memory_lines([rows[1]])
+    check("渲染：单一类型不加分组标题", single == ["- CPU 为 i5-1240P（#52）"], str(single))
+    check("渲染：空内容与空列表不产生空行",
+          format_memory_lines([{"id": 1, "kind": "fact", "content": "  "}]) == []
+          and format_memory_lines([]) == [])
+    check("渲染：未知 kind 归到「其他」",
+          format_memory_lines([{"id": 7, "kind": "conclusion", "content": "x"},
+                               {"id": 8, "kind": "profile", "content": "y"}])[0] == "画像：")
+
     # --- 总结水位：已总结的消息不会被「超 6 小时兜底」重复总结
     db.add_message("sw", "user", "第一轮旧消息", sender_id="u5")
     db.add_message("sw", "assistant", "第一轮旧回复", sender_id="u5")

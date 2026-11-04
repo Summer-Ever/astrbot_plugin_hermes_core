@@ -299,6 +299,49 @@ def filter_in_window(history: list[dict[str, Any]],
     return [h for h in history if int(h["id"]) not in window_ids]
 
 
+# 注入块的分组标题。kind 是内部字段，模型只需要「画像 / 偏好」这一层区别；
+# 逐条写 (profile) 既占字符预算，又容易和正文混在一起被当成内容的一部分。
+KIND_TITLES = (("profile", "画像"), ("preference", "偏好"),
+               ("fact", "事实"), ("summary", "近况"))
+
+
+def format_memory_lines(items: list[dict[str, Any]], *,
+                        note_key: str = "note") -> list[str]:
+    """把记忆条目渲染成注入用的几行：类型分组 + 编号后置。
+
+    - 编号必须保留：pin_memory / save_memory(replaces=) 全靠它定位条目。
+    - 编号放行尾而不是行首：正文优先，行首不再出现 #，客户端按 markdown
+      渲染时也不会把 # 当成标记吃掉（截图里 `#127` 就变成了 `127`）。
+    - kind 提到分组标题：6 条平铺时逐条 `(profile)` 是纯开销（实测省 52 字）。
+    - note 用于「钉于 2026-08」这类附注，由调用方按需填。
+    """
+    groups: dict[str, list[dict]] = {}
+    for it in items or []:
+        groups.setdefault(str(it.get("kind") or "fact"), []).append(it)
+    order = [k for k, _ in KIND_TITLES]
+    order += [k for k in groups if k not in order]   # 未知 kind 也不丢
+    titles = dict(KIND_TITLES)
+    multi = sum(1 for k in order if groups.get(k)) > 1
+    out: list[str] = []
+    last_label = ""
+    for kind in order:
+        rows = groups.get(kind) or []
+        if not rows:
+            continue
+        label = titles.get(kind, "其他")
+        if multi and label != last_label:
+            out.append(f"{label}：")
+            last_label = label
+        for it in rows:
+            text = str(it.get("content") or "").strip()
+            if not text:
+                continue
+            note = str(it.get(note_key) or "").strip()
+            tail = f"（#{it['id']}" + (f"，{note}" if note else "") + "）"
+            out.append(f"- {text}{tail}")
+    return out
+
+
 def suppress_repeats(items: list[dict[str, Any]], seen: dict[int, int],
                      cur_turn: int, gap: int = 4) -> list[dict[str, Any]]:
     """重复抑制：近 gap 轮注入过的记忆本轮跳过。
