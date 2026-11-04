@@ -87,9 +87,10 @@ def _visible_clause(allow_private: bool, group_id: str, viewer_owner: str = "",
         if viewer_owner:
             parts.append(f"({vis} = 'private' AND {prefix}owner_id = ?)")
             args.append(viewer_owner)
-        else:
-            # 调用方已按 owner 收窄（如总结时按批发言人过滤），这里不再重复
-            parts.append(f"{vis} = 'private'")
+        # else：连查看者是谁都判不出来，就不给任何 private 条目——
+        # 这里曾经直接放行全部 private（"调用方已按 owner 收窄"），
+        # 但适配器取不到 sender_id 时 owner 就是空串，等于把所有人的私聊记忆
+        # 摊给当前这个人（实测 pinned 里能看到别人的私聊。）没有身份就没有私聊。
     if group_id:
         parts.append(f"({vis} = 'group' AND {prefix}group_id = ?)")
         args.append(group_id)
@@ -320,6 +321,7 @@ class HermesDB:
             """
         )
         self._repair_orphan_private(c)
+        self._normalize_private_scope(c)
         c.commit()
         return fts_ok
 
@@ -389,10 +391,36 @@ class HermesDB:
             # identities 表尚未建好等边缘情况：不写 meta，下次启动重试
             pass
 
+    def _normalize_private_scope(self, c) -> None:
+        """把「私聊可见但没有群」的条目统一挪到 user 作用域。
+
+        检索是按 scope 分层的：群层查 `scope='group'`，按人查 `scope='user'`。
+        一条 `visibility='private' + scope='group'` 的行两边都不落地——群层会按
+        可见性把它过滤掉，按人层又查不到它。v0.12.16 之前总结链路会写出这种行，
+        生产库 7 条活跃记忆全是这个形态（同时也都是无归属行，由
+        `_repair_orphan_private` 一并救回）。
+
+        幂等：正常情况下每次启动 UPDATE 0 行，不写 meta 标记，
+        避免「先建库、后写脏行」的时序漏修。
+        """
+        try:
+            cur = c.execute(
+                "UPDATE memories SET scope = 'user'"
+                " WHERE COALESCE(visibility, '') = 'private'"
+                "   AND COALESCE(group_id, '') = ''"
+                "   AND COALESCE(scope, '') <> 'user'"
+            )
+            if cur.rowcount:
+                import logging
+
+                logging.getLogger(__name__).info(
+                    f"[hermes_core] 已把 {cur.rowcount} 条私聊记忆从群作用域挪回 user")
+        except sqlite3.OperationalError:
+            pass
+
     @property
     def fts_enabled(self) -> bool:
         return self._fts_enabled
-
     def _migrate_skills(self, c) -> None:
         """把老库的全局技能表重建成按身份隔离的表。
 

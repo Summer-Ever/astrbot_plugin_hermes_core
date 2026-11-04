@@ -450,6 +450,40 @@ def main() -> int:
     check("孤儿修复后 scope=user", fixed["scope"] == "user", fixed["scope"])
     r2.close()
 
+    # --- v0.12.17 私聊作用域规范化：private 且无群 → 必须落在 user 层
+    #     写坏的方式：总结时把 scope 判成 group、可见性却判成 private。
+    #     分层检索下这种行两边都不落地（群层按可见性过滤掉、按人层 scope 不匹配）。
+    sdir = os.path.join(tmp, "scopenorm")
+    os.makedirs(sdir, exist_ok=True)
+    n1 = HermesDB(sdir, "scope.db")
+    bad_id = n1.add_memory("fact", "作用域写错的私聊记忆", scope="group",
+                           owner_id="u70", visibility="private")
+    check("写入时确实是 private+group 错位",
+          n1.memory_by_id(bad_id)["scope"] == "group",
+          n1.memory_by_id(bad_id)["scope"])
+    n1.close()
+    n2 = HermesDB(sdir, "scope.db")
+    check("启动后 scope 规范为 user",
+          n2.memory_by_id(bad_id)["scope"] == "user",
+          n2.memory_by_id(bad_id)["scope"])
+    check("规范后可被本人按人检索到",
+          any(r["id"] == bad_id for r in n2.search_memories(
+              "作用域写错的私聊记忆", owner_id="u70", allow_private=True)))
+    n2.close()
+
+    # --- v0.12.17 判不出查看者时不放行 private（原来的隐式 fail-open）
+    check("无身份时检索不到他人 private",
+          not any(r["id"] == dm_priv for r in db.search_memories(
+              "私聊说过的生日", owner_id="", allow_private=True)))
+    db.set_pinned(dm_priv, True)
+    check("无身份时钉住清单不含他人 private",
+          not any(r["id"] == dm_priv for r in db.pinned_memories(
+              "", allow_private=True)))
+    check("无身份时常驻不含他人 private",
+          not any(r["id"] == dm_priv for r in db.resident_notes(
+              "", limit=20, allow_private=True)))
+    db.set_pinned(dm_priv, False)
+
     # --- v0.12.17 删除合并父条不能把子条永久悬空
     c1 = db.add_memory("fact", "子条一", owner_id="u50")
     c2 = db.add_memory("fact", "子条二", owner_id="u50")
