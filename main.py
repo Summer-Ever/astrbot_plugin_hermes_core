@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.16"
+PLUGIN_VERSION = "0.12.17"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -491,6 +491,16 @@ class HermesCore(Star):
         except Exception:
             return default
 
+    # WebUI 与 LLM 工具必须共用同一套写入侧净化/拦截，否则面板就成了
+    # 绕过注入防线的后门（面板写进 public 记忆后每轮注入给所有人）。
+    @staticmethod
+    def _sanitize_memory(text: str) -> str:
+        return _clean_memory_text(text)
+
+    @staticmethod
+    def _looks_like_injection(text: str) -> bool:
+        return _is_injection(text)
+
     # ============ 构建戳：确认热重载后跑的是哪份代码 ============
 
     def _build_hash(self) -> str:
@@ -809,7 +819,7 @@ class HermesCore(Star):
         # 不依赖关键词命中——「机器人记得你」的基线不能建立在碰巧搜到之上。
         # 群聊场景下 allow_private=False：私聊里沉淀的条目整层不出现。
         allow_private = bool(sc["allow_private"])
-        resident = self._resident_block(owner_id, allow_private)
+        resident = self._resident_block(owner_id, allow_private, sc["group_id"])
         if resident:
             lines.append("[关于这位用户（长期稳定信息）]")
             # 钉住的条目可能已经被用户改主意了（先说「叫我兄弟」后说「喊我老爹」），
@@ -822,17 +832,22 @@ class HermesCore(Star):
             lines += format_memory_lines([self._inject_item(r) for r in resident])
 
         # 第二层：按当前这句话检索相关记忆（用户 > 群 > 全局逐级补）
+        scan = max(200, int(self._get_cfg("recall_scan_limit", 3000)))
         if scope == "user":
             memories = self.db.search_memories(
                 search_q, limit=mem_k, owner_id=owner_id, allow_private=allow_private,
-                session_id=sid, platform=sc["platform"], group_id=sc["group_id"] or None)
+                session_id=sid, platform=sc["platform"], group_id=sc["group_id"] or None,
+                scan=scan, viewer_owner=owner_id)
         elif scope == "group":
             memories = self.db.search_memories(
                 search_q, limit=mem_k, session_id=sid, allow_private=allow_private,
-                platform=sc["platform"], group_id=sc["group_id"] or None)
+                platform=sc["platform"], group_id=sc["group_id"] or None,
+                scan=scan, viewer_owner=owner_id)
         else:
-            memories = self.db.search_memories(search_q, limit=mem_k,
-                                               allow_private=allow_private)
+            memories = self.db.search_memories(
+                search_q, limit=mem_k, allow_private=allow_private, scan=scan,
+                group_id=sc["group_id"] or None, session_id=sid,
+                platform=sc["platform"], viewer_owner=owner_id, global_mode=True)
         raw_mem = len(memories)
         memories = suppress_repeats(memories, state["seen"], state["turn"])
         if raw_mem > len(memories):
@@ -938,14 +953,16 @@ class HermesCore(Star):
             "note": note,
         }
 
-    def _resident_block(self, owner_id: str, allow_private: bool = True) -> list[dict]:
+    def _resident_block(self, owner_id: str, allow_private: bool = True,
+                        group_id: str = "") -> list[dict]:
         """常驻条目（60 秒缓存）。写记忆/整理后由调用方清缓存。
 
-        缓存键必须带可见性，否则先私聊、再群聊时会拿到同一份（含私事）的缓存。
+        缓存键必须带可见性和群：否则先私聊、再群聊时会拿到同一份（含私事）的缓存；
+        换一个群也会拿到上一个群的「只在来源群可见」条目。
         """
         if not owner_id or not bool(self._get_cfg("resident_notes", True)):
             return []
-        key = (owner_id, bool(allow_private))
+        key = (owner_id, bool(allow_private), str(group_id or ""))
         now = time.time()
         cached = self._resident_cache.get(key)
         if cached and now - cached[0] < 60:
@@ -955,6 +972,7 @@ class HermesCore(Star):
             limit=max(1, int(self._get_cfg("resident_max_items", 6))),
             max_chars=max(120, int(self._get_cfg("resident_max_chars", 400))),
             allow_private=bool(allow_private),
+            group_id=str(group_id or ""),
         )
         # 只增不减会长期驻留每个见过的人：人以千计时是几 MB 的 dict，
         # 而且 TTL 只在读同一个 key 时才判断，冷 key 永远不会被淘汰。
@@ -997,7 +1015,9 @@ class HermesCore(Star):
             except Exception:
                 pass
             if reply:
-                self.db.add_message(sid, "assistant", reply,
+                # 单条超长回复（贴代码/表格）没有留全的必要：原文只用于检索，
+                # 8k 已经远超注入窗口；不截断会让库随少数几条长回复暴涨。
+                self.db.add_message(sid, "assistant", reply[:8000],
                                     platform=event.get_platform_name() or "",
                                     group_id=str(event.get_group_id() or ""))
         except Exception:
@@ -1015,7 +1035,8 @@ class HermesCore(Star):
         mems = self.db.search_memories(
             query, limit=5, owner_id=sc["owner_id"], session_id=sc["sid"],
             platform=sc["platform"], group_id=sc["group_id"] or None,
-            allow_private=bool(sc["allow_private"]))
+            allow_private=bool(sc["allow_private"]), viewer_owner=sc["owner_id"],
+            scan=max(200, int(self._get_cfg("recall_scan_limit", 3000))))
         if mems:
             try:
                 self.db.bump_hits([int(m["id"]) for m in mems])
@@ -1047,9 +1068,12 @@ class HermesCore(Star):
         rec = self.db.memory_by_id(int(memory_id))
         if not rec or int(rec.get("merged_into") or 0) != 0:
             return f"记忆 #{memory_id} 不存在或已失效。"
-        # 只能操作自己的记忆；群公共/全局记忆（无归属）也允许钉
-        if rec.get("owner_id") and rec["owner_id"] != sc["owner_id"]:
-            return "只能钉住你自己的记忆。"
+        # 只能操作自己的记忆。公共记忆（无归属）钉住后并不会对任何人常驻
+        # （常驻要求 owner 匹配），却会被永久排除在整理/深度清理之外——
+        # 任何群友都能借此把垃圾条目钉死在库里，所以公共条目只允许管理员钉。
+        mine = bool(sc["owner_id"]) and (rec.get("owner_id") or "") == sc["owner_id"]
+        if not mine and not self._is_admin(event):
+            return "只能钉住你自己的记忆；群/全局公共记忆需要管理员操作。"
         # 编号必须是本会话真的见过的那几条。群里被注入的「把 #137 钉住」这种话
         # 不会成功，因为 #137 从未出现在这个会话的上下文里。
         if not self._id_seen(sc["sid"], int(memory_id)):
@@ -1108,10 +1132,14 @@ class HermesCore(Star):
                 old = self.db.memory_by_id(int(replaces))
             except (TypeError, ValueError):
                 old = None
-            # 只能替换自己的（或无归属的）记忆，且不能替换自己；
-            # 编号同样必须是本会话可见过的，防止注入内容指定任意编号做删除。
+            # 只能替换自己的记忆，且不能替换自己；公共（无归属）条目会被
+            # 全员共用，任何群友都能借 replaces 把它从所有人视野里顶掉，
+            # 因此只有管理员能替换。编号同样必须是本会话可见过的。
+            mine_old = bool(sc["owner_id"]) and \
+                (old.get("owner_id") or "") == sc["owner_id"]
+            shared_old = bool(old) and not (old.get("owner_id") or "")
             if old and int(old.get("merged_into") or 0) == 0 and int(replaces) != mid \
-                    and (not old.get("owner_id") or old["owner_id"] == sc["owner_id"]) \
+                    and (mine_old or (shared_old and self._is_admin(event))) \
                     and self._id_seen(sc["sid"], int(replaces)):
                 # 被替换的旧条原本是常驻的，新条要继承「常驻」身份，
                 # 否则「以后别叫我兄弟」会把称呼槽位整个清空。
@@ -1173,6 +1201,10 @@ class HermesCore(Star):
         """
         sc = self._scope_keys(event)
         name = re.sub(r"\s+", "_", name.strip())[:64]
+        # 正文会整份读进上下文；不设上限时模型可以一次写进几十万字符，
+        # 之后每次 read_skill 都在烧 token，还会挤掉真正的对话上下文。
+        content = str(content or "")[:20000]
+        trigger = _clean_memory_text(trigger)[:300]
         if not name or not content:
             return "技能名和内容都不能为空。"
         want = str(scope or "private").strip().lower()
@@ -1381,7 +1413,7 @@ class HermesCore(Star):
         self._flush_metrics()
 
         # 记忆巩固：攒够 N 条新记忆才整理一次（一次整理 = 一次模型调用，别每条都调）
-        new_ids = {m["id"] for m in self.db.all_active_memories() if m["id"] > before_max}
+        new_ids = self.db.active_memory_ids_since(before_max)
         queued = self._queue_memories(new_ids) if new_ids else self._queued_memory_count()
         if self._should_consolidate_memories(queued):
             try:
@@ -1447,10 +1479,20 @@ class HermesCore(Star):
                 text = "（该条疑似指令注入，已过滤）"
             if m["role"] == "user":
                 known_ids.add(str(m["sender_id"] or ""))
-                lines.append(f"[用户 {m['sender_id'] or '未知'}({m['sender_name'] or '匿名'})]: {text}")
+                # 昵称也是用户可控输入：带换行就能在 prompt 里伪造一行
+                # 「助手: ...」或一条规则。压平并截断后再拼进转录。
+                who = _clean_memory_text(m.get("sender_name") or "匿名")[:30]
+                lines.append(f"[用户 {m['sender_id'] or '未知'}({who})]: {text}")
             else:
                 lines.append(f"助手: {text}")
         transcript = "\n".join(lines)
+
+        # 本批发言人（已解析别名）。私聊里只有一个人：模型漏写 owner 或写成
+        # 昵称时，归属依然无歧义，必须归给本人。否则会落成 owner_id='' +
+        # visibility='private' 的孤儿行——按人检索和常驻都读不到，永久沉默。
+        batch_owners = {self.db.resolve_owner(x, fmt) for x in known_ids if x}
+        batch_owners.discard("")
+        solo_owner = next(iter(batch_owners)) if (not gid and len(batch_owners) == 1) else ""
 
         # 技能归属：这一批对话里发言最多的人。技能跟人走，不跟群走——
         # 否则 A 摸索出来的流程会被 B 覆盖掉。
@@ -1472,8 +1514,12 @@ class HermesCore(Star):
         existing_skills = self.db.list_skills(owner_id=skill_owner, group_id=gid)
         skill_hint = ""
         if existing_skills and self._get_cfg("auto_skill", True):
+            # trigger 是历史对话里提炼/群友可写的自由文本，直接拼进 prompt
+            # 等于给总结模型开了一条常驻注入通道。压平换行、限长后再列。
             lines_s = "\n".join(
-                f"- {s['name']}：{s['trigger'] or '通用'}" for s in existing_skills[:25]
+                f"- {_clean_memory_text(s['name'])[:64]}："
+                f"{_clean_memory_text(s['trigger'] or '通用')[:80]}"
+                for s in existing_skills[:25]
             )
             skill_hint = (
                 "\n\n[已有技能] 若本次流程属于下列某个技能的范畴，name 必须原样沿用该技能名"
@@ -1487,9 +1533,8 @@ class HermesCore(Star):
             # 只带本批发言人自己的常驻条目，避免把别人的私事喂进这次总结。
             # 群会话还要再收一层：私聊钉住的「叫我老爹」进了这段提示，模型很可能
             # 顺手写进群记忆——那就是把私事带进群的最短路径。
-            batch_owners = {self.db.resolve_owner(x, fmt) for x in known_ids if x}
-            pins = [p for p in self.db.pinned_memories(limit=30,
-                                                       allow_private=not bool(gid))
+            pins = [p for p in self.db.pinned_memories(
+                        limit=30, allow_private=not bool(gid), group_id=gid)
                     if not p.get("owner_id") or p["owner_id"] in batch_owners]
         except Exception:
             pins = []
@@ -1533,11 +1578,16 @@ class HermesCore(Star):
         for item in self._extract_json_array(text):
             if not isinstance(item, dict):
                 continue
-            if item.get("skill") and self._get_cfg("auto_skill", True):
+            # 无归属又不在群里时不要落技能：_norm_scope 会把它变成 global，
+            # 等于让一段没有主人的流程被全体用户读到。
+            if item.get("skill") and self._get_cfg("auto_skill", True) \
+                    and (skill_owner or gid):
                 name = re.sub(r"\s+", "_", str(item.get("name", "")).strip())[:64]
                 if name and item.get("content"):
-                    trigger = str(item.get("trigger", "")).strip()
-                    new_content = str(item["content"])
+                    trigger = _clean_memory_text(str(item.get("trigger", "")))[:300]
+                    # 技能正文会整份读进模型上下文，不设上限时一次总结就能写进
+                    # 几十万字符，之后每次 read_skill 都在烧 token。
+                    new_content = str(item["content"])[:20000]
                     old = self.db.peek_skill(name, owner_id=skill_owner, group_id=gid)
                     if old and bool(self._get_cfg("skill_merge_same_name", True)):
                         # 同名技能：先读旧版再合并，而不是直接覆盖丢掉旧步骤
@@ -1559,10 +1609,13 @@ class HermesCore(Star):
                 if not content_text or _is_injection(content_text):
                     continue
                 owner = str(item.get("owner", "")).strip()
-                if owner not in known_ids:
-                    owner = ""  # 归属不明 → 降级为群公共记忆
-                if owner:
-                    owner = self.db.resolve_owner(owner, fmt)
+                if solo_owner:
+                    owner = solo_owner
+                else:
+                    if owner not in known_ids:
+                        owner = ""  # 群聊里归属不明 → 降级为群公共记忆
+                    if owner:
+                        owner = self.db.resolve_owner(owner, fmt)
                 mid, created = self.db.add_memory_smart(
                     str(item.get("kind", "fact")), content_text,
                     scope="user" if owner else "group", source="auto_summary",
@@ -1746,6 +1799,10 @@ class HermesCore(Star):
         max_clusters = max(1, int(self._get_cfg("consolidate_max_clusters", 6)))
         min_total = max(2, int(self._get_cfg("consolidate_min_memories", 6)))
 
+        # 普通整理靠两两比较聚类，复杂度 O(n²)。单作用域上千条时会把事件循环
+        # 按住好几秒，所以只取最近 600 条；更老的条目走深度整理（按片处理）。
+        cluster_max = 600
+        capped = 0
         if focus_ids:
             clusters: list[list[dict]] = []
             by_bucket: dict[tuple, list[dict]] = {}
@@ -1773,9 +1830,14 @@ class HermesCore(Star):
             for items in buckets.values():
                 if len(items) < 2:
                     continue
+                if len(items) > cluster_max:
+                    capped += len(items) - cluster_max
+                    items = items[-cluster_max:]
                 clusters += _cluster_by_similarity(items, threshold)
             if not clusters:
-                return f"已检查 {len(rows)} 条记忆，没有发现需要合并的碎片。"
+                miss = (f"（每个作用域只检查最近 {cluster_max} 条，"
+                        f"较早的 {capped} 条未参与）" if capped else "")
+                return f"已检查 {len(rows)} 条记忆，没有发现需要合并的碎片{miss}。"
 
         # 去掉被别的簇完全包含的重复簇
         seen: set[tuple] = set()
@@ -1794,7 +1856,8 @@ class HermesCore(Star):
             listing.append(f"组 {idx}：")
             for m in group:
                 id_to_group[m["id"]] = idx
-                listing.append(f"- #{m['id']} ({m['kind']}) {m['content'][:200]}")
+                listing.append(f"- #{m['id']} ({m['kind']}) "
+                               f"{_clean_memory_text(m['content'])[:200]}")
 
         head = (
             "下面是从长期记忆里挑出的若干组碎片，组内内容高度相似或互补。"
@@ -1841,8 +1904,11 @@ class HermesCore(Star):
                 ids = [int(x) for x in (item.get("ids") or []) if str(x).strip().isdigit()]
             except Exception:
                 continue
-            content = str(item.get("content") or "").strip()
-            if len(ids) < 2 or not content:
+            # 合并产物是「新写入的记忆」，不能绕过写入侧的净化：
+            # 压平换行（否则一条记忆会变成注入块里的多行指令）、限长、
+            # 命中指令腔就整条丢弃（宁可保留碎片，也不把注入固化下来）。
+            content = _clean_memory_text(str(item.get("content") or ""))
+            if len(ids) < 2 or not content or _is_injection(content):
                 continue
             # 必须是同一组，且 id 都真实存在——防止模型跨组乱填、合并到别人头上
             gids = {id_to_group.get(i) for i in ids}
@@ -1861,14 +1927,18 @@ class HermesCore(Star):
             if new_id:
                 applied.append(f"#{'/'.join(map(str, ids))} → #{new_id}：{content[:80]}")
 
+        scope_note = (f"\n（每个作用域只检查最近 {cluster_max} 条，"
+                      f"较早的 {capped} 条请用「深度整理」处理）" if capped else "")
         if not applied:
             return (f"发现 {len(clusters)} 组疑似重复，但没有一组通过校验"
                     "（可能模型判断不该合，或 ids 跨了用户/群）。"
+                    + scope_note
                     + (f"\n{foot}" if foot else ""))
 
         head = "记忆整理预览（未写入）" if dry_run else "记忆已整理"
         return (f"{head}：{len(applied)} 组\n"
                 + "\n".join(f"- {a}" for a in applied[:8])
+                + scope_note
                 + (f"\n{foot}" if foot else ""))
 
     async def _deep_consolidate(self, rows: list[dict], dry_run: bool,
@@ -1961,7 +2031,7 @@ class HermesCore(Star):
             if all(int(m["id"]) in done_ids for m in items):
                 continue
             listing = "\n".join(
-                f"- #{m['id']} ({m['kind']}) {str(m['content'])[:160]}"
+                f"- #{m['id']} ({m['kind']}) {_clean_memory_text(m['content'])[:160]}"
                 for m in items
             )
             try:
@@ -2027,8 +2097,9 @@ class HermesCore(Star):
                     total_drop += self.db.discard_memories(ids)
                     applied.append(f"丢弃 #{'/'.join(map(str, ids))}")
                 else:
-                    content = str(item.get("content") or "").strip()
-                    if len(ids) < 2 or not content:
+                    # 同普通整理：模型输出也是写入，必须过净化和注入拦截
+                    content = _clean_memory_text(str(item.get("content") or ""))
+                    if len(ids) < 2 or not content or _is_injection(content):
                         continue
                     id_set = set(ids)
                     old_texts = [str(m["content"]) for m in items
@@ -2577,9 +2648,10 @@ class HermesCore(Star):
         if not rec:
             yield event.plain_result(f"记忆 #{memory_id} 不存在。")
             return
-        mine = (rec.get("owner_id") or "") == sc["owner_id"]
-        group_shared = not rec.get("owner_id") and (rec.get("group_id") or "") == sc["group_id"]
-        if not (mine or (group_shared and self._is_admin(event)) or self._is_admin(event)):
+        # 不能只比较 owner_id：适配器拿不到 sender_id 时 sc["owner_id"] 也是空串，
+        # `'' == ''` 会让任何人删掉所有无归属的公共记忆（fail-open）。
+        mine = bool(sc["owner_id"]) and (rec.get("owner_id") or "") == sc["owner_id"]
+        if not (mine or self._is_admin(event)):
             yield event.plain_result(f"记忆 #{memory_id} 不属于你，无法删除。")
             return
         ok = self.db.delete_memory(memory_id)
@@ -2653,6 +2725,11 @@ class HermesCore(Star):
     @hermes.command("导入历史")
     async def hermes_import_history(self, event: AstrMessageEvent):
         """把 AstrBot 原生对话历史导入本插件记忆库，实现无缝接管。"""
+        # 这是迁移/接管操作：会把整个会话的原生上下文复制进插件库并触发总结。
+        # 放开给普通群友等于给了「重复灌库 + 烧 token」的开关。
+        if not self._is_admin(event):
+            yield event.plain_result(self._deny_admin(event, "导入原生历史"))
+            return
         imported = await self._import_native_history(event.unified_msg_origin)
         yield event.plain_result(imported)
 
@@ -2661,7 +2738,10 @@ class HermesCore(Star):
         if cm is None:
             return "当前 AstrBot 版本没有 conversation_manager，无法导入。"
         try:
-            count = 0
+            count = skipped = 0
+            # 幂等：原生历史和插件库会有大量重叠，重复导入会让消息翻倍、
+            # 总结重复跑、记忆重复写。按 (role, content) 跳过已存在的。
+            seen = self.db.message_signatures(umo, limit=20000)
             convs = await cm.get_conversations(umo)
             for conv in convs or []:
                 history = conv.history
@@ -2677,9 +2757,16 @@ class HermesCore(Star):
                     content = str(h.get("content", "")).strip()
                     if not content or role not in ("user", "assistant"):
                         continue
-                    self.db.add_message(umo, role, content[:2000])
+                    content = content[:2000]
+                    sig = (role, content)
+                    if sig in seen:
+                        skipped += 1
+                        continue
+                    self.db.add_message(umo, role, content)
+                    seen.add(sig)
                     count += 1
-            return f"导入完成：{count} 条原生对话记录已并入记忆库。"
+            tail = f"，跳过 {skipped} 条已存在" if skipped else ""
+            return f"导入完成：{count} 条原生对话记录已并入记忆库{tail}。"
         except Exception:
             logger.error(f"[hermes_core] 导入历史失败:\n{traceback.format_exc()}")
             return "导入失败，详见后台日志。"
@@ -2853,6 +2940,9 @@ class HermesCore(Star):
         database）；而旧实例继续跑、新实例同时起来做自动整理，两个连接会
         对同一批记忆各合并一次。所以这里必须 cancel + await 全部任务。
         """
+        # 先让 to_thread 里的修剪循环停手：cancel 只能取消 await，取消不了线程。
+        # 不等它就直接 close()，线程会在已关闭的连接上继续 DELETE。
+        self.db.request_stop()
         tasks = [t for t in (self._bg_task, self._consolidate_task, self._probe_task)
                  if t is not None and not t.done()]
         for t in tasks:

@@ -37,7 +37,8 @@ PLUGIN_NAME = "astrbot_plugin_hermes_core"
 CONFIG_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("记忆注入", ("memory_injection", "memory_scope", "per_user_history",
                   "group_private_memory", "exclusive_memory",
-                  "inject_memories_topk", "inject_history_topk")),
+                  "inject_memories_topk", "inject_history_topk",
+                  "recall_scan_limit")),
     ("自动总结", ("auto_summarize", "summarize_interval_minutes",
                   "min_new_messages", "summarize_grace_hours")),
     ("记忆整理", ("auto_consolidate", "consolidate_every_n_memories",
@@ -64,11 +65,18 @@ MEMORY_KINDS = ("fact", "preference", "profile", "summary")
 
 
 def _bucket(row: dict) -> tuple:
-    """记忆的归属边界：不同用户/不同群绝不合并。"""
+    """记忆的归属边界：不同用户/不同群/不同可见性绝不合并。
+
+    visibility 必须进桶。merge_memories 继承组内最早那条的可见性：
+    把一条私聊记忆和一条群可见记忆合在一起，结果要么私事变群可见，
+    要么群里从此想不起来——两者都不可自愈。v0.12.13 修过整理链路，
+    但面板的合并入口当时漏了同一件事。
+    """
     return (
         row.get("scope") or "",
         row.get("owner_id") or "",
         row.get("group_id") or "",
+        row.get("visibility") or "",
     )
 
 
@@ -263,9 +271,12 @@ class HermesWebAPI:
 
     async def memory_add(self):
         data = await self._body()
-        content = str(data.get("content") or "").strip()
+        content = self.plugin._sanitize_memory(str(data.get("content") or ""))
         if not content:
             return self._fail("记忆内容不能为空")
+        if self.plugin._looks_like_injection(content):
+            return self._fail("内容含指令式语句（如「忽略以上」「你现在是」），"
+                              "记忆会被逐轮注入，不能这样写")
         kind = str(data.get("kind") or "fact").strip()
         if kind not in MEMORY_KINDS:
             return self._fail("未知的记忆类型")
@@ -307,10 +318,12 @@ class HermesWebAPI:
         content = data.get("content")
         kind = data.get("kind")
         if content is not None:
-            content = str(content).strip()
+            content = self.plugin._sanitize_memory(str(content))
             if not content:
                 return self._fail("记忆内容不能为空")
-            content = content[:500]
+            if self.plugin._looks_like_injection(content):
+                return self._fail("内容含指令式语句（如「忽略以上」「你现在是」），"
+                                  "记忆会被逐轮注入，不能这样写")
         if kind is not None and str(kind) not in MEMORY_KINDS:
             return self._fail("未知的记忆类型")
         ok = self.plugin.db.update_memory(mid, content, None if kind is None else str(kind))
@@ -346,8 +359,10 @@ class HermesWebAPI:
     async def memory_merge(self):
         data = await self._body()
         raw_ids = data.get("ids") or []
-        content = str(data.get("content") or "").strip()
+        content = self.plugin._sanitize_memory(str(data.get("content") or ""))
         kind = str(data.get("kind") or "").strip()
+        if kind and kind not in MEMORY_KINDS:
+            return self._fail("未知的记忆类型")
         if not isinstance(raw_ids, list) or len(raw_ids) < 2:
             return self._fail("至少选择两条记忆")
         try:
@@ -356,6 +371,8 @@ class HermesWebAPI:
             return self._fail("id 必须是数字")
         if not content:
             return self._fail("合并后的内容不能为空")
+        if self.plugin._looks_like_injection(content):
+            return self._fail("合并后的内容含指令式语句，未写入")
         rows = [self.plugin.db.memory_by_id(i) for i in ids]
         if any(r is None for r in rows):
             return self._fail("有记忆已被删除，请刷新后重试", 404)

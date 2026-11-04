@@ -65,6 +65,38 @@ def _where(conds: list[str]) -> str:
     return (" WHERE " + " AND ".join(conds)) if conds else ""
 
 
+def _visible_clause(allow_private: bool, group_id: str, viewer_owner: str = "",
+                    prefix: str = "") -> tuple[str, list]:
+    """当前场景能读到哪些 visibility 的条目（唯一的可见性判定口径）。
+
+    v0.12.17 之前只有「群层」加了 ``visibility != 'private'``，而按人检索
+    （user tier）、常驻、钉住清单都只按 owner 过滤。结果是 A 群里产生、
+    visibility='group' 的条目，会在这个人于 B 群发言时被按人召回——
+    “只在来源群可见”的承诺根本没生效。这里把三种可见性显式写成条件：
+
+    - public：任何场景；
+    - private：仅私聊（allow_private），且必须属于当前查看者；
+    - group：仅当当前就在来源群。
+
+    返回 (SQL 片段, 参数)。调用方把片段接在 WHERE 条件后面。
+    """
+    vis = f"COALESCE(NULLIF({prefix}visibility, ''), 'public')"
+    parts = [f"{vis} = 'public'"]
+    args: list = []
+    if allow_private:
+        if viewer_owner:
+            parts.append(f"({vis} = 'private' AND {prefix}owner_id = ?)")
+            args.append(viewer_owner)
+        else:
+            # 调用方已按 owner 收窄（如总结时按批发言人过滤），这里不再重复
+            parts.append(f"{vis} = 'private'")
+    if group_id:
+        parts.append(f"({vis} = 'group' AND {prefix}group_id = ?)")
+        args.append(group_id)
+    # 不在群里时 group 条目一律不可读：它只属于来源群。
+    return " AND (" + " OR ".join(parts) + ")", args
+
+
 def _neg_words(text: str) -> set[str]:    return {w for w in _NEG_WORDS if w in str(text or "")}
 
 
@@ -128,8 +160,14 @@ class HermesDB:
         self._lock = threading.Lock()
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # 热重载/面板进程与机器人进程短时并存时，没有 busy_timeout 会直接抛
+        # "database is locked"，异常还会冒到消息处理链上。WAL 下写冲突本应等待，
+        # 这里给 5 秒的等待窗口。
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        # 卸载时通知仍在后台线程里跑的批次任务尽快收手（见 prune_messages）。
+        self._closing = threading.Event()
         self._fts_enabled = self._init_schema()
 
     # ---------- schema ----------
@@ -281,8 +319,75 @@ class HermesDB:
                 ON messages(session_id, sender_id, id);
             """
         )
+        self._repair_orphan_private(c)
         c.commit()
         return fts_ok
+
+    def _repair_orphan_private(self, c) -> None:
+        """修复 v0.12.16 及更早版本留下的「孤儿私聊记忆」。
+
+        总结模型有时不给 owner（或给了昵称而不是 ID），私聊里就会落成
+        owner_id='' + visibility='private'。这种行按人检索查不到（按 owner 过滤），
+        常驻也查不到（要求 owner 非空），等于永久沉在库里——生产库实测 29 条活跃
+        记忆里有 7 条是这样，占 24%。
+
+        私聊会话只有一个人，归属可以无歧义地从消息记录（或 umo 的
+        FriendMessage 段）反推。只修「无群、无归属、私聊可见」的活跃行，
+        群里的无归属行是群公共记忆，不能动。
+        """
+        try:
+            if c.execute("SELECT 1 FROM meta WHERE key = ?",
+                         ("mig_orphan_private_v01217",)).fetchone():
+                return
+            rows = c.execute(
+                "SELECT id, session_id, platform FROM memories"
+                " WHERE merged_into = 0 AND COALESCE(owner_id, '') = ''"
+                "   AND COALESCE(group_id, '') = ''"
+                "   AND COALESCE(visibility, '') = 'private'"
+            ).fetchall()
+            if not rows:
+                # 新库/已修复的库：不写标记。否则「先建库、后写入孤儿行」
+                # （降级回旧版本、或从备份恢复）会永远错过修复。
+                return
+            fixed = 0
+            now = time.time()
+            for r in rows:
+                sid = str(r["session_id"] or "")
+                owner = ""
+                senders = [
+                    str(x[0]) for x in c.execute(
+                        "SELECT DISTINCT sender_id FROM messages"
+                        " WHERE session_id = ? AND sender_id != '' LIMIT 3",
+                        (sid,),
+                    ).fetchall()
+                ]
+                if len(senders) == 1:
+                    owner = self.resolve_owner(senders[0], str(r["platform"] or ""))
+                if not owner and ":FriendMessage:" in sid:
+                    raw = sid.rsplit(":FriendMessage:", 1)[1].strip()
+                    if raw:
+                        owner = self.resolve_owner(raw, str(r["platform"] or ""))
+                if not owner:
+                    continue
+                c.execute(
+                    "UPDATE memories SET owner_id = ?, scope = 'user', updated_ts = ?"
+                    " WHERE id = ?",
+                    (owner, now, int(r["id"])),
+                )
+                fixed += 1
+            c.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                ("mig_orphan_private_v01217", str(fixed)),
+            )
+            if fixed:
+                # 只在真有修复时打日志，避免每次启动都刷一行
+                import logging
+
+                logging.getLogger(__name__).info(
+                    f"[hermes_core] 已修复 {fixed} 条无归属的私聊记忆（重新挂回本人）")
+        except sqlite3.OperationalError:
+            # identities 表尚未建好等边缘情况：不写 meta，下次启动重试
+            pass
 
     @property
     def fts_enabled(self) -> bool:
@@ -454,6 +559,8 @@ class HermesDB:
                 if wm <= 0:
                     continue
                 while True:  # asb-audit: ignore=ASB-13 同步方法由 asyncio.to_thread 调用，每批 LIMIT 必然收敛
+                    if self._closing.is_set():
+                        break  # 插件已卸载：别在旧连接上继续删
                     with self._lock:
                         ids = [r[0] for r in self.conn.execute(
                             "SELECT id FROM messages WHERE session_id = ?"
@@ -467,6 +574,8 @@ class HermesDB:
         else:
             # 海象循环：每批取一批删一批；批次大小受 LIMIT 约束，不会长事务
             while True:  # asb-audit: ignore=ASB-13 同步方法由 asyncio.to_thread 调用，每批 LIMIT 必然收敛
+                if self._closing.is_set():
+                    break
                 with self._lock:
                     ids = [r[0] for r in self.conn.execute(
                         "SELECT id FROM messages WHERE ts < ? LIMIT ?",
@@ -576,6 +685,18 @@ class HermesDB:
             (session_id, limit),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def message_signatures(self, session_id: str, limit: int = 20000) -> set[tuple]:
+        """(role, content) 去重集，供「导入原生历史」做幂等判断。
+
+        重复导入会把同一段对话再存一遍：消息数翻倍、总结重复跑、记忆重复写。
+        """
+        rows = self.conn.execute(
+            "SELECT role, content FROM messages WHERE session_id = ?"
+            " ORDER BY id DESC LIMIT ?",
+            (str(session_id), max(1, int(limit))),
+        ).fetchall()
+        return {(str(r["role"]), str(r["content"])) for r in rows}
 
     def messages_since(self, since_id: int, limit: int = 200) -> list[dict]:
         rows = self.conn.execute(
@@ -754,6 +875,10 @@ class HermesDB:
                 self.conn.commit()
             if corrections:
                 self.supersede_memories(corrections, best_id)
+            if pin_old:
+                # 被改掉的是常驻条目：新说法合并进了 best，常驻身份要跟过来，
+                # 否则「叫我哥哥」被改成「叫我老师」后整个槽位从常驻里消失。
+                self.set_pinned(best_id, True)
             return best_id, False
         new_id = self.add_memory(kind, content, scope=scope, source=source,
                                  owner_id=owner_id, session_id=session_id,
@@ -783,7 +908,8 @@ class HermesDB:
     def resident_notes(self, owner_id: str, limit: int = 6,
                        max_chars: int = 400,
                        kinds: tuple[str, ...] = ("profile", "preference"),
-                       allow_private: bool = True) -> list[dict]:
+                       allow_private: bool = True,
+                       group_id: str = "") -> list[dict]:
         """常驻「关于你」条目：不依赖检索命中，每次对话固定注入。
 
         Hermes 的做法是把 MEMORY.md / USER.md 整块加载——「机器人记得你」的
@@ -797,7 +923,9 @@ class HermesDB:
         if not owner_id:
             return []
         marks = _ph(len(kinds))
-        vis = "" if allow_private else " AND COALESCE(visibility, '') != 'private'"
+        # 可见性必须带群：A 群里沉淀的「只在来源群可见」条目，不能因为同一个人
+        # 在 B 群发言就进常驻。v0.12.17 之前这里只挡 private，group 条目会跨群。
+        vis, vis_args = _visible_clause(allow_private, group_id, owner_id)
         # 第一批：钉住的条目（任何 kind）——用户/模型明确要求「每轮必带」的信息，
         # 不受 kind 限制，也不受字符预算限制，这是重要信息的保护通道。
         # 按 pinned_ts 倒序：同槽位冲突时最新的排前面，模型能看出先后。
@@ -806,7 +934,7 @@ class HermesDB:
             " COALESCE(visibility, '') AS visibility FROM memories"
             " WHERE merged_into = 0 AND owner_id = ? AND pinned = 1" + vis +
             " ORDER BY COALESCE(pinned_ts, 0) DESC, id DESC LIMIT ?",
-            (owner_id, max(1, int(limit))),
+            (owner_id, *vis_args, max(1, int(limit))),
         ).fetchall()
         # 第二批：画像/偏好优先。重要度必须随时间衰减——importance 只在重复写入时
         # +0.15、从不下降，按它硬排会让新偏好永远挤不进常驻（实测 6 条老条目
@@ -818,7 +946,7 @@ class HermesDB:
             f" WHERE merged_into = 0 AND owner_id = ? AND pinned = 0 AND kind IN ({marks})"
             + vis +
             f" ORDER BY id DESC LIMIT ?",
-            (owner_id, *kinds, max(40, int(limit) * 8)),
+            (owner_id, *kinds, *vis_args, max(40, int(limit) * 8)),
         ).fetchall()
         now = time.time()
         ranked: list[tuple] = []
@@ -873,20 +1001,23 @@ class HermesDB:
         return out
 
     def pinned_memories(self, owner_id: str = "", limit: int = 30,
-                        allow_private: bool = True) -> list[dict]:
+                        allow_private: bool = True,
+                        group_id: str = "") -> list[dict]:
         """全部钉住条目（可跨 owner），供总结时判断「哪条被改变了」。
 
         allow_private=False 用于群会话的总结：私聊钉住的「叫我老爹」不该被塞进
         一次群聊总结的提示里——那正是把私事写进群记忆的最短路径。
+        group_id 同样要参与：别的群里钉住的内容不能被拿来当本群总结的依据。
         """
-        sql = ("SELECT id, kind, content, owner_id, pinned_ts, visibility"
+        sql = ("SELECT id, kind, content, owner_id, group_id, pinned_ts, visibility"
                " FROM memories WHERE merged_into = 0 AND pinned = 1")
         args: list = []
         if owner_id:
             sql += " AND owner_id = ?"
             args.append(owner_id)
-        if not allow_private:
-            sql += " AND COALESCE(visibility, '') != 'private'"
+        vis, vis_args = _visible_clause(allow_private, group_id, owner_id)
+        sql += vis
+        args += vis_args
         sql += " ORDER BY id ASC LIMIT ?"
         args.append(max(1, int(limit)))
         return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
@@ -916,8 +1047,13 @@ class HermesDB:
             return []
         rows = self.conn.execute(
             "SELECT id, content FROM memories WHERE merged_into = 0 AND pinned = 1"
-            " AND owner_id = ? AND id != ?",
-            (rec.get("owner_id") or "", int(memory_id)),
+            " AND owner_id = ? AND id != ?"
+            # 同槽位只在同一可见域里比较：私聊里的「叫我哥哥」不能被
+            # 另一个群里钉的「叫我老师」顶掉，反之亦然。
+            " AND (COALESCE(visibility, 'public') = 'public'"
+            "      OR COALESCE(group_id, '') = ?)",
+            (rec.get("owner_id") or "", int(memory_id),
+             rec.get("group_id") or ""),
         ).fetchall()
         return [int(r["id"]) for r in rows if _slot_of(r["content"]) == slot]
 
@@ -960,13 +1096,28 @@ class HermesDB:
             self.conn.commit()
             return cur.rowcount
 
-    def all_active_memories(self, limit: int = 1000) -> list[dict]:
-        """所有未合并的记忆，按 id 升序（即时间顺序），供巩固/去重使用。"""
-        rows = self.conn.execute(
-            "SELECT * FROM memories WHERE merged_into = 0 ORDER BY id LIMIT ?",
-            (limit,),
-        ).fetchall()
+    def all_active_memories(self, limit: int | None = None) -> list[dict]:
+        """所有未合并的记忆，按 id 升序（即时间顺序），供巩固/去重使用。
+
+        limit=None 表示全量。v0.12.16 之前硬编码 1000：超过 1000 条的账号，
+        最老的那部分记忆永远不会被整理（手动「全库整理」也一样，但它会显示
+        “全量”，属于静默漏处理）。
+        """
+        sql = "SELECT * FROM memories WHERE merged_into = 0 ORDER BY id"
+        args: tuple = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            args = (max(1, int(limit)),)
+        rows = self.conn.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
+
+    def active_memory_ids_since(self, since_id: int) -> set[int]:
+        """只取 id，供「本轮新增了哪些记忆」这类判断，避免把正文全读进内存。"""
+        rows = self.conn.execute(
+            "SELECT id FROM memories WHERE merged_into = 0 AND id > ?",
+            (int(since_id),),
+        ).fetchall()
+        return {int(r["id"]) for r in rows}
 
     def max_memory_id(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) m FROM memories").fetchone()
@@ -1094,8 +1245,10 @@ class HermesDB:
                         session_id: str | None = None,
                         platform: str | None = None,
                         group_id: str | None = None,
-                        scan: int = 1200,
-                        allow_private: bool = True) -> list[dict]:
+                        scan: int = 3000,
+                        allow_private: bool = True,
+                        viewer_owner: str = "",
+                        global_mode: bool = False) -> list[dict]:
         """记忆检索：作用域分层 + 本地相关性排序（bigram/IDF/时间衰减/去冗余）。
 
         群公共记忆的键用 (platform, group_id) 而不是 session_id(umo)，
@@ -1104,16 +1257,30 @@ class HermesDB:
         分层逐级补：用户私有 > 群共享 > 全局。分层后各自排序再串起来，
         比给不同层级乘系数更直观，也不会出现「全局的高分记忆把用户偏好挤出前 5」。
 
-        allow_private=False（群聊场景）时，private 条目不参与任何一层：
-        同一个人昨天在私聊说的「下周做手术」，今天在群里 @ 机器人时不能被召回。
+        可见性在每一层都要判（`_visible_clause`）：
+        - allow_private=False（群聊）时 private 条目不参与；
+        - visibility='group' 的条目只在其来源群参与——v0.12.16 之前按人检索
+          不看 group_id，A 群的「只在来源群可见」会被 B 群召回。
+
+        viewer_owner 是「当前是谁在看」，用于 private 条目归属校验；
+        group 模式（memory_scope=group）不传 owner_id 时也要传它。
         """
         tiers: list[tuple[str, list]] = []
-        vis = "" if allow_private else " AND COALESCE(visibility, '') != 'private'"
-        if owner_id is None and group_id is None:
-            tiers.append(("merged_into = 0" + vis, []))
+        viewer = viewer_owner or (owner_id or "")
+        if global_mode:
+            # 全机器人共享：看得到所有人的 public、本群的 group、以及自己的
+            # private（仅私聊）。旧实现是「整表不分可见性」，私聊内容会在
+            # global 模式下被注入给所有人。
+            vis, va = _visible_clause(allow_private, group_id or "", viewer)
+            tiers.append(("merged_into = 0" + vis, list(va)))
+        elif owner_id is None and group_id is None:
+            vis, va = _visible_clause(allow_private, "", viewer)
+            tiers.append(("merged_into = 0" + vis, list(va)))
         else:
             if owner_id is not None:
-                tiers.append(("merged_into = 0 AND owner_id = ?" + vis, [owner_id]))
+                vis, va = _visible_clause(allow_private, group_id or "", owner_id)
+                tiers.append(("merged_into = 0 AND owner_id = ?" + vis,
+                              [owner_id, *va]))
             if group_id is not None:
                 cond = "merged_into = 0 AND ((group_id = ? AND platform = ?)"
                 args: list = [group_id, platform or ""]
@@ -1122,10 +1289,12 @@ class HermesDB:
                     args.append(session_id)
                 else:
                     cond += ")"
-                tiers.append((cond + vis, args))
+                vis, va = _visible_clause(allow_private, group_id, viewer)
+                tiers.append((cond + vis, [*args, *va]))
+            vis, va = _visible_clause(allow_private, "", viewer)
             tiers.append(
                 ("merged_into = 0 AND owner_id = '' AND session_id = ''"
-                 " AND group_id = ''", [])
+                 " AND group_id = ''" + vis, list(va))
             )
 
         out: list[dict] = []
@@ -1281,8 +1450,25 @@ class HermesDB:
         return {r["kind"] or "fact": int(r["c"]) for r in rows}
 
     def delete_memory(self, memory_id: int) -> bool:
+        """物理删除一条记忆；指向它的合并产物要先「松绑」。
+
+        合并链是 merged_into 单链表：删掉中间节点后，子条仍指着已不存在的 id，
+        所有活跃查询都会把它们排除（merged_into != 0），等于整组内容永久消失，
+        unmerge() 也救不回来。删除前把子条挂回它自己的父节点（没有父就恢复活跃）。
+        """
+        mid = int(memory_id)
         with self._lock:
-            cur = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            row = self.conn.execute(
+                "SELECT merged_into FROM memories WHERE id = ?", (mid,)
+            ).fetchone()
+            if not row:
+                return False
+            parent = int(row["merged_into"] or 0)
+            self.conn.execute(
+                "UPDATE memories SET merged_into = ? WHERE merged_into = ?",
+                (parent if parent > 0 else 0, mid),
+            )
+            cur = self.conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
             self.conn.commit()
             return cur.rowcount > 0
 
@@ -1523,7 +1709,13 @@ class HermesDB:
             lines.append(f"- [{m['kind']}] {m['content']}")
         return "\n".join(lines)
 
+    def request_stop(self) -> None:
+        """让后台批次任务（TTL 修剪）在下一批之前收手。"""
+        self._closing.set()
+
     def close(self):
+        # 先立旗再关连接：后台线程（TTL 修剪）每批都会检查，尽量在关库前收手。
+        self._closing.set()
         try:
             self.conn.close()
         except Exception:

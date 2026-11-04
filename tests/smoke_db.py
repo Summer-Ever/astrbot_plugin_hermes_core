@@ -310,7 +310,9 @@ def main() -> int:
     check("私聊与群各自成条（不同可见性不合并）", c2 is True and x2 != x1, f"{x2},{c2}")
     priv = [n for n in db.resident_notes("u12", limit=6, allow_private=True)
             if "深色" in n["content"]]
-    grp = [n for n in db.resident_notes("u12", limit=6, allow_private=False)
+    # 群场景必须带 group_id：可见性判定以「当前就在哪个群」为准
+    grp = [n for n in db.resident_notes("u12", limit=6, allow_private=False,
+                                        group_id="G2")
            if "深色" in n["content"]]
     check("私聊场景命中 private 那条", len(priv) == 1 and priv[0]["id"] == x1, str(priv))
     check("群场景只命中 group 那条", len(grp) == 1 and grp[0]["id"] == x2, str(grp))
@@ -400,6 +402,77 @@ def main() -> int:
     check("get_alias 未绑定返回空", db.get_alias("raw_nobody") == "")
     db.add_alias("raw_alice", "u20", "qq")
     check("get_alias 返回归属", db.get_alias("raw_alice") == "u20")
+
+    # --- v0.12.17 可见性：group 只在来源群生效，不能按人跨群泄漏
+    ga = db.add_memory("preference", "A群约定每周五交作业", owner_id="u30",
+                       group_id="GA", visibility="group")
+    gb_hits = db.search_memories("每周五交作业", owner_id="u30", group_id="GB",
+                                 platform="p", allow_private=False)
+    check("跨群不召回他群 group 记忆",
+          all(r["id"] != ga for r in gb_hits), str([r["id"] for r in gb_hits]))
+    ga_hits = db.search_memories("每周五交作业", owner_id="u30", group_id="GA",
+                                 platform="p", allow_private=False)
+    check("本群可召回 group 记忆",
+          any(r["id"] == ga for r in ga_hits), str([r["id"] for r in ga_hits]))
+    check("跨群常驻不含他群 group 记忆",
+          all(r["id"] != ga for r in db.resident_notes("u30", allow_private=False,
+                                                       group_id="GB")))
+    check("本群常驻包含 group 记忆",
+          any(r["id"] == ga for r in db.resident_notes("u30", allow_private=False,
+                                                       group_id="GA")))
+    pub = db.add_memory("preference", "公开偏好喝美式", owner_id="u30",
+                        group_id="GA", visibility="public")
+    check("public 记忆在其他群仍可见",
+          any(r["id"] == pub for r in db.search_memories(
+              "公开偏好喝美式", owner_id="u30", group_id="GB",
+              platform="p", allow_private=False)))
+    dm_priv = db.add_memory("preference", "只在私聊说过的生日是六月",
+                            owner_id="u30", visibility="private")
+    check("群聊搜不到 private", all(
+        r["id"] != dm_priv for r in db.search_memories(
+            "私聊说过的生日", owner_id="u30", group_id="GA",
+            platform="p", allow_private=False)))
+    check("私聊搜得到 private", any(
+        r["id"] == dm_priv for r in db.search_memories(
+            "私聊说过的生日", owner_id="u30", allow_private=True)))
+
+    # --- v0.12.17 孤儿私聊记忆修复：owner 缺失时按会话发言人反推
+    rdir = os.path.join(tmp, "repair")
+    os.makedirs(rdir, exist_ok=True)
+    r1 = HermesDB(rdir, "repair.db")
+    r1.add_message("umo:FriendMessage:RAW9", "user", "你好", sender_id="RAW9")
+    rid = r1.add_memory("fact", "孤儿私聊记忆", owner_id="",
+                        session_id="umo:FriendMessage:RAW9", visibility="private")
+    r1.close()
+    r2 = HermesDB(rdir, "repair.db")
+    fixed = r2.memory_by_id(rid)
+    check("孤儿私聊记忆重挂 owner", fixed["owner_id"] == "RAW9", fixed["owner_id"])
+    check("孤儿修复后 scope=user", fixed["scope"] == "user", fixed["scope"])
+    r2.close()
+
+    # --- v0.12.17 删除合并父条不能把子条永久悬空
+    c1 = db.add_memory("fact", "子条一", owner_id="u50")
+    c2 = db.add_memory("fact", "子条二", owner_id="u50")
+    parent = db.merge_memories([c1, c2], "合并后的条目", "fact")
+    check("合并产生新条目", parent > 0, str(parent))
+    db.delete_memory(parent)
+    check("删父条后子条恢复活跃",
+          db.memory_by_id(c1)["merged_into"] == 0
+          and db.memory_by_id(c2)["merged_into"] == 0)
+
+    # --- v0.12.17 整理快照不再硬顶 1000 条
+    base = len(db.all_active_memories())
+    for i in range(1005):
+        db.add_memory("fact", f"批量记忆 {i}", owner_id="u60")
+    check("all_active_memories 不再硬顶 1000",
+          len(db.all_active_memories()) >= base + 1005,
+          f"{len(db.all_active_memories())} < {base + 1005}")
+    check("active_memory_ids_since 只返回新增 id",
+          len(db.active_memory_ids_since(0)) >= base + 1005)
+
+    # --- 导入历史幂等依赖的消息签名
+    check("message_signatures 覆盖已有消息",
+          ("user", "新的保留消息") in db.message_signatures("s1"))
 
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")
