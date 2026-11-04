@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.8"
+PLUGIN_VERSION = "0.12.9"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -300,6 +300,7 @@ class HermesCore(Star):
         logger.info(f"[hermes_core] 已加载，FTS5: {'开启' if self.db.fts_enabled else '不可用(退化为 LIKE)'}")
         self._migrate_watermarks()
         self._check_memory_conflicts()
+        self._recover_interrupted_job()
         self._register_web_apis()
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
@@ -375,6 +376,54 @@ class HermesCore(Star):
                 except OSError:
                     pass
         return h.hexdigest()[:10]
+
+    def _recover_interrupted_job(self):
+        """启动自检：把「进程被杀时留下的运行中标记」改成中断。
+
+        手动整理在后台跑，收尾那段（写最终结果）只有正常返回才会执行；
+        后台被 kill、容器被回收、直接关窗口时 asyncio 任务被取消，
+        CancelledError 会绕过 except Exception，meta 里就永远留着 running=true。
+        不清掉的话 /hermes 状态 和 /hermes 整理结果 会一直显示"仍在运行"。
+
+        数据本身是安全的：每个作用域的合并/丢弃都在单个 SQLite 事务里提交，
+        被中断只会丢掉"还没跑到的桶"，不会留下写了一半的条目。
+        """
+        raw = self.db.get_meta("consolidate_report", "")
+        if not raw:
+            return
+        try:
+            rep = json.loads(raw)
+        except Exception:
+            return
+        if not isinstance(rep, dict) or not rep.get("running"):
+            return
+        prog = rep.get("progress") or {}
+        done, total = int(prog.get("done") or 0), int(prog.get("total") or 0)
+        done_txt = f"已完成 {done}/{total} 个作用域" if total else ""
+        rep["running"] = False
+        rep["ok"] = False
+        rep["interrupted"] = True
+        rep["text"] = (f"上次整理被中断（机器人后台退出）。"
+                       f"{done_txt + '。' if done_txt else ''}"
+                       "已提交的合并/丢弃都已写库，没跑到的部分没有处理；"
+                       "需要的话重发 /hermes 整理。")
+        self.db.set_meta("consolidate_report", json.dumps(rep, ensure_ascii=False))
+        logger.warning(f"[hermes_core] 上次整理被中断，已标记为未完成"
+                       f"（{done_txt or '无进度记录'}）")
+
+    def _bump_consolidate_progress(self, done: int, total: int):
+        """每跑完一个作用域就更新一次进度，只为中断时能说清跑到哪了。"""
+        raw = self.db.get_meta("consolidate_report", "")
+        if not raw:
+            return
+        try:
+            rep = json.loads(raw)
+        except Exception:
+            return
+        if not isinstance(rep, dict) or not rep.get("running"):
+            return
+        rep["progress"] = {"done": int(done), "total": int(total)}
+        self.db.set_meta("consolidate_report", json.dumps(rep, ensure_ascii=False))
 
     def _write_build_stamp(self) -> None:
         try:
@@ -1518,6 +1567,9 @@ class HermesCore(Star):
         applied: list[str] = []
         total_merge = total_drop = 0
         skipped = 0
+        # 只统计真正要交给模型的桶（单条作用域直接跳过），用于中断时报告进度
+        total_buckets = sum(1 for v in buckets.values() if len(v) >= 2)
+        done_buckets = 0
         for bucket, items in buckets.items():
             listing = "\n".join(
                 f"- #{m['id']} ({m['kind']}) {str(m['content'])[:160]}"
@@ -1541,6 +1593,9 @@ class HermesCore(Star):
                 skipped += 1
                 logger.warning(f"[hermes_core] 深度整理跳过作用域 {bucket}: {str(exc)[:160]}")
                 continue
+            finally:
+                done_buckets += 1
+                self._bump_consolidate_progress(done_buckets, total_buckets)
             valid_ids = {int(m["id"]) for m in items[:120]}
             id_scope = {int(m["id"]): _scope_bucket(m) for m in items[:120]}
             for item in self._extract_json_array(text):
@@ -1634,8 +1689,16 @@ class HermesCore(Star):
         ts = time.strftime("%m-%d %H:%M", time.localtime(int(rep.get("ts") or 0)))
         kind = "深度" if rep.get("deep") else "普通"
         if rep.get("running"):
-            return f"{ts} 开始{kind}整理，仍在运行（/hermes 整理结果 看详情）"
-        state = "完成" if rep.get("ok") else "失败"
+            raw_prog = rep.get("progress") or {}
+            done, total = int(raw_prog.get("done") or 0), int(raw_prog.get("total") or 0)
+            prog = f"（{done}/{total} 个作用域）" if total else ""
+            return f"{ts} 开始{kind}整理，仍在运行{prog}（/hermes 整理结果 看详情）"
+        if rep.get("ok"):
+            state = "完成"
+        elif rep.get("interrupted"):
+            state = "被中断"
+        else:
+            state = "失败"
         return f"{ts} {kind}整理{state}（/hermes 整理结果 看详情）"
 
     async def _merge_skill_content(self, name: str, old_trigger: str,
@@ -1971,10 +2034,19 @@ class HermesCore(Star):
             return str(raw)[:1500]
         ts = time.strftime("%m-%d %H:%M", time.localtime(int(rep.get("ts") or 0)))
         kind = "深度整理" if rep.get("deep") else "普通整理"
+        raw_prog = rep.get("progress") or {}
+        done, total = int(raw_prog.get("done") or 0), int(raw_prog.get("total") or 0)
         if rep.get("running"):
-            return (f"[{kind}] {ts} 开始，仍在运行。\n"
+            prog = f"，已跑 {done}/{total} 个作用域" if total else ""
+            return (f"[{kind}] {ts} 开始，仍在运行{prog}。\n"
                     "模型链慢的时候可能要几分钟；跑完会主动推给你，也可以稍后再查。")
-        head = f"[{kind}] {ts} " + ("完成" if rep.get("ok") else "失败")
+        if rep.get("ok"):
+            state = "完成"
+        elif rep.get("interrupted"):
+            state = "被中断（后台退出）"
+        else:
+            state = "失败"
+        head = f"[{kind}] {ts} {state}"
         if rep.get("dry"):
             head += "（预览，未写入）"
         head += "｜结果推送：" + ("成功" if rep.get("pushed") else "未送达，就在本条")
