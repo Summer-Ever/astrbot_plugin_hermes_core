@@ -70,27 +70,6 @@ except ImportError:
         _db_spec.loader.exec_module(_db_mod)
         HermesDB = _db_mod.HermesDB
 
-# 渲染模块与 db 同层，复用同样的三级兜底
-try:
-    from .modules.render import RenderError, render_mermaid
-    from .modules.render import warmup as warmup_renderer
-except ImportError:
-    try:
-        from modules.render import RenderError, render_mermaid
-        from modules.render import warmup as warmup_renderer
-    except ImportError:
-        import importlib.util as _ilu2
-
-        _rd_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "modules", "render.py"
-        )
-        _rd_spec = _ilu2.spec_from_file_location("astrbot_plugin_hermes_core_render", _rd_file)
-        _rd_mod = _ilu2.module_from_spec(_rd_spec)
-        _rd_spec.loader.exec_module(_rd_mod)
-        RenderError = _rd_mod.RenderError
-        render_mermaid = _rd_mod.render_mermaid
-        warmup_renderer = _rd_mod.warmup
-
 # 模型路由：主模型 + 降级链 + 重试/错误分类，同样三级兜底
 try:
     from .modules.router import ModelRouter, ModelError, ERROR_LABELS
@@ -110,11 +89,6 @@ except ImportError:
         ModelError = _rt_mod.ModelError
         ERROR_LABELS = _rt_mod.ERROR_LABELS
 
-try:
-    from astrbot.api.message_components import Image
-except ImportError:
-    Image = None
-
 # 技能中枢：把本体装的只读技能和插件进化的个人技能合成一个视图，同样三级兜底
 try:
     from .modules.skill_hub import SkillHub, guess_data_root
@@ -133,13 +107,12 @@ except ImportError:
         SkillHub = _sh_mod.SkillHub
         guess_data_root = _sh_mod.guess_data_root
 
-PLUGIN_VERSION = "0.11.0"
+PLUGIN_VERSION = "0.12.0"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
     "list_skills(查看技能，分「我的技能」和「系统技能·只读」)、read_skill(读取技能全文)、"
-    "save_skill(把可复用流程存为我的技能)、update_skill(局部修改我的技能)、"
-    "render_mermaid(把 mermaid 图表渲染成 PNG 图片发到聊天)。"
+    "save_skill(把可复用流程存为我的技能)、update_skill(局部修改我的技能)。"
     "遇到值得长期记住的信息请主动 save_memory；完成复杂流程后可用 save_skill 沉淀方法。"
     "改技能一律走 update_skill 做局部替换，不要整份重写；"
     "系统技能是 AstrBot 本体装的、全局共享，插件不能写它，要改就基于它生成个人副本。"
@@ -227,7 +200,6 @@ class HermesCore(Star):
         # 所有总结/整理都走它：主模型失败自动降级，不依赖「当前对话模型」
         self.router = ModelRouter(self)
         self._bg_task: asyncio.Task | None = None
-        self._warm_task: asyncio.Task | None = None
         self._sum_lock = asyncio.Lock()
         self._resident_cache: dict[str, tuple[float, list[dict]]] = {}
         self._inject_guard: dict[str, float] = {}
@@ -247,18 +219,6 @@ class HermesCore(Star):
         self._register_web_apis()
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
-        # 渲染依赖（mermaid.min.js / puppeteer-core）放到后台预下载：
-        # 用户第一次要图时不用等几分钟，也不会阻塞事件循环。
-        if bool(self._get_cfg("render_warmup", True)):
-            self._warm_task = asyncio.create_task(self._warmup_renderer())
-
-    async def _warmup_renderer(self):
-        """后台预热渲染依赖。失败只提示，不影响插件其他功能。"""
-        try:
-            ok, err = await warmup_renderer(_default_data_dir())
-            logger.info(f"[hermes_core] 渲染依赖{'已就绪' if ok else '预热失败：' + err}")
-        except Exception:
-            logger.warning(f"[hermes_core] 渲染预热跳过:\n{traceback.format_exc(limit=2)}")
 
     def _register_web_apis(self):
         """把 WebUI 接口挂到 dashboard 上（页面见 views/hermes/）。
@@ -667,35 +627,6 @@ class HermesCore(Star):
             return (f"已修改：系统技能 {res['name']} 不能直接改，我基于它建了一份属于你的副本再改，"
                     f"以后你会优先读到这份，本体原版没动。")
         return f"技能 {res['name']} 已按你的要求局部更新，其余内容保持不变。"
-
-    @filter.llm_tool(name="render_mermaid")
-    async def tool_render_mermaid(self, event: AstrMessageEvent, code: str) -> str:
-        """把 mermaid 图表源码本地渲染为 PNG 并直接发送到当前聊天。当用户想要图、流程图、时序图、架构图等可视化内容时调用；不要使用 mermaid.ink 等外部渲染服务。
-        Args:
-            code (string): 完整的 mermaid 图表源码，第一行是图表类型声明，例如 "flowchart TD\\nA[开始] --> B[结束]"
-        """
-        if Image is None:
-            return "当前 AstrBot 版本缺少图片组件，无法发图。"
-        out = os.path.join(
-            _default_data_dir(), "renders",
-            f"m_{hashlib.md5(code.encode()).hexdigest()[:12]}.png",
-        )
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        try:
-            await render_mermaid(code, out, _default_data_dir())
-        except RenderError as e:
-            return f"渲染失败：{e}"
-        except Exception:
-            return f"渲染异常：{traceback.format_exc(limit=2)}"
-        if MessageChain is not None:
-            try:
-                await self.context.send_message(
-                    event.unified_msg_origin, MessageChain([Image.fromFileSystem(out)])
-                )
-                return "图片已发送。"
-            except Exception:
-                return f"渲染成功但自动发送失败，请改用 /hermes 图 命令。文件位于：{out}"
-        return f"渲染成功，文件位于：{out}"
 
     # ============ 后台总结循环（Hermes nudge）============
 
@@ -1466,34 +1397,6 @@ class HermesCore(Star):
             f.write(md)
         yield event.plain_result(f"已导出到插件数据目录 MEMORY.md（{len(md)} 字符）。")
 
-    @hermes.command("图")
-    async def hermes_graph(self, event: AstrMessageEvent, *, code: str = ""):
-        """/hermes 图 <mermaid 源码> —— 本地渲染并发图。也可直接让模型调 render_mermaid 工具。"""
-        if not code.strip():
-            yield event.plain_result(
-                "用法：/hermes 图 <mermaid源码>\n"
-                "示例：/hermes 图 flowchart TD\\n A[开始] --> B[结束]\n"
-                "更方便的方式：直接在对话里让我\"画个流程图\"，我会自动调用渲染工具。"
-            )
-            return
-        if Image is None:
-            yield event.plain_result("当前 AstrBot 版本缺少图片组件，无法发图。")
-            return
-        code = code.replace("\\n", "\n")
-        out = os.path.join(
-            _default_data_dir(), "renders",
-            f"m_{hashlib.md5(code.encode()).hexdigest()[:12]}.png",
-        )
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        yield event.plain_result("正在本地渲染图表……")
-        try:
-            await render_mermaid(code, out, _default_data_dir())
-            yield event.chain([Image.fromFileSystem(out)])
-        except RenderError as e:
-            yield event.plain_result(f"渲染失败：{e}")
-        except Exception:
-            yield event.plain_result(f"渲染异常：{traceback.format_exc(limit=2)}")
-
     # ============ 接管系统级记忆 ============
 
     @hermes.command("导入历史")
@@ -1662,9 +1565,8 @@ class HermesCore(Star):
             f"下一次对话会照常召回。")
 
     async def terminate(self):
-        for task in (self._bg_task, self._warm_task):
-            if task and not task.done():
-                task.cancel()
+        if self._bg_task and not self._bg_task.done():
+            self._bg_task.cancel()
         self._flush_metrics()
         self.db.close()
         logger.info("[hermes_core] 已卸载")
