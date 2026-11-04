@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.14"
+PLUGIN_VERSION = "0.12.15"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -314,6 +314,8 @@ class HermesCore(Star):
         self._migrate_watermarks()
         self._check_memory_conflicts()
         self._recover_interrupted_job()
+        # 必须在任何模型调用之前：把「跟随当前对话模型」的老配置固化成显式快照
+        await self._detach_model_chain()
         try:
             n = self.router.load_cooldowns()
             if n:
@@ -401,6 +403,85 @@ class HermesCore(Star):
             self.db.set_meta("watermark_migrated", "1")
         except Exception:
             logger.error(f"[hermes_core] 水位迁移失败:\n{traceback.format_exc()}")
+
+    def _astrbot_model_cfg(self) -> dict:
+        """读 AstrBot 主体「对话模型 / 降级模型」设置。
+
+        只在两个地方用：首次升级时做一次性快照，以及页面上给「沿用」按钮做参考。
+        运行时的模型链绝不读它——见 _detach_model_chain 与 router.effective_chain。
+        """
+        try:
+            acm = self.context.astrbot_config_mgr
+            cfg = acm.confs["default"]
+            ar = cfg.get("agent_runner", {}) or {}
+            if ar.get("runner_type") != "local":
+                return {"primary": "", "fallbacks": [], "source": "非 local 运行器，无此配置"}
+            model = (ar.get("config") or {}).get("model") or {}
+            return {
+                "primary": str(model.get("provider_id") or ""),
+                "fallbacks": [str(x) for x in (model.get("fallback_provider_ids") or [])],
+                "max_retries": model.get("request_max_retries"),
+                "source": "AstrBot 对话配置",
+            }
+        except Exception:
+            return {"primary": "", "fallbacks": [], "source": ""}
+
+    async def _detach_model_chain(self) -> None:
+        """把总结模型从 AstrBot 主体设置里摘出来：一次性快照，之后永不跟随。
+
+        旧行为：`llm_primary_provider` 留空就每次调用时读 context.get_using_provider()，
+        用户在主体里换对话模型，后台总结与深度整理会跟着换。记忆是长期数据，
+        归纳风格、上下文预算、调用成本都会无声漂移，事后无法归因。
+
+        新行为：运行时只认插件配置。首次升级（配置为空）时把当下的对话模型
+        快照写进插件配置，等于替用户做一次「确认」，此后主体怎么改都无关。
+        """
+        if self.config is None:
+            return
+        try:
+            configured = str(self.config.get("llm_primary_provider", "") or "").strip()
+        except Exception:
+            return
+        if configured:
+            return  # 已经显式选过，天然解耦
+
+        ast = self._astrbot_model_cfg()
+        pid = (ast.get("primary") or "").strip() or self.router.current_provider_id()
+        if not pid:
+            logger.warning(
+                "[hermes_core] 插件未设置总结模型，AstrBot 也没有可用的对话模型；"
+                "请到 Hermes →「模型」页选择主模型")
+            return
+
+        known = {p["id"]: p for p in self.router.all_providers()}
+        if pid not in known:
+            logger.warning(
+                f"[hermes_core] 无法快照总结模型：{pid} 不在 AstrBot 的模型列表里；"
+                "请到 Hermes →「模型」页手动选择")
+            return
+
+        snap: dict = {"llm_primary_provider": pid}
+        # 降级链也快照一份（只在插件里本来就空的时候）：主体有降级而插件没有，
+        # 主模型一挂就是整批失败，这比"多几条降级"危险得多。
+        fbs = [x for x in (ast.get("fallbacks") or [])
+               if x in known and x != pid]
+        if fbs and not self.router.configured_fallbacks():
+            snap["llm_fallback_providers"] = fbs[:10]
+
+        try:
+            self.config.update(snap)
+            save = getattr(self.config, "save_config_async", None)
+            if callable(save):
+                await save()
+            else:
+                self.config.save_config()
+            logger.info(
+                f"[hermes_core] 总结模型已与 AstrBot 主体设置解耦：主模型快照为 {pid}"
+                f"（降级 {', '.join(snap.get('llm_fallback_providers') or []) or '无'}）。"
+                "此后在主体里更改对话模型不会再影响本插件")
+        except Exception:
+            # 内存里已经 update 生效，本次运行仍然解耦；只是重启后会再快照一次。
+            logger.error(f"[hermes_core] 保存模型快照失败:\n{traceback.format_exc(limit=3)}")
 
     def _get_cfg(self, key: str, default):
         if self.config is None:
@@ -1235,8 +1316,8 @@ class HermesCore(Star):
         "全局凑够 8 条"导致的低频会话永远不总结、以及跨会话打包串味。
         """
         if not self.router.has_model():
-            return ("没有可用的对话模型：请先在 AstrBot 里配置模型提供商，"
-                    "再到插件页面「模型」标签选择总结模型。")
+            return ("本插件还没设置总结模型（它不跟随 AstrBot 主体的对话模型）："
+                    "请到 Hermes 插件页「模型」标签选择主模型。")
 
         min_new = max(1, int(self._get_cfg("min_new_messages", 8)))
         grace_h = float(self._get_cfg("summarize_grace_hours", 6))
@@ -2388,7 +2469,7 @@ class HermesCore(Star):
             yield event.plain_result(self._consolidate_report_text())
             return
         if not self.router.has_model():
-            yield event.plain_result("没有可用的对话模型，请先在插件页面「模型」标签配置。")
+            yield event.plain_result("本插件还没设置总结模型，请先到插件页「模型」标签选择主模型。")
             return
         deep = any(k in mode.lower() for k in ("深度", "deep", "彻底"))
         dry = any(k in mode.lower() for k in ("预览", "试运行", "dry", "dry-run"))
@@ -2453,7 +2534,7 @@ class HermesCore(Star):
             yield event.plain_result(self._deny_admin(event, "技能整理"))
             return
         if not self.router.has_model():
-            yield event.plain_result("没有可用的对话模型，请先在插件页面「模型」标签配置。")
+            yield event.plain_result("本插件还没设置总结模型，请先到插件页「模型」标签选择主模型。")
             return
         dry = mode.strip() in ("预览", "试运行", "dry", "dry-run")
         yield event.plain_result("正在检查技能重叠情况……")

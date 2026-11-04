@@ -172,8 +172,10 @@ class HermesWebAPI:
             chain = [e["id"] for e in router.effective_chain(ignore_cooldown=True)]
             logs = router.logs(20)
             return {
-                "primary": primary or router.current_provider_id(),
-                "follow_current": not primary,
+                # 只报插件自己配的主模型。以前这里是 `primary or current_provider_id()`，
+                # 概览页会把 AstrBot 的对话模型显示成"总结模型"，掩盖了实际没配置这件事。
+                "primary": primary,
+                "detached": True,
                 "chain": chain,
                 "last_used": getattr(router, "_last_used", ""),
                 "recent_fail": sum(1 for x in logs if not x["ok"]),
@@ -611,7 +613,7 @@ class HermesWebAPI:
 
     async def action_summarize(self):
         if not self.plugin.router.has_model():
-            return self._fail("没有可用的对话模型，请先在「模型」标签配置主模型")
+            return self._fail("本插件还没设置总结模型，请先在「模型」标签选择主模型")
         result = await self.plugin._summarize(force=True)
         return json_response({"result": result})
 
@@ -619,7 +621,7 @@ class HermesWebAPI:
         data = await self._body()
         dry = bool(data.get("dry_run"))
         if not self.plugin.router.has_model():
-            return self._fail("没有可用的对话模型，请先在「模型」标签配置主模型")
+            return self._fail("本插件还没设置总结模型，请先在「模型」标签选择主模型")
         result = await self.plugin._consolidate_memories(dry_run=dry)
         if not dry:
             self.plugin._reset_memory_queue()
@@ -629,7 +631,7 @@ class HermesWebAPI:
         data = await self._body()
         dry = bool(data.get("dry_run"))
         if not self.plugin.router.has_model():
-            return self._fail("没有可用的对话模型，请先在「模型」标签配置主模型")
+            return self._fail("本插件还没设置总结模型，请先在「模型」标签选择主模型")
         result = await self.plugin._consolidate_skills(dry_run=dry)
         if not dry:
             self.plugin.db.set_meta("skill_consolidate_pending", "0")
@@ -686,7 +688,17 @@ class HermesWebAPI:
     }
 
     def _astrbot_chain(self) -> dict:
-        """读 AstrBot 主体「对话模型 / 降级模型」配置，供页面一键沿用。"""
+        """读 AstrBot 主体「对话模型 / 降级模型」配置，仅供页面「沿用」按钮参考。
+
+        插件运行时的模型链不读这里：主体改对话模型不会影响本插件，
+        只有用户主动点「沿用 AstrBot 对话配置」才会把这份值写进插件配置。
+        """
+        getter = getattr(self.plugin, "_astrbot_model_cfg", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return {"primary": "", "fallbacks": [], "source": ""}
         try:
             acm = self.plugin.context.astrbot_config_mgr
             cfg = acm.confs["default"]

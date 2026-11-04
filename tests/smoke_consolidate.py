@@ -260,9 +260,80 @@ async def case_footer(tmp: str) -> None:
     check("多模型落款以 > 开头", txt.startswith("> "))
 
 
+class FakeConfig(dict):
+    """够用的配置对象：dict 语义 + 异步保存。"""
+
+    def __init__(self, data=None):
+        super().__init__(data or {})
+        self.saves = 0
+
+    async def save_config_async(self):
+        self.saves += 1
+
+
+class StubRouter:
+    """_detach_model_chain 只用到这三个方法。"""
+
+    def __init__(self, current="", known=("a", "b"), fallbacks=()):
+        self.current = current
+        self.known = list(known)
+        self.fallbacks = list(fallbacks)
+
+    def current_provider_id(self) -> str:
+        return self.current
+
+    def configured_fallbacks(self) -> list:
+        return list(self.fallbacks)
+
+    def all_providers(self) -> list:
+        return [{"id": p, "loaded": True} for p in self.known]
+
+
+def _detach_core(cfg: dict, astrbot_chain: dict, router: StubRouter):
+    obj = m.HermesCore.__new__(m.HermesCore)
+    obj.config = FakeConfig(cfg)
+    model = {"provider_id": astrbot_chain.get("primary", ""),
+             "fallback_provider_ids": astrbot_chain.get("fallbacks", [])}
+    obj.context = types.SimpleNamespace(astrbot_config_mgr=types.SimpleNamespace(
+        confs={"default": {"agent_runner": {"runner_type": "local",
+                                            "config": {"model": model}}}}))
+    obj.router = router
+    return obj
+
+
+async def case_detach(tmp: str) -> None:
+    """主模型/降级链必须与 AstrBot 主体设置解耦。
+
+    旧逻辑留空就每次读 get_using_provider()：主体换对话模型，后台总结跟着换。
+    现在首次启动把当时的模型快照写进插件配置，之后主体怎么改都无关。
+    """
+    # 1) 空配置 → 快照一次，主模型与降级链都固化
+    core = _detach_core({}, {"primary": "b", "fallbacks": ["a"]}, StubRouter("b"))
+    await core._detach_model_chain()
+    check("留空时快照主模型", core.config.get("llm_primary_provider") == "b",
+          str(core.config))
+    check("留空时快照降级链", core.config.get("llm_fallback_providers") == ["a"],
+          str(core.config.get("llm_fallback_providers")))
+    check("快照落盘一次", core.config.saves == 1, str(core.config.saves))
+
+    # 2) 已显式配置 → 一个字都不动，也不写盘
+    core = _detach_core({"llm_primary_provider": "a", "llm_fallback_providers": []},
+                        {"primary": "b", "fallbacks": ["b"]}, StubRouter("b"))
+    await core._detach_model_chain()
+    check("已配置时不被主体覆盖", core.config["llm_primary_provider"] == "a",
+          core.config["llm_primary_provider"])
+    check("已配置时不再写盘", core.config.saves == 0, str(core.config.saves))
+
+    # 3) 主体也没模型 → 不写空值，交给页面提示
+    core = _detach_core({}, {"primary": "", "fallbacks": []}, StubRouter(""))
+    await core._detach_model_chain()
+    check("主体无模型时不写空配置", "llm_primary_provider" not in core.config,
+          str(core.config))
+
+
 async def main() -> int:
     for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
-               case_merge, case_visibility, case_mutex, case_footer):
+               case_merge, case_visibility, case_mutex, case_detach, case_footer):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:
             await fn(tmp)

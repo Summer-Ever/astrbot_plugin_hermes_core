@@ -289,7 +289,7 @@
         const m = d.models || {};
         if (!m.primary) return '<span class="chip warn">未配置</span>';
         const extra = (m.chain || []).length - 1;
-        return `${esc(m.primary)}${m.follow_current ? ' <span class="faint">（跟随对话）</span>' : ""}`
+        return `${esc(m.primary)}`
           + (extra > 0 ? ` <span class="faint">· ${extra} 个降级</span>` : "");
       })()],
       ["代码校验", `<span class="mono faint">${esc(d.code_hash || "—")}</span>`],
@@ -924,8 +924,8 @@
     const usable = list.filter((p) => p.loaded);
     const cur = d.current_id || "";
 
-    // 主模型下拉：留空 = 跟随当前对话模型
-    const opts = [`<option value="">跟随当前对话模型${cur ? `（${esc(cur)}）` : "（未配置）"}</option>`];
+    // 主模型下拉：必须显式选择。留空 = 插件不调用模型（不再跟随主体设置）
+    const opts = ['<option value="">未选择（本插件不调用模型）</option>'];
     list.forEach((p) => {
       const label = `${p.id}${p.model && p.model !== p.id ? ` · ${p.model}` : ""}`;
       const tail = [ctxText(p.context_tokens), p.loaded ? "" : "未启用", p.id === cur ? "当前对话" : ""]
@@ -936,10 +936,13 @@
       opts.push(`<option value="${esc(draft.primary)}" selected>${esc(draft.primary)}（不在当前列表）</option>`);
     }
     $("#model-primary").innerHTML = opts.join("");
-    $("#model-current-chip").textContent = cur ? `对话模型：${cur}` : "未配置对话模型";
+    $("#model-current-chip").textContent = cur
+      ? `AstrBot 对话模型：${cur}（与本插件无关）`
+      : "AstrBot 未配置对话模型";
     $("#model-primary-hint").textContent = draft.primary
       ? `总结优先用 ${draft.primary}；它失败时按下方降级链继续`
-      : "留空表示跟随 AstrBot 当前对话模型（对话模型一换，总结模型也跟着换）";
+      : "留空则本插件不做任何总结与整理。这里与 AstrBot 主体的对话模型设置完全独立，"
+        + "在主体里换模型不会影响本插件";
 
     // 降级链
     const chain = draft.fallbacks;
@@ -1109,7 +1112,12 @@
         policy: draft.policy,
       });
       state.models.dirty = false;
-      toast(`已保存：${(r.chain || []).join(" → ") || "无可用模型"}`);
+      if (!draft.primary) {
+        // 留空等于停掉所有总结与整理，保存成功也要说清楚，不然只是"静默失忆"
+        toast("已保存，但没有选主模型：本插件不会做任何总结与整理", "err");
+      } else {
+        toast(`已保存：${(r.chain || []).join(" → ") || "无可用模型"}`);
+      }
       await loadModels();
     } catch (err) {
       toast(`保存失败：${errMsg(err)}`, "err");
@@ -1383,14 +1391,14 @@
     $("#model-test-primary").addEventListener("click", (e) => {
       const d = state.models;
       if (!d.data) return;
-      const pid = d.draft.primary || d.data.current_id;
-      if (!pid) { toast("还没有可测试的主模型", "err"); return; }
+      const pid = d.draft.primary;
+      if (!pid) { toast("还没有选主模型", "err"); return; }
       testModels([pid], e.currentTarget);
     });
     $("#model-test-chain").addEventListener("click", (e) => {
       const d = state.models;
       if (!d.data) return;
-      const ids = [d.draft.primary || d.data.current_id, ...d.draft.fallbacks].filter(Boolean);
+      const ids = [d.draft.primary, ...d.draft.fallbacks].filter(Boolean);
       if (!ids.length) { toast("链里还没有模型", "err"); return; }
       testModels(ids, e.currentTarget);
     });

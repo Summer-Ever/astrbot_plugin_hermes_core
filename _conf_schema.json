@@ -187,14 +187,14 @@
     "llm_primary_provider": {
         "type": "string",
         "default": "",
-        "description": "总结时优先使用的模型（填 AstrBot 里的 provider ID，留空 = 跟随当前对话模型）",
-        "hint": "推荐在插件页面「模型」标签里选，那里能看到全部模型的上下文长度和连通性"
+        "description": "总结与整理使用的主模型（填 AstrBot 里的 provider ID）。不跟随 AstrBot 主体的对话模型设置，留空 = 插件不调用模型",
+        "hint": "与主体设置解耦：主体里换对话模型不会改变这里。记忆是长期数据，模型换掉会让归纳风格与成本无声漂移，因此必须显式指定。推荐在插件页「模型」标签选择"
     },
     "llm_fallback_providers": {
         "type": "list",
         "default": [],
-        "description": "降级模型，按顺序尝试（主模型失败后依次使用）",
-        "hint": "最多 10 个；同样建议用「模型」页维护，支持上下移动排序"
+        "description": "降级模型，按顺序尝试（主模型失败后依次使用）。与 AstrBot 主体的降级链无关",
+        "hint": "最多 10 个；建议用「模型」页维护，支持上下移动排序"
     },
     "llm_max_retries": {
         "type": "int",

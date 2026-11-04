@@ -70,9 +70,10 @@ class FakeProvider:
 
 
 class FakePlugin:
-    def __init__(self, providers: dict, cfg: dict):
+    def __init__(self, providers: dict, cfg: dict, current=None):
         self.cfg = cfg
         self.db = None
+        self.current = current  # 模拟 AstrBot 主体的「当前对话模型」
         self.context = types.SimpleNamespace(
             provider_manager=types.SimpleNamespace(
                 inst_map=providers,
@@ -82,14 +83,14 @@ class FakePlugin:
                     for p in providers
                 ],
             ),
-            get_using_provider=lambda: None,
+            get_using_provider=lambda: self.current,
         )
 
     def _get_cfg(self, key, default=None):
         return self.cfg.get(key, default)
 
 
-def make_router(cfg: dict, providers: dict) -> ModelRouter:
+def make_router(cfg: dict, providers: dict, current=None) -> ModelRouter:
     base = {
         "llm_primary_provider": next(iter(providers)),
         "llm_fallback_providers": list(providers)[1:],
@@ -102,7 +103,59 @@ def make_router(cfg: dict, providers: dict) -> ModelRouter:
         "llm_min_interval": 0.0,
     }
     base.update(cfg)
-    return ModelRouter(FakePlugin(providers, base))
+    return ModelRouter(FakePlugin(providers, base, current))
+
+
+async def case_decoupled() -> None:
+    """主模型必须只认插件配置，绝不跟随 AstrBot 主体的对话模型。
+
+    记忆是长期数据：主体里换个对话模型，后台总结与深度整理如果跟着换，
+    归纳风格、上下文预算、调用成本都会无声漂移，事后无法归因。
+    """
+    a, b = FakeProvider("a"), FakeProvider("b")
+    provs = {"a": a, "b": b}
+
+    # 1) 插件没配主模型：即使主体有当前对话模型，也不许回退过去
+    r = make_router({"llm_primary_provider": "", "llm_fallback_providers": []},
+                    provs, current=b)
+    check("未配置主模型时不跟随主体", r.effective_chain() == [],
+          str([e["id"] for e in r.effective_chain()]))
+    try:
+        await r.chat("hi", purpose="测试")
+        check("未配置应拒绝调用", False, "竟然调通了")
+    except ModelError as exc:
+        check("未配置时错误类型", exc.kind == "no_provider", exc.kind)
+        check("报错指向插件模型页", "模型" in str(exc) and "AstrBot" in str(exc), str(exc))
+    check("未配置时没打到任何模型", not a.calls and not b.calls, str((a.calls, b.calls)))
+
+    # 2) 显式配了主模型：主模型改为谁都不影响链路
+    r2 = make_router({"llm_primary_provider": "a", "llm_fallback_providers": ["b"]},
+                     provs, current=b)
+    check("显式配置后链固定", [e["id"] for e in r2.effective_chain()] == ["a", "b"],
+          str([e["id"] for e in r2.effective_chain()]))
+    r2.plugin.current = a  # 用户在主体里换对话模型
+    check("主体换模型不影响链路",
+          [e["id"] for e in r2.effective_chain()] == ["a", "b"],
+          str([e["id"] for e in r2.effective_chain()]))
+    r2.plugin.current = None
+    check("主体关掉对话模型也不影响链路",
+          [e["id"] for e in r2.effective_chain()] == ["a", "b"],
+          str([e["id"] for e in r2.effective_chain()]))
+
+    # 3) 真的跑一次，落款必须是插件配的主模型
+    await r2.chat("hi", purpose="测试")
+    check("调用走插件主模型", a.calls and not b.calls, str((len(a.calls), len(b.calls))))
+    check("落款标注主模型", "（主模型）" in r2.footer(), r2.footer())
+
+    # 4) 解耦之后的新故障形态：主体里把选中的 provider 删了/停用了
+    r3 = make_router({"llm_primary_provider": "gone", "llm_fallback_providers": []},
+                     provs, current=a)
+    try:
+        await r3.chat("hi", purpose="测试")
+        check("选中的模型不存在时应报错", False, "竟然调通了")
+    except ModelError as exc:
+        check("报错点名缺失的模型", "gone" in str(exc), str(exc))
+        check("报错说明不跟随主体", "不跟随" in str(exc), str(exc))
 
 
 async def case_interval() -> None:
@@ -230,7 +283,8 @@ async def case_soft_deadline() -> None:
 async def main() -> int:
     for fn in (case_interval, case_rpm_deadline, case_rate_no_retry,
                case_rate_cooldown, case_retry_after_parse, case_deadline_stop,
-               case_all_cooling, case_cooldown_floor, case_soft_deadline):
+               case_all_cooling, case_cooldown_floor, case_soft_deadline,
+               case_decoupled):
         try:
             await fn()
         except Exception as exc:

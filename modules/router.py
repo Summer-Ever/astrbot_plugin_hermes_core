@@ -436,7 +436,11 @@ class ModelRouter:
         """
         configs = self._configs()
         insts = self._insts()
-        primary = self.configured_primary() or self.current_provider_id()
+        # 主模型只认插件自己的配置，绝不回退到 AstrBot 的「当前对话模型」。
+        # 回退会造成静默漂移：用户在主体里换个对话模型，后台总结与深度整理的
+        # 归纳风格、上下文预算、调用成本全跟着变，而记忆是长期数据，
+        # 换模型前后的条目质量不一致，事后根本查不出是哪次换的。
+        primary = self.configured_primary()
         wanted: list[str] = []
         if primary:
             wanted.append(primary)
@@ -642,9 +646,19 @@ class ModelRouter:
                                  "所有模型都在限流/失败冷却中，先不调用以免加重风控："
                                  + "；".join(f"{s['id']} {s['reason']}"
                                             for s in self._last_skipped[:3]))
+            if self._last_skipped:
+                # 解耦之后这条路径会真的出现：用户在 AstrBot 主体里删掉/停用了
+                # 本插件选中的 provider。必须把 provider ID 打出来，否则只会看到
+                # 「没有可用模型」，根本想不到是主体那边动了模型列表。
+                raise ModelError("no_provider",
+                                 "本插件选定的总结模型不可用："
+                                 + "；".join(f"{s['id']} {s['reason']}"
+                                            for s in self._last_skipped[:3])
+                                 + "。请到 Hermes 插件页「模型」重新选择"
+                                 "（本插件不跟随 AstrBot 主体的对话模型设置）。")
             raise ModelError("no_provider",
-                             "没有可用的对话模型：请先在 AstrBot 配置模型提供商，"
-                             "再到本页选择总结模型。")
+                             "本插件没有可用的总结模型：请到 AstrBot 的 Hermes 插件页 →"
+                             "「模型」选择主模型（本插件不跟随 AstrBot 主体的对话模型设置）。")
 
         per_model = pol["max_retries"] + 1
         total_cap = pol["total_attempts"]
