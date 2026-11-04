@@ -86,6 +86,7 @@ class HermesWebAPI:
             (f"{self.prefix}/memories", self.memories, ["GET"], "记忆列表（筛选+分页）"),
             (f"{self.prefix}/memories/add", self.memory_add, ["POST"], "新增记忆"),
             (f"{self.prefix}/memories/update", self.memory_update, ["POST"], "修改记忆"),
+            (f"{self.prefix}/memories/pin", self.memory_pin, ["POST"], "钉住/取消钉住记忆（常驻保护）"),
             (f"{self.prefix}/memories/delete", self.memory_delete, ["POST"], "删除记忆"),
             (f"{self.prefix}/memories/merge", self.memory_merge, ["POST"], "合并多条记忆"),
             (f"{self.prefix}/skills", self.skills, ["GET"], "技能列表（含正文）"),
@@ -294,6 +295,19 @@ class HermesWebAPI:
         if not ok:
             return self._fail("记忆不存在或没有改动", 404)
         return json_response({"id": mid, "record": self.plugin.db.memory_by_id(mid)})
+
+    async def memory_pin(self):
+        data = await self._body()
+        try:
+            mid = int(data.get("id"))
+        except (TypeError, ValueError):
+            return self._fail("缺少记忆 id")
+        pinned = bool(data.get("pinned"))
+        ok = self.plugin.db.set_pinned(mid, pinned)
+        if not ok:
+            return self._fail("记忆不存在或已失效", 404)
+        self.plugin._resident_cache.clear()
+        return json_response({"id": mid, "pinned": pinned})
 
     async def memory_delete(self):
         data = await self._body()

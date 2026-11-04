@@ -78,7 +78,7 @@ def main() -> int:
     check("fact 仍可被检索", any("i5-1240P" in m["content"] for m in fact_hits))
 
     # 丢弃：退出活跃池，检索与常驻都看不到，可恢复
-    did = db.add_memory("preference", "临时指令条目", owner_id="u1")[0]
+    did = db.add_memory("preference", "临时指令条目", owner_id="u1")
     check("discard 生效", db.discard_memories([did]) == 1)
     check("丢弃后检索不到", all(m["id"] != did for m in
                                 db.search_memories("临时指令", owner_id="u1", limit=5)))
@@ -86,6 +86,16 @@ def main() -> int:
     n_active = db.conn.execute(
         "SELECT COUNT(*) c FROM memories WHERE id=? AND merged_into=-1", (did,)).fetchone()["c"]
     check("丢弃是软删（保留原文）", n_active == 1)
+
+    # pinned：钉住条目必进常驻（哪怕 fact）、不受预算挤出、拒绝被丢弃
+    pid = db.add_memory("fact", "关键约束：部署必须使用内网镜像源", owner_id="u1")
+    check("钉住前 fact 不进常驻", all(n["id"] != pid for n in db.resident_notes("u1", limit=10)))
+    check("set_pinned 生效", db.set_pinned(pid, True) is True)
+    notes3 = db.resident_notes("u1", limit=10, max_chars=10)  # 预算压到 10 字
+    check("钉住条目必进常驻且不受预算限制", any(n["id"] == pid for n in notes3))
+    check("钉住条目拒绝丢弃", db.discard_memories([pid]) == 0)
+    check("取消钉住", db.set_pinned(pid, False) is True)
+    check("取消后恢复预算约束", all(n["id"] != pid for n in db.resident_notes("u1", limit=10, max_chars=10)))
 
     ids = [n["id"] for n in notes]
     if ids:

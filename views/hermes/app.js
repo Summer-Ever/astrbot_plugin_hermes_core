@@ -385,17 +385,19 @@
         ? `<span class="mono" title="${esc(r.owner_id)}">${esc(String(r.owner_id).slice(0, 14))}</span>`
         : (r.group_id ? `<span class="muted">群 ${esc(String(r.group_id).slice(0, 10))}</span>` : '<span class="faint">全局</span>');
       const mergedChip = Number(r.merged_into) ? ' <span class="chip">已合并</span>' : "";
+      const pinChip = Number(r.pinned) ? ' <span class="chip warn" title="钉住：每轮必注入，整理时不可合并/丢弃">钉住</span>' : "";
       return `
         <tr data-id="${r.id}">
           <td><input type="checkbox" class="checkbox mem-check" data-id="${r.id}" ${m.selected.has(r.id) ? "checked" : ""}></td>
           <td class="mono faint">${r.id}</td>
           <td><span class="chip blue">${esc(KIND_LABEL[r.kind] || r.kind)}</span></td>
-          <td class="content"><div class="text">${esc(r.content)}</div>${mergedChip}</td>
+          <td class="content"><div class="text">${esc(r.content)}</div>${mergedChip}${pinChip}</td>
           <td>${owner}</td>
           <td><span class="chip">${esc(r.source || "—")}</span></td>
           <td class="nowrap muted">${fmtTime(r.ts)}</td>
           <td>
             <div class="ops">
+              <button class="btn tiny ghost" data-mem-pin="${r.id}" data-pinned="${Number(r.pinned) ? 1 : 0}">${Number(r.pinned) ? "取消钉住" : "钉住"}</button>
               <button class="btn tiny ghost" data-mem-edit="${r.id}">编辑</button>
               <button class="btn tiny danger" data-mem-del="${r.id}">删除</button>
             </div>
@@ -1213,6 +1215,17 @@
       if (edit) {
         const rec = state.mem.rows.find((r) => r.id === Number(edit.dataset.memEdit));
         if (rec) editMemoryModal(rec);
+        return;
+      }
+      const pinBtn = e.target.closest("[data-mem-pin]");
+      if (pinBtn) {
+        const id = Number(pinBtn.dataset.memPin);
+        const pinned = pinBtn.dataset.pinned === "1";
+        try {
+          await apiPost("memories/pin", { id, pinned: !pinned });
+          toast(pinned ? "已取消钉住" : "已钉住：每轮必注入");
+          loadMemories();
+        } catch (_) { /* 错误已由 apiPost 提示 */ }
         return;
       }
       const del = e.target.closest("[data-mem-del]");

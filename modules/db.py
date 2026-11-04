@@ -167,6 +167,8 @@ class HermesDB:
             "ALTER TABLE memories ADD COLUMN hits INTEGER DEFAULT 0",
             "ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0",
             "ALTER TABLE memories ADD COLUMN last_hit_ts REAL DEFAULT 0",
+            # v0.12.4：重要信息保护。pinned=1 的条目必进常驻注入，整理时不可合并/丢弃
+            "ALTER TABLE memories ADD COLUMN pinned INTEGER DEFAULT 0",
         ):
             try:
                 c.execute(ddl)
@@ -577,10 +579,18 @@ class HermesDB:
         if not owner_id:
             return []
         marks = _ph(len(kinds))
+        # 第一批：钉住的条目（任何 kind）——用户/模型明确要求「每轮必带」的信息，
+        # 不受 kind 限制，也不受字符预算限制，这是重要信息的保护通道。
+        pinned_rows = self.conn.execute(
+            "SELECT id, kind, content, importance, hits, pinned FROM memories"
+            " WHERE merged_into = 0 AND owner_id = ? AND pinned = 1"
+            " ORDER BY id DESC LIMIT ?",
+            (owner_id, max(1, int(limit))),
+        ).fetchall()
+        # 第二批：画像/偏好优先于一次性事实，按重要度与命中次数排序
         rows = self.conn.execute(
-            f"SELECT id, kind, content, importance, hits FROM memories"
-            f" WHERE merged_into = 0 AND owner_id = ? AND kind IN ({marks})"
-            # 画像/偏好优先于一次性事实：常驻区块就那么点预算，先放「这个人是谁」
+            f"SELECT id, kind, content, importance, hits, pinned FROM memories"
+            f" WHERE merged_into = 0 AND owner_id = ? AND pinned = 0 AND kind IN ({marks})"
             f" ORDER BY CASE kind WHEN 'profile' THEN 0 WHEN 'preference' THEN 1 ELSE 2 END,"
             f" COALESCE(importance, 0) DESC, COALESCE(hits, 0) DESC, id DESC"
             f" LIMIT ?",
@@ -588,7 +598,17 @@ class HermesDB:
         ).fetchall()
         out: list[dict] = []
         used = 0
-        for r in rows:
+        seen: set[int] = set()
+        for r in pinned_rows:      # 钉住条目先入，预算不约束
+            text = str(r["content"] or "").strip()
+            if not text:
+                continue
+            out.append(dict(r))
+            seen.add(int(r["id"]))
+            used += len(text) + 3
+        for r in rows:             # 其余条目受字符预算约束
+            if int(r["id"]) in seen:
+                continue
             text = str(r["content"] or "").strip()
             if not text:
                 continue
@@ -615,6 +635,15 @@ class HermesDB:
             "SELECT * FROM memories WHERE id = ?", (memory_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def set_pinned(self, memory_id: int, pinned: bool) -> bool:
+        """钉住/取消钉住一条记忆。钉住的条目：必进常驻注入，整理时不可合并或丢弃。"""
+        cur = self.conn.execute(
+            "UPDATE memories SET pinned = ?, updated_ts = ? WHERE id = ? AND merged_into = 0",
+            (1 if pinned else 0, time.time(), int(memory_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def merge_memories(self, ids: list[int], content: str, kind: str = "") -> int:
         """把一组记忆合成一条新的，旧条只标记 merged_into 指向新条（不物理删除）。
@@ -666,6 +695,7 @@ class HermesDB:
 
         深度整理用：一次性任务指令、闲聊反馈、技能清单这类「不该进长期记忆」
         的条目无法与任何东西合并，只能整体退出活跃池。
+        钉住的条目拒绝丢弃——那是用户明确要求保护的重要信息。
         """
         ids = [int(i) for i in ids if i]
         if not ids:
@@ -674,7 +704,7 @@ class HermesDB:
             marks = _ph(len(ids))
             cur = self.conn.execute(
                 f"UPDATE memories SET merged_into = -1, updated_ts = ?"
-                f" WHERE id IN ({marks}) AND merged_into = 0",
+                f" WHERE id IN ({marks}) AND merged_into = 0 AND pinned = 0",
                 (time.time(), *ids),
             )
             self.conn.commit()

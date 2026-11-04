@@ -126,13 +126,15 @@ except ImportError:
         filter_in_window = _rc_mod.filter_in_window
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.3"
+PLUGIN_VERSION = "0.12.4"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
+    "pin_memory(钉住重要记忆，钉住后每轮必定注入且不会被整理丢弃)、"
     "list_skills(查看技能，分「我的技能」和「系统技能·只读」)、read_skill(读取技能全文)、"
     "save_skill(把可复用流程存为我的技能)、update_skill(局部修改我的技能)。"
-    "遇到值得长期记住的信息请主动 save_memory；完成复杂流程后可用 save_skill 沉淀方法。"
+    "遇到值得长期记住的信息请主动 save_memory；用户明确说「必须一直记住」时先保存再 pin_memory 钉住；"
+    "完成复杂流程后可用 save_skill 沉淀方法。"
     "改技能一律走 update_skill 做局部替换，不要整份重写；"
     "系统技能是 AstrBot 本体装的、全局共享，插件不能写它，要改就基于它生成个人副本。"
 )
@@ -433,7 +435,8 @@ class HermesCore(Star):
         resident = self._resident_block(owner_id)
         if resident:
             lines.append("[关于这位用户（长期稳定信息）]")
-            lines.extend(f"- ({r['kind']}) {r['content']}" for r in resident)
+            # 带 #编号：模型可以据此调用 pin_memory（钉住重要信息）等管理工具
+            lines.extend(f"- #{r['id']} ({r['kind']}) {r['content']}" for r in resident)
 
         # 第二层：按当前这句话检索相关记忆（用户 > 群 > 全局逐级补）
         if scope == "user":
@@ -452,7 +455,7 @@ class HermesCore(Star):
             self._bump_metric("recall_mem_suppressed", raw_mem - len(memories))
         if memories:
             lines.append("[长期记忆参考]")
-            lines += [f"- ({m['kind']}) {m['content']}" for m in memories]
+            lines += [f"- #{m['id']} ({m['kind']}) {m['content']}" for m in memories]
             self._bump_metric("recall_memories", len(memories))
             for m in memories:
                 state["seen"][int(m["id"])] = state["turn"]
@@ -572,18 +575,41 @@ class HermesCore(Star):
         msgs = self.db.search_messages(query, limit=5, session_id=sc["sid"], sender_id=sc["raw_id"])
         out = []
         if mems:
-            out.append("[记忆] " + " | ".join(f"{m['content']}" for m in mems))
+            out.append("[记忆] " + " | ".join(f"#{m['id']} {m['content']}" for m in mems))
         if msgs:
             out.append("[历史] " + " | ".join(f"{m['role']}:{m['content'][:80]}" for m in reversed(msgs)))
         return "\n".join(out) or "没有找到相关内容。"
 
+    @filter.llm_tool(name="pin_memory")
+    async def tool_pin_memory(self, event: AstrMessageEvent, memory_id: int,
+                              pinned: bool = True) -> str:
+        """钉住/取消钉住一条长期记忆。钉住后该条每轮对话必定注入（不受字数预算挤出），整理时也不会被合并或丢弃。当用户明确要求「这条必须一直记住」「以后每次都要带上」时调用；用户说某条不用总是记着时用 pinned=false 取消。
+        Args:
+            memory_id (number): 记忆编号（注入块或 search_memory 结果里 # 后面的数字）
+            pinned (boolean): true=钉住，false=取消钉住
+        """
+        sc = self._scope_keys(event)
+        rec = self.db.memory_by_id(int(memory_id))
+        if not rec or int(rec.get("merged_into") or 0) != 0:
+            return f"记忆 #{memory_id} 不存在或已失效。"
+        # 只能操作自己的记忆；群公共/全局记忆（无归属）也允许钉
+        if rec.get("owner_id") and rec["owner_id"] != sc["owner_id"]:
+            return "只能钉住你自己的记忆。"
+        ok = self.db.set_pinned(int(memory_id), bool(pinned))
+        if not ok:
+            return f"记忆 #{memory_id} 状态未变化。"
+        self._resident_cache.clear()
+        state = "已钉住：之后每轮对话都会注入这条记忆" if pinned else "已取消钉住"
+        return f"#{memory_id} {state}。"
+
     @filter.llm_tool(name="save_memory")
     async def tool_save_memory(self, event: AstrMessageEvent, content: str,
-                               kind: str = "fact") -> str:
+                               kind: str = "fact", pinned: bool = False) -> str:
         """把值得长期记住的信息保存为记忆（自动归属到当前发言用户）。用户偏好、重要事实、项目背景等都应保存。
         Args:
             content (string): 记忆内容（简洁的一句话）
             kind (string): 类型，fact/preference/profile/summary 之一
+            pinned (boolean): 用户明确要求「必须一直记住/每次都要带上」时设为 true，该条将每轮必定注入
         """
         sc = self._scope_keys(event)
         mid, created = self.db.add_memory_smart(
@@ -591,6 +617,8 @@ class HermesCore(Star):
             owner_id=sc["owner_id"], session_id=sc["sid"],
             platform=sc["platform"], group_id=sc["group_id"],
         )
+        if created and pinned:
+            self.db.set_pinned(mid, True)
         self._resident_cache.pop(sc["owner_id"], None)
         if created:
             self._queue_memories([mid])  # 手动存的也进整理队列，攒够阈值一起合并
@@ -954,6 +982,9 @@ class HermesCore(Star):
                 )
                 if created:
                     made_mem += 1
+                    # 用户明确强调「必须一直记住」的条目自动钉住，进入常驻保护通道
+                    if item.get("pinned") and mid:
+                        self.db.set_pinned(mid, True)
         # 新记忆可能改变「关于你」的内容，清掉缓存让下一条消息用上
         self._resident_cache.clear()
         return made_mem, made_skill, skill_upd
@@ -1047,6 +1078,8 @@ class HermesCore(Star):
         rows = self.db.all_active_memories()
         if not rows:
             return "还没有任何记忆。"
+        # 钉住的条目是用户明确要求保护的重要信息：不参与任何合并/丢弃归纳
+        rows = [m for m in rows if not int(m.get("pinned") or 0)]
         if deep:
             return await self._deep_consolidate(rows, dry_run)
 
