@@ -563,14 +563,15 @@ class HermesDB:
             )
             self.conn.commit()
 
-    def resident_notes(self, owner_id: str, limit: int = 12,
-                       max_chars: int = 800,
-                       kinds: tuple[str, ...] = ("profile", "preference", "fact")
+    def resident_notes(self, owner_id: str, limit: int = 6,
+                       max_chars: int = 400,
+                       kinds: tuple[str, ...] = ("profile", "preference")
                         ) -> list[dict]:
         """常驻「关于你」条目：不依赖检索命中，每次对话固定注入。
 
         Hermes 的做法是把 MEMORY.md / USER.md 整块加载——「机器人记得你」的
-        基线不该建立在「这次的关键词恰好撞上」之上。这里取稳定的画像/偏好，
+        基线不该建立在「这次的关键词恰好撞上」之上。这里只取稳定的画像与偏好
+        （fact 是具体事实，量大且多为一次性信息，走检索层按需召回），
         按重要度与命中次数排序，最后按字符预算截断。
         """
         if not owner_id:
@@ -659,6 +660,25 @@ class HermesDB:
             self.conn.execute("DELETE FROM memories WHERE id = ?", (new_id,))
             self.conn.commit()
             return n
+
+    def discard_memories(self, ids: list[int]) -> int:
+        """把记忆标记为丢弃（merged_into = -1），不物理删除，可人工恢复。
+
+        深度整理用：一次性任务指令、闲聊反馈、技能清单这类「不该进长期记忆」
+        的条目无法与任何东西合并，只能整体退出活跃池。
+        """
+        ids = [int(i) for i in ids if i]
+        if not ids:
+            return 0
+        with self._lock:
+            marks = _ph(len(ids))
+            cur = self.conn.execute(
+                f"UPDATE memories SET merged_into = -1, updated_ts = ?"
+                f" WHERE id IN ({marks}) AND merged_into = 0",
+                (time.time(), *ids),
+            )
+            self.conn.commit()
+            return cur.rowcount
 
     def search_memories(self, query: str, limit: int = 5,
                         owner_id: str | None = None,

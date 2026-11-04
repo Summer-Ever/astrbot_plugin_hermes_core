@@ -70,6 +70,23 @@ def main() -> int:
     check("resident_notes 只返回本人", all("设计师" not in n["content"] for n in notes), str(len(notes)))
     check("resident_notes 含画像", any("工程师" in n["content"] for n in notes))
 
+    # fact 不进常驻：事实量大且多为一次性信息，只走检索层
+    db.add_memory("fact", "用户电脑 CPU 是 i5-1240P", owner_id="u1")
+    notes2 = db.resident_notes("u1", limit=10, max_chars=2000)
+    check("resident_notes 默认不含 fact", all("i5-1240P" not in n["content"] for n in notes2))
+    fact_hits = db.search_memories("i5-1240P CPU", owner_id="u1", limit=3)
+    check("fact 仍可被检索", any("i5-1240P" in m["content"] for m in fact_hits))
+
+    # 丢弃：退出活跃池，检索与常驻都看不到，可恢复
+    did = db.add_memory("preference", "临时指令条目", owner_id="u1")[0]
+    check("discard 生效", db.discard_memories([did]) == 1)
+    check("丢弃后检索不到", all(m["id"] != did for m in
+                                db.search_memories("临时指令", owner_id="u1", limit=5)))
+    check("丢弃后常驻不含", all(n["id"] != did for n in db.resident_notes("u1", limit=10)))
+    n_active = db.conn.execute(
+        "SELECT COUNT(*) c FROM memories WHERE id=? AND merged_into=-1", (did,)).fetchone()["c"]
+    check("丢弃是软删（保留原文）", n_active == 1)
+
     ids = [n["id"] for n in notes]
     if ids:
         db.bump_hits(ids)

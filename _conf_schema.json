@@ -43,13 +43,13 @@
     },
     "resident_max_items": {
         "type": "int",
-        "description": "常驻条目数量上限",
-        "default": 12
+        "description": "常驻条目数量上限（只含画像/偏好，事实类走检索层）",
+        "default": 6
     },
     "resident_max_chars": {
         "type": "int",
-        "description": "常驻区块字符上限（越小越省 token，建议 400-1200）",
-        "default": 800
+        "description": "常驻区块字符上限（越小越省 token，建议 300-800）",
+        "default": 400
     },
     "auto_summarize": {
         "type": "bool",
@@ -212,7 +212,7 @@
     },
     "summary_prompt": {
         "type": "text",
-        "default": "你是记忆管家。阅读下面的对话记录，提炼值得长期记住的信息（用户偏好、事实、项目背景、结论），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON。若无可提炼内容输出 []。同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
+        "default": "你是记忆管家。阅读下面的对话记录，只提炼【跨会话仍然成立】的稳定信息（用户画像、长期偏好、稳定事实、项目背景），输出 JSON 数组，每项 {\"kind\": \"fact|preference|profile|summary\", \"content\": \"一条简洁的中文记忆\"}。只输出 JSON；无可提炼输出 []。\n收录标准（三条全满足才收）：\n1. 稳定：长期成立，不是某次对话的临时要求；\n2. 可复用：未来的对话里也用得上；\n3. 泛化：写普遍规律而非单次事件（写「偏好快速响应」，不写「曾反馈你最近好快」）。\n禁止收录：\n- 一次性任务指令与当次配置修改（如「把人格里的某部分删掉」），除非用户明确说「以后都这样」；\n- 已安装的技能/插件清单——技能由技能系统单独管理；\n- 纯闲聊寒暄与情绪反馈；\n- 随时可从系统环境查到的易变状态。\n同时，如果整段对话展示了一个可复用的解决流程，额外输出一项 {\"skill\": true, \"name\": \"英文短名\", \"trigger\": \"何时使用\", \"content\": \"Markdown 格式的完整步骤\"}。",
         "description": "总结器使用的提示词"
     },
     "retention_days": {

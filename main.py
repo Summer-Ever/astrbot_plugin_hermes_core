@@ -126,7 +126,7 @@ except ImportError:
         filter_in_window = _rc_mod.filter_in_window
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.2"
+PLUGIN_VERSION = "0.12.3"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -518,8 +518,8 @@ class HermesCore(Star):
             return cached[1]
         items = self.db.resident_notes(
             owner_id,
-            limit=max(1, int(self._get_cfg("resident_max_items", 12))),
-            max_chars=max(120, int(self._get_cfg("resident_max_chars", 800))),
+            limit=max(1, int(self._get_cfg("resident_max_items", 6))),
+            max_chars=max(120, int(self._get_cfg("resident_max_chars", 400))),
         )
         self._resident_cache[owner_id] = (now, items)
         return items
@@ -1030,24 +1030,29 @@ class HermesCore(Star):
     # ============ 记忆巩固（consolidation）============
 
     async def _consolidate_memories(self, dry_run: bool = False,
-                                    focus_ids: set[int] | None = None) -> str:
+                                    focus_ids: set[int] | None = None,
+                                    deep: bool = False) -> str:
         """把碎片化的记忆合并成更完整的条目。
 
-        两种模式：
+        三种模式：
         - focus_ids：只给「刚写入的新记忆」找相似旧记忆（自动模式，省 token）
         - 不传：全库按相似度聚类（/hermes 整理 手动模式）
+        - deep=True：全量直接交给模型归纳（/hermes 整理 深度），能处理字面
+          相似度召回不到的同义改写，并丢弃不属于长期记忆的条目
 
         字面相似度只用来「召回候选」，不直接决定合并——「喜欢吃香蕉 / 喜欢吃苹果」
         只有 0.33，而「养了只猫叫咪咪 / 养了只狗叫旺财」有 0.38，字面分不出该不该合。
         真正判断交给一次 LLM 调用。
         """
-        threshold = float(self._get_cfg("consolidate_threshold", 0.3))
-        max_clusters = max(1, int(self._get_cfg("consolidate_max_clusters", 6)))
-        min_total = max(2, int(self._get_cfg("consolidate_min_memories", 6)))
-
         rows = self.db.all_active_memories()
         if not rows:
             return "还没有任何记忆。"
+        if deep:
+            return await self._deep_consolidate(rows, dry_run)
+
+        threshold = float(self._get_cfg("consolidate_threshold", 0.3))
+        max_clusters = max(1, int(self._get_cfg("consolidate_max_clusters", 6)))
+        min_total = max(2, int(self._get_cfg("consolidate_min_memories", 6)))
 
         if focus_ids:
             clusters: list[list[dict]] = []
@@ -1161,6 +1166,96 @@ class HermesCore(Star):
 
         head = "记忆整理预览（未写入）" if dry_run else "记忆已整理"
         return f"{head}：{len(applied)} 组\n" + "\n".join(f"- {a}" for a in applied[:8])
+
+    async def _deep_consolidate(self, rows: list[dict], dry_run: bool) -> str:
+        """深度整理：全量记忆直接交给模型归纳，不依赖字面相似度聚类。
+
+        与普通整理的区别：
+        - 同义改写/中英混排的重复（「友善温柔的女孩」vs「kind gentle assistant」）
+          字面相似度召回不到，只有全量喂给模型才看得出来；
+        - 可以「丢弃」：一次性任务指令、闲聊反馈、技能清单这类条目没法跟谁合并，
+          只能整体退出活跃池（merged_into = -1，保留原文可人工恢复）。
+        按作用域分桶逐桶调用，绝不跨用户/跨群归纳。
+        """
+        buckets: dict[tuple, list[dict]] = {}
+        for m in rows:
+            buckets.setdefault(_scope_bucket(m), []).append(m)
+        buckets = {k: sorted(v, key=lambda r: r["id"]) for k, v in buckets.items()}
+
+        head = (
+            "下面是同一位用户（或同一个群）的全部长期记忆。请做一次彻底整理：\n"
+            "1. 同义改写、中英混排的重复条目合并为一条（如「友善温柔细心的女孩助手」"
+            "与「kind, gentle, thoughtful female assistant」是同一条偏好）；\n"
+            "2. 互补的信息合并成一条（「喜欢吃香蕉」+「喜欢吃苹果」→「喜欢吃香蕉、苹果」）；\n"
+            "3. 前后矛盾的以编号较大的（较新）为准，改写成一条；\n"
+            "4. 不属于长期记忆的直接丢弃（discard）：一次性任务指令、当次配置修改要求"
+            "（如「把人格里的某部分删掉」）、纯闲聊反馈（如「你最近好快」）、"
+            "技能/插件清单、随时可查的易变状态；\n"
+            "5. 不要编造，不要丢关键细节；所有 ids 只能是上面列出的编号。\n"
+            "输出 JSON 数组，不要解释：\n"
+            '合并/改写输出 {"ids":[编号...],"kind":"preference|profile|fact","content":"整理后的一条"}\n'
+            '丢弃输出 {"ids":[编号...],"discard":true}\n'
+            "ids 至少 1 条。没有需要动的就输出 []。\n\n"
+        )
+
+        applied: list[str] = []
+        total_merge = total_drop = 0
+        for bucket, items in buckets.items():
+            listing = "\n".join(
+                f"- #{m['id']} ({m['kind']}) {str(m['content'])[:160]}"
+                for m in items[:120]
+            )
+            if len(items) < 2:
+                continue
+            text = await self.router.chat(
+                builder=lambda budget: head + listing[:max(600, budget - len(head) - 40)],
+                purpose="深度整理记忆",
+            )
+            valid_ids = {int(m["id"]) for m in items[:120]}
+            id_scope = {int(m["id"]): _scope_bucket(m) for m in items[:120]}
+            for item in self._extract_json_array(text):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    ids = [int(x) for x in (item.get("ids") or [])
+                           if str(x).strip().isdigit()]
+                except Exception:
+                    continue
+                ids = [i for i in ids if i in valid_ids]
+                if not ids:
+                    continue
+                # 同一作用域内才允许操作，防止模型跨用户乱归
+                if len({id_scope[i] for i in ids}) != 1:
+                    continue
+                if item.get("discard"):
+                    if dry_run:
+                        applied.append(f"丢弃 #{'/'.join(map(str, ids))}")
+                        continue
+                    total_drop += self.db.discard_memories(ids)
+                    applied.append(f"丢弃 #{'/'.join(map(str, ids))}")
+                else:
+                    content = str(item.get("content") or "").strip()
+                    if len(ids) < 2 or not content:
+                        continue
+                    old_texts = [str(m["content"]) for m in items
+                                 if int(m["id"]) in set(ids)]
+                    if dry_run:
+                        applied.append(
+                            f"#{'/'.join(map(str, ids))}：{' / '.join(old_texts)[:80]}"
+                            f" → {content[:80]}")
+                        continue
+                    if self.db.merge_memories(ids, content[:500],
+                                              str(item.get("kind") or "")):
+                        total_merge += 1
+                        applied.append(
+                            f"#{'/'.join(map(str, ids))} → {content[:80]}")
+
+        if not applied:
+            return (f"深度整理完成：{len(buckets)} 个作用域，模型认为没有需要合并或丢弃的条目。")
+        self._resident_cache.clear()
+        tag = "深度整理预览（未写入）" if dry_run else "深度整理完成"
+        return (f"{tag}：合并 {total_merge} 组、丢弃 {total_drop} 条\n"
+                + "\n".join(f"- {a}" for a in applied[:10]))
 
     async def _merge_skill_content(self, name: str, old_trigger: str,
                                    old_content: str, new_trigger: str,
@@ -1394,14 +1489,18 @@ class HermesCore(Star):
 
     @hermes.command("整理")
     async def hermes_consolidate(self, event: AstrMessageEvent, mode: str = ""):
-        """/hermes 整理 [预览] —— 把碎片化的相似记忆合并成一条"""
+        """/hermes 整理 [深度|预览] —— 合并相似记忆；深度=全量重新归纳，可清理垃圾条目"""
         if not self.router.has_model():
             yield event.plain_result("没有可用的对话模型，请先在插件页面「模型」标签配置。")
             return
-        dry = mode.strip() in ("预览", "试运行", "dry", "dry-run")
-        yield event.plain_result("正在整理记忆（先本地聚类，有候选才会调用模型）……")
+        mode = mode.strip()
+        deep = mode in ("深度", "deep", "彻底")
+        dry = mode in ("预览", "试运行", "dry", "dry-run")
+        yield event.plain_result(
+            "正在深度整理记忆（全量交给模型归纳，会清理一次性指令和闲聊条目）……"
+            if deep else "正在整理记忆（先本地聚类，有候选才会调用模型）……")
         try:
-            out = await self._consolidate_memories(dry_run=dry)
+            out = await self._consolidate_memories(dry_run=dry, deep=deep)
             if not dry:
                 self._reset_memory_queue()  # 全库刚整理过，队列里的 id 已经没意义
             yield event.plain_result(out)
