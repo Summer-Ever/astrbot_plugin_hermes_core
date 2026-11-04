@@ -59,6 +59,7 @@ def new_core(tmp: str):
     obj.db = m.HermesDB(tmp)
     obj._resident_cache = {}
     obj._consolidate_task = None
+    obj._consolidating = False
     return obj
 
 
@@ -202,6 +203,30 @@ async def case_visibility(tmp: str) -> None:
 
 
 
+async def case_mutex(tmp: str) -> None:
+    """自动总结、手动命令、WebUI 三条路径不能同时对同一批记忆写库。"""
+    core = new_core(tmp)
+    seed(core.db, 4)
+    started = asyncio.Event()
+    calls = {"n": 0}
+
+    class SlowRouter:
+        async def chat(self, **_kw):
+            calls["n"] += 1
+            started.set()
+            await asyncio.sleep(0.05)
+            return "[]"
+
+    core.router = SlowRouter()
+    first = asyncio.create_task(core._consolidate_memories(deep=True))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    second = await core._consolidate_memories(deep=True)
+    await first
+    check("整理互斥：第二次直接跳过", second.startswith("整理正在进行中"), second)
+    check("第一次不受影响跑完", calls["n"] == 1, str(calls["n"]))
+    check("跑完后释放互斥", core._consolidating is False)
+
+
 async def case_footer(tmp: str) -> None:
     """模型落款：单模型、多模型、降级层级都要标清楚。"""
     core = new_core(tmp)
@@ -237,7 +262,7 @@ async def case_footer(tmp: str) -> None:
 
 async def main() -> int:
     for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
-               case_merge, case_visibility, case_footer):
+               case_merge, case_visibility, case_mutex, case_footer):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:
             await fn(tmp)

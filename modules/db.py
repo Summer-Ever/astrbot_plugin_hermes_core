@@ -297,6 +297,10 @@ class HermesDB:
         """
         cols = {r[1] for r in c.execute("PRAGMA table_info(skills)")}
         if not cols or "owner_id" in cols:
+            # 补偿：executescript 会隐式 COMMIT，迁移若在「RENAME 之后、回灌之前」
+            # 被 kill，库会停在「skills 空表 + skills_legacy_v080 有数据」。
+            # 下次启动 owner_id 已存在，原逻辑直接 return，技能看起来全丢了。
+            self._recover_skills_legacy(c)
             return
         try:
             row = c.execute(
@@ -327,24 +331,57 @@ class HermesDB:
         )
         c.commit()
 
+    @staticmethod
+    def _recover_skills_legacy(c) -> None:
+        """把迁移中断后残留的 skills_legacy_v080 回灌回空表。
+
+        归属已经无从考证（meta 没写成），按 global 处理：宁可让技能全体可见，
+        也不让用户的技能库凭空消失。
+        """
+        try:
+            if not c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='skills_legacy_v080'"
+            ).fetchone():
+                return
+            if int(c.execute("SELECT COUNT(*) FROM skills").fetchone()[0]) > 0:
+                return
+            c.execute(
+                "INSERT INTO skills(owner_id, scope, group_id, name, trigger, content,"
+                " created_ts, updated_ts, use_count, merged_into, origin)"
+                " SELECT '', 'global', '', name, trigger, content, created_ts,"
+                " created_ts, COALESCE(use_count, 0), 0, 'hermes'"
+                " FROM skills_legacy_v080"
+            )
+            c.execute("DROP TABLE skills_legacy_v080")
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
+
     # ---------- messages ----------
 
     def add_message(self, session_id: str, role: str, content: str,
                     platform: str = "", sender_id: str = "", sender_name: str = "",
                     group_id: str = "") -> int:
         with self._lock:
-            cur = self.conn.execute(
-                "INSERT INTO messages(ts, session_id, platform, sender_id, sender_name,"
-                " role, content, group_id) VALUES(?,?,?,?,?,?,?,?)",
-                (time.time(), session_id, platform, sender_id, sender_name, role,
-                 content, group_id or ""),
-            )
-            if self._fts_enabled:
-                self.conn.execute(
-                    "INSERT INTO messages_fts(rowid, content, session_id) VALUES(?,?,?)",
-                    (cur.lastrowid, content, session_id),
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO messages(ts, session_id, platform, sender_id, sender_name,"
+                    " role, content, group_id) VALUES(?,?,?,?,?,?,?,?)",
+                    (time.time(), session_id, platform, sender_id, sender_name, role,
+                     content, group_id or ""),
                 )
-            self.conn.commit()
+                if self._fts_enabled:
+                    self.conn.execute(
+                        "INSERT INTO messages_fts(rowid, content, session_id) VALUES(?,?,?)",
+                        (cur.lastrowid, content, session_id),
+                    )
+                self.conn.commit()
+            except Exception:
+                # FTS 写入失败时不能把未提交的 INSERT 留在连接上，
+                # 否则会被下一次 commit 顺手写进库（消息与水位的顺序就乱了）
+                self.conn.rollback()
+                raise
             return cur.lastrowid
 
     @staticmethod
@@ -407,35 +444,44 @@ class HermesDB:
             return 0
         cutoff = time.time() - int(days) * 86400
         total = 0
-        with self._lock:
-            if require_summarized:
-                # 按会话各自的水位删，绝不越过未总结的部分
-                for sid in self.all_session_ids():
-                    wm = self.get_watermark(sid)
-                    if wm <= 0:
-                        continue
-                    while (ids := [r[0] for r in self.conn.execute(
+        # 锁只包「取一批 + 删一批」：原来的写法把整个修剪过程放在一把锁里，
+        # 而每条新消息的 add_message 都要抢同一把锁 —— 清理几十秒，
+        # 事件循环上所有消息处理就跟着停几十秒。
+        if require_summarized:
+            # 按会话各自的水位删，绝不越过未总结的部分
+            for sid in self.all_session_ids():
+                wm = self.get_watermark(sid)
+                if wm <= 0:
+                    continue
+                while True:  # asb-audit: ignore=ASB-13 同步方法由 asyncio.to_thread 调用，每批 LIMIT 必然收敛
+                    with self._lock:
+                        ids = [r[0] for r in self.conn.execute(
                             "SELECT id FROM messages WHERE session_id = ?"
                             " AND ts < ? AND id <= ? LIMIT ?",
                             (sid, cutoff, wm, int(batch)),
-                    ).fetchall()]):
-                        total += self._delete_message_batch(ids)
-                        if len(ids) < int(batch):
-                            break
-            else:
-                # 海象循环：每批取一批删一批；批次大小受 LIMIT 约束，不会长事务
-                while (ids := [r[0] for r in self.conn.execute(
-                        "SELECT id FROM messages WHERE ts < ? LIMIT ?",
-                        (cutoff, int(batch)),
-                ).fetchall()]):
-                    total += self._delete_message_batch(ids)
+                        ).fetchall()]
+                        if ids:
+                            total += self._delete_message_batch(ids)
                     if len(ids) < int(batch):
                         break
-            if total:
-                try:
-                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception:
-                    pass
+        else:
+            # 海象循环：每批取一批删一批；批次大小受 LIMIT 约束，不会长事务
+            while True:  # asb-audit: ignore=ASB-13 同步方法由 asyncio.to_thread 调用，每批 LIMIT 必然收敛
+                with self._lock:
+                    ids = [r[0] for r in self.conn.execute(
+                        "SELECT id FROM messages WHERE ts < ? LIMIT ?",
+                        (cutoff, int(batch)),
+                    ).fetchall()]
+                    if ids:
+                        total += self._delete_message_batch(ids)
+                if len(ids) < int(batch):
+                    break
+        if total:
+            try:
+                # checkpoint 会等所有读者结束，是不可预估时长的阻塞，必须放在锁外
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
         return total
 
     def recent_message_ids(self, session_id: str | None, sender_id: str | None,
@@ -841,12 +887,14 @@ class HermesDB:
         v = str(visibility or "").strip().lower()
         if v not in self.VISIBILITY:
             return False
-        cur = self.conn.execute(
-            "UPDATE memories SET visibility = ?, updated_ts = ?"
-            " WHERE id = ? AND merged_into = 0",
-            (v, time.time(), int(memory_id)),
-        )
-        self.conn.commit()
+        cur = None
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE memories SET visibility = ?, updated_ts = ?"
+                " WHERE id = ? AND merged_into = 0",
+                (v, time.time(), int(memory_id)),
+            )
+            self.conn.commit()
         return cur.rowcount > 0
 
     def slot_conflicts(self, memory_id: int) -> list[int]:
@@ -928,16 +976,18 @@ class HermesDB:
         （例如先说「叫我兄弟」后说「喊我老爹」，旧条 unpin 且退出活跃池）。
         """
         now = time.time()
-        cur = self.conn.execute(
-            "UPDATE memories SET pinned = ?, pinned_ts = ?, updated_ts = ?"
-            " WHERE id = ? AND merged_into = 0",
-            (1 if pinned else 0, now if pinned else 0, now, int(memory_id)),
-        )
-        self.conn.commit()
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE memories SET pinned = ?, pinned_ts = ?, updated_ts = ?"
+                " WHERE id = ? AND merged_into = 0",
+                (1 if pinned else 0, now if pinned else 0, now, int(memory_id)),
+            )
+            self.conn.commit()
         if cur.rowcount <= 0:
             return False
         if pinned:
-            # 顶掉同槽位的旧条；不删原文，只退出活跃池
+            # 顶掉同槽位的旧条；不删原文，只退出活跃池。
+            # 放锁外：supersede 自己会取锁，而 _lock 不可重入。
             self.supersede_slot_conflicts(int(memory_id))
         return True
 
@@ -952,10 +1002,17 @@ class HermesDB:
             return 0
         with self._lock:
             marks = _ph(len(ids))
+            # 只收活跃且未钉住的条目：并发整理可能已经把同一批 id 合并掉，
+            # 钉住则是用户明确要求保护的信息。原来只按 id 取，会把已合并条目的
+            # merged_into 指针改指向新条，回滚链（unmerge）就此断掉。
             rows = self.conn.execute(
-                f"SELECT * FROM memories WHERE id IN ({marks})", ids
+                f"SELECT * FROM memories WHERE id IN ({marks})"
+                " AND COALESCE(merged_into, 0) = 0 AND COALESCE(pinned, 0) = 0",
+                ids,
             ).fetchall()
-            if not rows:
+            if len(rows) < 2 or len(rows) != len(set(ids)):
+                # 组内条目在快照之后被别的路径合并/丢弃/钉住：整组作废，
+                # 宁可不合也不写半组，否则会出现两条内容重叠的活跃记忆。
                 return 0
             rows = sorted(rows, key=lambda r: r["id"])
             base = rows[0]
@@ -964,21 +1021,33 @@ class HermesDB:
             vis = self._norm_visibility(
                 base["visibility"], base["owner_id"] or "", base["group_id"] or "")
             now = time.time()
-            cur = self.conn.execute(
-                "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
-                " session_id, platform, group_id, merged_into, updated_ts,"
-                " visibility)"
-                " VALUES(?,?,?,?,?,?,?,?,?,0,?,?)",
-                (now, kind or base["kind"], base["scope"], content, "consolidate",
-                 base["owner_id"] or "", base["session_id"] or "",
-                 base["platform"] or "", base["group_id"] or "", now, vis),
-            )
-            new_id = cur.lastrowid
-            self.conn.execute(
-                f"UPDATE memories SET merged_into = ?, updated_ts = ? WHERE id IN ({marks})",
-                (new_id, now, *ids),
-            )
-            self.conn.commit()
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
+                    " session_id, platform, group_id, merged_into, updated_ts,"
+                    " visibility)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,0,?,?)",
+                    (now, kind or base["kind"], base["scope"], content, "consolidate",
+                     base["owner_id"] or "", base["session_id"] or "",
+                     base["platform"] or "", base["group_id"] or "", now, vis),
+                )
+                new_id = cur.lastrowid
+                upd = self.conn.execute(
+                    f"UPDATE memories SET merged_into = ?, updated_ts = ?"
+                    f" WHERE id IN ({marks})"
+                    " AND COALESCE(merged_into, 0) = 0 AND COALESCE(pinned, 0) = 0",
+                    (new_id, now, *ids),
+                )
+                if upd.rowcount != len(rows):
+                    # 期间被并发改动：新条和标记一起回滚，不留半成品
+                    self.conn.rollback()
+                    return 0
+                self.conn.commit()
+            except Exception:
+                # 不能只把异常往上抛：INSERT 已执行而 UPDATE 失败时，事务会悬在
+                # 连接上，被下一次任意 commit 顺手提交，变成「新条有了、旧条还在」。
+                self.conn.rollback()
+                raise
             return new_id
 
     def unmerge(self, new_id: int) -> int:
@@ -1381,10 +1450,13 @@ class HermesDB:
         row = self._pick_skill(name, owner_id, group_id)
         if not row:
             return None
-        self.conn.execute(
-            "UPDATE skills SET use_count = use_count + 1 WHERE id = ?", (row["id"],)
-        )
-        self.conn.commit()
+        # 计数写在读路径上，必须与其它写操作共用一把锁：否则它会替
+        # 后台线程里未提交的事务「顺手 commit」，把半成品写进库。
+        with self._lock:
+            self.conn.execute(
+                "UPDATE skills SET use_count = use_count + 1 WHERE id = ?", (row["id"],)
+            )
+            self.conn.commit()
         return dict(row)
 
     def skill_owners(self) -> list[dict]:

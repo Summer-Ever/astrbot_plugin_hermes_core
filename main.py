@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.13"
+PLUGIN_VERSION = "0.12.14"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -291,6 +291,10 @@ class HermesCore(Star):
         # 手动整理是长任务（逐作用域调用模型），不能占着事件处理等平台回话：
         # QQ 官方被动回复只有 5 分钟有效期，超时后结果只能靠主动消息补发。
         self._consolidate_task: asyncio.Task | None = None
+        # 整理互斥：自动总结、手动命令、WebUI 三条路径都会快照全库再花几分钟写回，
+        # 同时跑会把同一批 id 从对方的合并结果里抢走。见 _consolidate_memories。
+        self._consolidating = False
+        self._probe_task: asyncio.Task | None = None
         self._sum_lock = asyncio.Lock()
         self._resident_cache: dict[tuple[str, bool], tuple[float, list[dict]]] = {}
         self._inject_guard: dict[str, float] = {}
@@ -318,7 +322,9 @@ class HermesCore(Star):
             logger.warning(f"[hermes_core] 读取冷却状态失败:\n{traceback.format_exc(limit=2)}")
         self._register_web_apis()
         if bool(self._get_cfg("llm_probe_on_start", False)):
-            asyncio.create_task(self._probe_models())
+            # 保存引用：事件循环只持弱引用，裸 create_task 的任务可能中途被 GC，
+            # 也会在 terminate 时漏掉取消。
+            self._probe_task = asyncio.create_task(self._probe_models())
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
 
@@ -529,7 +535,11 @@ class HermesCore(Star):
         if not bool(self._get_cfg("consolidate_progress_push", True)):
             return False
         try:
-            await self.context.send_message(origin, MessageChain([Plain(text)]))
+            # 必须带超时：适配器/网络挂住时 send_message 可能永不返回，
+            # 而它就在整理循环里，一片卡住整批就停在那里不动了。
+            await asyncio.wait_for(
+                self.context.send_message(origin, MessageChain([Plain(text)])),
+                timeout=10)
             return True
         except Exception:
             logger.warning("[hermes_core] 进度推送失败（不影响整理继续）:\n"
@@ -660,13 +670,15 @@ class HermesCore(Star):
             now = time.time()
             if now - self._inject_guard.get(key, 0) < 300:
                 return
+            block = self._build_context_block(event, query, req)
+            if not block:
+                return
+            # 写入时机放在构建成功之后：原来先写后构建，一旦构建抛异常，
+            # 同一个问题在 5 分钟内都不会再尝试注入——一次偶发失败变成静默失忆。
             self._inject_guard[key] = now
             if len(self._inject_guard) > 200:
                 cutoff = now - 300
                 self._inject_guard = {k: v for k, v in self._inject_guard.items() if v > cutoff}
-            block = self._build_context_block(event, query, req)
-            if not block:
-                return
             if TextPart is not None and hasattr(req, "extra_user_content_parts"):
                 part = TextPart(text=block)
                 if hasattr(part, "mark_as_temp"):
@@ -750,6 +762,12 @@ class HermesCore(Star):
             self._bump_metric("recall_memories", len(memories))
             for m in memories:
                 state["seen"][int(m["id"])] = state["turn"]
+            # 只写不清理的话，一个长期活跃的群会把见过的所有记忆 id 一直留着
+            # （记忆上千条就是上千项）。去重窗口只看最近 4 轮，200 轮足够安全。
+            if len(state["seen"]) > 500:
+                keep_after = state["turn"] - 200
+                state["seen"] = {k: v for k, v in state["seen"].items()
+                                 if v >= keep_after}
             try:
                 self.db.bump_hits([int(m["id"]) for m in memories])
             except Exception:
@@ -857,6 +875,14 @@ class HermesCore(Star):
             max_chars=max(120, int(self._get_cfg("resident_max_chars", 400))),
             allow_private=bool(allow_private),
         )
+        # 只增不减会长期驻留每个见过的人：人以千计时是几 MB 的 dict，
+        # 而且 TTL 只在读同一个 key 时才判断，冷 key 永远不会被淘汰。
+        if len(self._resident_cache) >= 256:
+            cutoff = now - 60
+            self._resident_cache = {k: v for k, v in self._resident_cache.items()
+                                    if v[0] > cutoff}
+            while len(self._resident_cache) >= 256:
+                self._resident_cache.pop(next(iter(self._resident_cache)))
         self._resident_cache[key] = (now, items)
         return items
 
@@ -1279,10 +1305,14 @@ class HermesCore(Star):
         if self._should_consolidate_memories(queued):
             try:
                 note = await self._consolidate_memories(focus_ids=set(self._pending_memory_ids()))
-                if note and not note.startswith("记忆只有"):
+                if note.startswith("整理正在进行中"):
+                    # 另一条路径正在跑：这批仍然没整理过，队列不能清
                     summary += "\n" + note
-                self._reset_memory_queue()
-                self._clear_auto_consolidate_backoff()
+                else:
+                    if note and not note.startswith("记忆只有"):
+                        summary += "\n" + note
+                    self._reset_memory_queue()
+                    self._clear_auto_consolidate_backoff()
             except Exception:
                 # 出错不清队列，下一轮重试；但连续失败要退避，否则模型链坏掉时
                 # 每一轮总结都多烧几次调用、还持续撞限流。
@@ -1298,8 +1328,9 @@ class HermesCore(Star):
             try:
                 note = await self._consolidate_skills()
                 summary += "\n" + note
-                self.db.set_meta("skill_consolidate_pending", "0")
-                self._clear_auto_consolidate_backoff()
+                if not note.startswith("整理正在进行中"):
+                    self.db.set_meta("skill_consolidate_pending", "0")
+                    self._clear_auto_consolidate_backoff()
             except Exception:
                 self._mark_auto_consolidate_failed()
                 logger.error(f"[hermes_core] 技能整理失败:\n{traceback.format_exc()}")
@@ -1308,10 +1339,10 @@ class HermesCore(Star):
         if made_skill and self._get_cfg("skill_notify_admin", True) and self._last_origin \
                 and MessageChain is not None and Plain is not None:
             try:
-                await self.context.send_message(
+                await asyncio.wait_for(self.context.send_message(
                     self._last_origin,
                     MessageChain([Plain(f"[技能进化] 刚学会了 {made_skill} 个新技能，用 /hermes 技能 查看。")]),
-                )
+                ), timeout=10)
             except Exception:
                 pass
         return summary
@@ -1586,6 +1617,30 @@ class HermesCore(Star):
                                     focus_ids: set[int] | None = None,
                                     deep: bool = False,
                                     force: bool = False) -> str:
+        """整理入口：进程内全局互斥，跑完才放行。
+
+        三条路径都会进来——自动总结（main.py 里攒够阈值时）、/hermes 整理、
+        WebUI 的 actions/consolidate。它们各自开头都只是快照 all_active_memories，
+        然后花几分钟调模型，最后按快照里的 id 写库。两边同时跑时，后写的那条
+        会把同一批 id 从对方的合并结果里抢走：回滚链断掉，还多出一条内容重叠的
+        活跃记忆（同一件事注入两遍）。
+
+        拿不到就直接返回、不排队：整理不是必须此刻完成的事，排队只会把
+        总结流程也一起堵住。
+        """
+        if self._consolidating:
+            return "整理正在进行中，这次跳过（发 /hermes 整理结果 看进度）。"
+        self._consolidating = True
+        try:
+            return await self._consolidate_inner(
+                dry_run=dry_run, focus_ids=focus_ids, deep=deep, force=force)
+        finally:
+            self._consolidating = False
+
+    async def _consolidate_inner(self, dry_run: bool = False,
+                                 focus_ids: set[int] | None = None,
+                                 deep: bool = False,
+                                 force: bool = False) -> str:
         """把碎片化的记忆合并成更完整的条目。
 
         三种模式：
@@ -1979,7 +2034,9 @@ class HermesCore(Star):
         if origin and MessageChain is not None and Plain is not None:
             body = out if len(out) <= 900 else out[:900] + "\n…（完整结果发 /hermes 整理结果 查看）"
             try:
-                await self.context.send_message(origin, MessageChain([Plain(body)]))
+                await asyncio.wait_for(
+                    self.context.send_message(origin, MessageChain([Plain(body)])),
+                    timeout=15)
                 report["pushed"] = True
             except Exception:
                 logger.warning("[hermes_core] 整理结果推送失败，可改用 /hermes 整理结果 查看:\n"
@@ -2066,6 +2123,20 @@ class HermesCore(Star):
         return f"用户 {str(g['owner_id'])[-6:]}"
 
     async def _consolidate_skills(self, dry_run: bool = False) -> str:
+        """技能整理入口：与记忆整理互斥。
+
+        两者都会长时间占用模型链，而且技能侧是「按名字硬删除再写入」，
+        与总结流程里正在进行的 upsert_skill 撞上时，谁后写谁赢、对方那份直接消失。
+        """
+        if self._consolidating:
+            return "整理正在进行中，这次跳过技能整理。"
+        self._consolidating = True
+        try:
+            return await self._consolidate_skills_inner(dry_run=dry_run)
+        finally:
+            self._consolidating = False
+
+    async def _consolidate_skills_inner(self, dry_run: bool = False) -> str:
         """按归属分别整理技能，不同用户的技能绝不互相合并。
 
         技能不是记忆，字面相似度几乎没用（`chrome-cdp-browser-control` 和
@@ -2165,7 +2236,11 @@ class HermesCore(Star):
                 body += "\n（其余技能因当前模型上下文不足未列出）"
             return head + body
 
-        text = await self.router.chat(builder=build, purpose="整理技能")
+        # 技能整理也要有硬上限：没有 deadline 时，一个域最坏 4 次尝试 × 60 秒，
+        # 默认 3 个域能把总结锁占满十几分钟，后面的会话一条都总结不了。
+        text = await self.router.chat(builder=build, purpose="整理技能",
+                                      timeout=60.0, max_attempts=2,
+                                      deadline=time.monotonic() + 180)
         plan = self._extract_json_array(text)
 
         all_names = {s["name"] for s in skills}
@@ -2690,8 +2765,19 @@ class HermesCore(Star):
             f"下一次对话会照常召回。")
 
     async def terminate(self):
-        if self._bg_task and not self._bg_task.done():
-            self._bg_task.cancel()
+        """卸载：先让后台任务停下来，再关库。
+
+        原来只 cancel 了总结循环就直接 db.close()。深度整理能跑十几分钟，
+        热重载时它下一次 commit 会撞上已关闭的连接（Cannot operate on a closed
+        database）；而旧实例继续跑、新实例同时起来做自动整理，两个连接会
+        对同一批记忆各合并一次。所以这里必须 cancel + await 全部任务。
+        """
+        tasks = [t for t in (self._bg_task, self._consolidate_task, self._probe_task)
+                 if t is not None and not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._flush_metrics()
         self.db.close()
         logger.info("[hermes_core] 已卸载")

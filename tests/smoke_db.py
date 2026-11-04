@@ -98,6 +98,21 @@ def main() -> int:
     check("取消钉住", db.set_pinned(pid, False) is True)
     check("取消后恢复预算约束", all(n["id"] != pid for n in db.resident_notes("u1", limit=10, max_chars=10)))
 
+    # 合并守卫：钉住的、已经并过的条目都不能被再并一次，
+    # 否则回滚链（merged_into）会被改写，误合并再也还原不了
+    m1 = db.add_memory("preference", "喜欢喝美式", owner_id="u1")
+    m2 = db.add_memory("preference", "喝美式不加糖", owner_id="u1")
+    db.set_pinned(m1, True)
+    check("钉住的条目拒绝合并", db.merge_memories([m1, m2], "喜欢喝美式不加糖") == 0)
+    db.set_pinned(m1, False)
+    mid = db.merge_memories([m1, m2], "喜欢喝美式不加糖")
+    check("正常合并产出新条", mid > 0, str(mid))
+    m3 = db.add_memory("preference", "美式要加冰", owner_id="u1")
+    check("已合并的条目不能再次参与", db.merge_memories([m2, m3], "美式加冰不加糖") == 0)
+    check("合并产物可见性不为空", any(
+        r["id"] == mid and (r["visibility"] or "") in ("private", "group", "public")
+        for r in db.all_active_memories()))
+
     ids = [n["id"] for n in notes]
     if ids:
         db.bump_hits(ids)
