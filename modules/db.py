@@ -501,24 +501,29 @@ class HermesDB:
     def _fts_candidates(self, query: str, cap: int,
                         session_id: str | None,
                         sender_id: str | None) -> list[dict] | None:
-        """用 FTS5 trigram 取「包含查询短语」的消息，作为检索快路径。
+        """用 FTS5 trigram 取「与查询共享三字片段」的消息，作为检索快路径。
 
         返回 None 表示索引不可用（老库没建表 / SQLite 无 trigram），
-        调用方据此回退全扫。命中不足时调用方同样回退，所以不会损失召回，
-        只在短语确实出现过时省掉一次 1500 行的扫描。
+        调用方据此回退全扫。命中不足时调用方同样回退，所以不会损失召回。
+
+        索引本身是 trigram 分词，而原来这里提交的是**整句短语**——
+        自然语言一句话不会原样出现在历史消息里，实测 12 条常见查询里 10 条
+        命中 0 条，快路径等于常年失效：每次白查一次 FTS 再退回扫 1500 行，
+        而且 1500 行以外的历史永远检索不到。
+        改为按 3 字窗口 OR（见 recall.fts_windows）：文档只要共享任意一个
+        三字片段就能进候选，共享多个的由 bm25(rank) 排前面，
+        最后仍交给 rank_messages 精排。
         """
         if not self._fts_enabled:
             return None
-        q = " ".join(str(query).split())
-        if len(q) < 3:
+        wins = _recall.fts_windows(str(query))
+        if not wins:
             return None
-        # trigram 下用短语查询，引号内的特殊字符需要转义
-        phrase = '"' + q.replace('"', '""') + '"'
         # FTS5 要求 MATCH 左侧写表名，别名不可用；rank 只在 MATCH 时存在
         sql = ("SELECT m.* FROM messages_fts"
                " JOIN messages m ON m.id = messages_fts.rowid"
                " WHERE messages_fts MATCH ?")
-        args: list = [phrase]
+        args: list = [" OR ".join('"' + w.replace('"', '""') + '"' for w in wins)]
         if session_id is not None:
             sql += " AND m.session_id = ?"
             args.append(session_id)
@@ -538,26 +543,30 @@ class HermesDB:
                         scan: int = 1500) -> list[dict]:
         """按相关度检索历史消息（bigram + IDF），不再要求整句作为子串出现。
 
-        候选集优先取 FTS 短语命中，命中不足时回退到最近 scan 条：
-        越久远的对话越不可能被需要，同时也避免全表扫描。
+        候选集 = FTS 三字片段命中（可能来自整段历史）+ 最近一段对话。
+        最近对话永远要扫一小段：FTS 只认「连续 3 字」，像「部署 证书」这种
+        两个词分开出现的消息它命不中，而这类恰恰是「刚才说过」的典型。
+        FTS 命中充足时只补最近 200 条（约 2 ms），命中太少或索引不可用才退回
+        扫满 scan 条——原来无论命中多少都扫满，等于快路径白付一次查询。
         返回按 id 倒序（最新在前），与旧实现保持一致，调用方无需调整。
         """
         if len(_recall.norm(query)) < 4:
             # 两三个字的寒暄没有区分度，检索只会带回噪声
             return []
         cap = max(50, int(scan))
-        docs = self._fts_candidates(query, cap, session_id, sender_id)
-        if docs is None or len(docs) < max(24, int(limit) * 4):
-            where, args = self._msg_where(session_id, sender_id)
-            rows = self.conn.execute(
-                f"SELECT * FROM messages{where} ORDER BY id DESC LIMIT ?",
-                (*args, cap),
-            ).fetchall()
-            scanned = [dict(r) for r in rows]
-            if docs:
-                seen = {d["id"] for d in scanned}
-                scanned.extend([d for d in docs if d["id"] not in seen])
-            docs = scanned
+        # FTS 侧只取 bm25 前 500：rank_messages 最终只留 top-k，再多只是白算
+        fts = self._fts_candidates(query, min(cap, 500), session_id, sender_id)
+        enough = fts is not None and len(fts) >= max(12, int(limit) * 3)
+        scan_n = min(cap, 200) if enough else cap
+        where, args = self._msg_where(session_id, sender_id)
+        rows = self.conn.execute(
+            f"SELECT * FROM messages{where} ORDER BY id DESC LIMIT ?",
+            (*args, scan_n),
+        ).fetchall()
+        docs = [dict(r) for r in rows]
+        if fts:
+            seen = {d["id"] for d in docs}
+            docs.extend([d for d in fts if d["id"] not in seen])
         hits = _recall.rank_messages(query, docs, k=max(1, int(limit)))
         return sorted(hits, key=lambda x: -int(x["id"]))
 

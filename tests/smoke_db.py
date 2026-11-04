@@ -45,16 +45,45 @@ def main() -> int:
     noise = db.search_messages("股票基金", limit=3)
     check("无关查询不返回结果", noise == [], str(len(noise)))
 
-    # --- FTS 快路径（trigram 短语）
+    # --- FTS 快路径（trigram 三字窗口）
     fts = db._fts_candidates("Windows 11 版本", 50, None, None)
     check("FTS 索引可查询（非 None）", fts is not None, "索引不可用或 SQL 报错")
     if fts is not None:
-        check("FTS 短语命中至少 1 条", len(fts) >= 1, str(len(fts)))
+        check("FTS 命中至少 1 条", len(fts) >= 1, str(len(fts)))
         only_u1 = db._fts_candidates("Windows 11 版本", 50, None, "u1")
         check("FTS 支持 sender 过滤", only_u1 is not None and all(r["sender_id"] == "u1" for r in only_u1))
 
     check("count_messages 全量", db.count_messages() == 4, str(db.count_messages()))
     check("count_messages 按 sender", db.count_messages(sender_id="u1") == 2, str(db.count_messages(sender_id="u1")))
+
+    # --- FTS 快路径真的能命中（v0.12.16）
+    # 原实现提交的是「整句短语」，自然语言在历史里几乎不会原样出现 → 命中 0，
+    # 快路径常年失效，检索被死锁在「最近 scan 条」。这两条断言钉住这个行为。
+    db.add_message("s3", "user", "家里那台群晖证书过期了，续期一直报错，dns 校验失败",
+                   sender_id="u9")
+    sep = db._fts_candidates("群晖证书续期 acme 失败", 50, None, None)
+    check("FTS 命中非连续短语（三字窗口 OR）", bool(sep), f"命中 {len(sep or [])} 条")
+
+    # 把这条挤到「最近 scan 条」之外，只剩 FTS 能找回它
+    old_id = db.conn.execute("select max(id) from messages").fetchone()[0]
+    filler = [(time.time() - i, "s3", "qq", "u9", "老用户", "user",
+               f"第{i}条：今天天气不错，随便聊聊", "") for i in range(60)]
+    db.conn.executemany(
+        "INSERT INTO messages(ts,session_id,platform,sender_id,sender_name,role,content,group_id)"
+        " VALUES(?,?,?,?,?,?,?,?)", filler)
+    db.conn.commit()
+    for f_id, f_text, f_sid in db.conn.execute(
+            "select id, content, session_id from messages where id > ?", (old_id,)).fetchall():
+        db.conn.execute("INSERT INTO messages_fts(rowid, content, session_id) VALUES(?,?,?)",
+                        (f_id, f_text, f_sid))
+    db.conn.commit()
+    recent_only = [r["id"] for r in db.conn.execute(
+        "select id from messages where session_id='s3' order by id desc limit 20").fetchall()]
+    check("旧消息确实在最近窗口之外", old_id not in recent_only, f"old={old_id}")
+    far = db.search_messages("群晖证书续期 dns 校验失败", limit=3, session_id="s3", scan=20)
+    check("超出最近窗口的消息仍靠 FTS 找回",
+          any("群晖" in h["content"] for h in far),
+          f"命中 {len(far)} 条：" + str([h["content"][:12] for h in far]))
 
     # --- 记忆
     mid, created = db.add_memory_smart("preference", "用户喜欢用 winget 装软件",

@@ -52,6 +52,8 @@ _STOP_CHARS = set(
     "的了嘛吗呢吧啊呀哦嗯我你您他她它们是在有和就都也还这那个什么怎"
     "请帮把被给跟对从而且或之其与及呗哈呃诶"
 )
+# 与 _STOP_CHARS 等价的字符类，用于高频判断（见 _content_grams_of）
+_STOP_RE = re.compile("[" + "".join(sorted(_STOP_CHARS)) + "]")
 
 
 def norm(text: str) -> str:
@@ -69,8 +71,54 @@ def grams(text: str) -> list[str]:
     return list(dict.fromkeys(s[i: i + 2] for i in range(len(s) - 1)))
 
 
+def gram_set(text: str, normalized: bool = False) -> set[str]:
+    """只要集合时走这条：省掉 dict.fromkeys + list 的中间对象。
+
+    批量排序里每条文档只需要集合（IDF 统计、交集、去冗余都是集合运算），
+    实测比 grams() 快近一倍。normalized=True 表示传入的已经是 norm() 过的文本
+    （排序里本来就要算 norm 做精确包含加分，再归一化一次纯属浪费）。
+    """
+    s = text if normalized else norm(text)
+    if not s:
+        return set()
+    if len(s) == 1:
+        return {s}
+    return {s[i: i + 2] for i in range(len(s) - 1)}
+
+
+def fts_windows(text: str, cap: int = 48) -> list[str]:
+    """把查询切成 3 字窗口，供 FTS5 trigram 做 OR 检索。
+
+    trigram 至少要 3 个字符才可能命中，所以「整句短语」查询在自然语言下
+    几乎必然 0 命中（实测 12 条常见查询里 10 条命中 0），快路径等于常年失效。
+    这里两路取窗口：
+    - 归一化后的整句：抓连续表达的长片段；
+    - 再按空白/标点分段各取一次：`群晖 续期` 这种被空格隔开的关键词，
+      归一化会把空格吃掉，跨段窗口在原文里并不存在，只有分段才能命中。
+    合并去重并限长：贴日志/长报错时 MATCH 表达式不至于爆炸。
+    """
+    wins: list[str] = []
+    # 分段在前：分段窗口是用户真正输入的词，最不容易误伤；
+    # 整句窗口补「连续表达」，被 cap 截断时优先保住分段词。
+    for seg in _SPLIT_RE.split(str(text or "").lower()):
+        if len(seg) >= 3:
+            wins.extend(seg[i: i + 3] for i in range(len(seg) - 2))
+    s = norm(text)
+    if len(s) >= 3:
+        wins.extend(s[i: i + 3] for i in range(len(s) - 2))
+    return list(dict.fromkeys(wins))[:cap]
+
+
 def jaccard(a: str, b: str) -> float:
     A, B = set(grams(a)), set(grams(b))
+    if not A or not B:
+        return 0.0
+    inter = len(A & B)
+    return inter / (len(A) + len(B) - inter)
+
+
+def _jaccard_sets(A: set[str], B: set[str]) -> float:
+    """已算好 bigram 集合的版本。排序内部走这条，避免每条候选反复分词。"""
     if not A or not B:
         return 0.0
     inter = len(A & B)
@@ -83,8 +131,23 @@ def content_grams(text: str) -> list[str]:
     虚词构成的双字词（的时/时候/怎么/么办/这个）对判断相关性没有信息量，
     却会把分母撑大。全被过滤时退回原始 bigram，避免空分母。
     """
-    gs = grams(text)
-    out = [g for g in gs if not any(ch in _STOP_CHARS for ch in g)]
+    return _content_grams_of(grams(text))
+
+
+def _content_set_of(gset: set[str]) -> set[str]:
+    """集合版的实词过滤；全被过滤时退回全集（与 content_grams 的退化规则一致）。"""
+    out = {g for g in gset if not _STOP_RE.search(g)}
+    return out or gset
+
+
+def _content_grams_of(gs: list[str]) -> list[str]:
+    """content_grams 的内核：接收已算好的 bigram，避免重复分词。
+
+    用预编译正则做「含虚词字符」判断：原写法是每个 gram 都跑一次
+    `any(ch in _STOP_CHARS for ch in g)`，五千条记忆实测这一项就占排序
+    三分之一时间，而正则的字符类匹配在 C 层完成。
+    """
+    out = [g for g in gs if not _STOP_RE.search(g)]
     return out or gs
 
 
@@ -101,7 +164,8 @@ def build_idf(docs: Iterable[str]) -> dict[str, float]:
     return {g: math.log(1.0 + n / (1.0 + c)) for g, c in df.items()}
 
 
-def _coverage(qg: list[str], dg: set[str]) -> float:
+def _coverage(qg: list[str], dg: set[str],
+              qg_set: set[str] | None = None) -> float:
     """query 的 gram 有多大比例被文档覆盖（不看权重）。
 
     只用来做「是否算相关」的门槛：如果按 IDF 加权判断，一个极罕见的双字词
@@ -110,7 +174,8 @@ def _coverage(qg: list[str], dg: set[str]) -> float:
     """
     if not qg:
         return 0.0
-    return len(set(qg) & dg) / len(set(qg))
+    qs = qg_set if qg_set is not None else set(qg)
+    return len(qs & dg) / len(qs)
 
 
 def _weighted_coverage(qg: list[str], dg: set[str], idf: dict[str, float]) -> float:
@@ -128,17 +193,26 @@ def _weighted_coverage(qg: list[str], dg: set[str], idf: dict[str, float]) -> fl
 def score(query: str, doc: str, idf: dict[str, float], *,
           qg: list[str] | None = None, ts: float = 0.0,
           kind: str = "", hits: int = 0,
-          half_life_days: float = 180.0, now: float | None = None) -> float:
-    """单条打分。0 表示不相关。"""
+          half_life_days: float = 180.0, now: float | None = None,
+          doc_grams: set[str] | None = None,
+          doc_norm: str | None = None,
+          q_norm: str | None = None,
+          qg_set: set[str] | None = None) -> float:
+    """单条打分。0 表示不相关。
+
+    doc_grams / doc_norm / q_norm 是给 rank 复用的预计算结果：批量排序时
+    同一条文档会被「门槛判断 / 打分 / 去冗余」三次用到，每次重算 bigram
+    等于把整批文本分词三遍（5000 条记忆实测 45ms，其中 2/3 是重复分词）。
+    """
     if not query or not doc:
         return 0.0
     qg = qg if qg is not None else grams(query)
     if not qg:
         return 0.0
-    dg = set(grams(doc))
+    dg = doc_grams if doc_grams is not None else set(grams(doc))
     if not dg:
         return 0.0
-    cov = _coverage(qg, dg)
+    cov = _coverage(qg, dg, qg_set)
     if cov <= 0:
         return 0.0
     wcov = _weighted_coverage(qg, dg, idf)
@@ -149,7 +223,8 @@ def score(query: str, doc: str, idf: dict[str, float], *,
 
     # 精确包含：用户问「computer-power 技能」时，正文里就有这个词，应该重排到最前
     bonus = 1.0
-    nq, nd = norm(query), norm(doc)
+    nq = q_norm if q_norm is not None else norm(query)
+    nd = doc_norm if doc_norm is not None else norm(doc)
     if len(nq) >= 2 and nq in nd:
         bonus = 1.35
 
@@ -181,12 +256,33 @@ def rank(query: str, docs: list[dict[str, Any]], *, k: int = 5,
     if not qg or not qc:
         return []
     qc_set = set(qc)
-    idf = build_idf([str(d.get(text_key, "")) for d in docs])
+    qg_set = set(qg)
+    q_norm = norm(query)
 
-    scored: list[tuple[float, dict]] = []
+    # 每条候选只分词一次，后面门槛判断、打分、去冗余全都复用这份结果。
+    prepared: list[tuple[dict, str, set[str], str]] = []
+    df: dict[str, int] = {}
     for d in docs:
         text = str(d.get(text_key, ""))
-        dc = set(content_grams(text))
+        ntext = norm(text)
+        gset = gram_set(ntext, normalized=True)
+        prepared.append((d, text, gset, ntext))
+        # 只统计 query 里出现过的 gram：_weighted_coverage 只查 qg，
+        # 其余 gram 统计了也永远没人查。原来对每条候选的每个 bigram 都记一次
+        # df（1500 条 ≈ 14 万次 dict 写 + 等量 math.log），99% 是纯浪费。
+        for g in gset & qg_set:
+            df[g] = df.get(g, 0) + 1
+    n = len(prepared)
+    idf = ({g: math.log(1.0 + n / (1.0 + c)) for g, c in df.items()}
+           if n else {})
+
+    scored: list[tuple[float, dict, set[str]]] = []
+    for d, text, gset, d_norm in prepared:
+        # 粗筛：连 gram 都不相交的文档不可能过门槛（精确集合是 gset 的子集）。
+        # 只有少数候选会走到正则过滤，避免为几千条不相关文档付过滤成本。
+        if not (qc_set & gset):
+            continue
+        dc = _content_set_of(gset)
         hit_n = len(qc_set & dc)
         cov = hit_n / len(qc)
         # 双档门槛：
@@ -200,21 +296,24 @@ def rank(query: str, docs: list[dict[str, Any]], *, k: int = 5,
             continue
         s = score(query, text, idf, qg=qg, ts=float(d.get(ts_key) or 0),
                   kind=str(d.get(kind_key) or ""), hits=int(d.get(hits_key) or 0),
-                  half_life_days=half_life_days, now=now)
+                  half_life_days=half_life_days, now=now,
+                  doc_grams=gset, doc_norm=d_norm, q_norm=q_norm,
+                  qg_set=qg_set)
         if s <= 0:
             continue
-        scored.append((s, d))
+        scored.append((s, d, gset))
 
     scored.sort(key=lambda x: -x[0])
 
     out: list[dict] = []
-    for s, d in scored:
-        if dedup and any(jaccard(str(d.get(text_key, "")),
-                                 str(p.get(text_key, ""))) >= DEDUP_SIM for p in out):
+    kept_grams: list[set[str]] = []
+    for s, d, gset in scored:
+        if dedup and any(_jaccard_sets(gset, kg) >= DEDUP_SIM for kg in kept_grams):
             continue
         item = dict(d)
         item["_score"] = round(s, 4)
         out.append(item)
+        kept_grams.append(gset)
         if len(out) >= k:
             break
     return out
