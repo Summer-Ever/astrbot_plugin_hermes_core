@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.9"
+PLUGIN_VERSION = "0.12.10"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -301,6 +301,12 @@ class HermesCore(Star):
         self._migrate_watermarks()
         self._check_memory_conflicts()
         self._recover_interrupted_job()
+        try:
+            n = self.router.load_cooldowns()
+            if n:
+                logger.info(f"[hermes_core] 恢复 {n} 个模型的冷却状态（重启后不会立刻重撞）")
+        except Exception:
+            logger.warning(f"[hermes_core] 读取冷却状态失败:\n{traceback.format_exc(limit=2)}")
         self._register_web_apis()
         if self._get_cfg("auto_summarize", True):
             self._bg_task = asyncio.create_task(self._bg_loop())
@@ -406,7 +412,8 @@ class HermesCore(Star):
         rep["text"] = (f"上次整理被中断（机器人后台退出）。"
                        f"{done_txt + '。' if done_txt else ''}"
                        "已提交的合并/丢弃都已写库，没跑到的部分没有处理；"
-                       "需要的话重发 /hermes 整理。")
+                       "重发 /hermes 整理 会接着上次的进度跑，"
+                       "想从第一片重来就发 /hermes 整理 深度 重来。")
         self.db.set_meta("consolidate_report", json.dumps(rep, ensure_ascii=False))
         logger.warning(f"[hermes_core] 上次整理被中断，已标记为未完成"
                        f"（{done_txt or '无进度记录'}）")
@@ -424,6 +431,52 @@ class HermesCore(Star):
             return
         rep["progress"] = {"done": int(done), "total": int(total)}
         self.db.set_meta("consolidate_report", json.dumps(rep, ensure_ascii=False))
+
+    # ---- 整理断点：中断后重发只补没跑的部分 ----
+    #
+    # 不这样做的话，一次跑到 5/7 被 kill，重发会从第 1 片重新调模型：
+    # 已经整理过的片白烧一遍 token，还可能被限流挡在门外。
+    # 只认「记忆内容签名一致」的断点——用户又聊了几句、记忆变了就重头算，
+    # 否则新记忆会永远进不了整理范围。
+
+    _CHECKPOINT_META = "consolidate_checkpoint"
+    _CHECKPOINT_TTL = 6 * 3600
+
+    @staticmethod
+    def _unit_key(items: list[dict]) -> str:
+        h = hashlib.md5()
+        for i in sorted(int(m["id"]) for m in items):
+            h.update(f"{i},".encode())
+        return h.hexdigest()[:12]
+
+    @staticmethod
+    def _mem_signature(rows: list[dict]) -> str:
+        h = hashlib.md5()
+        for m in sorted(rows, key=lambda r: int(r["id"])):
+            h.update(f"{m['id']}:{m.get('content') or ''}".encode())
+        return h.hexdigest()[:12]
+
+    def _load_consolidate_checkpoint(self, sig: str) -> set[str]:
+        raw = self.db.get_meta(self._CHECKPOINT_META, "")
+        if not raw:
+            return set()
+        try:
+            cp = json.loads(raw)
+        except Exception:
+            return set()
+        if not isinstance(cp, dict) or cp.get("sig") != sig:
+            return set()
+        try:
+            if time.time() - float(cp.get("ts") or 0) > self._CHECKPOINT_TTL:
+                return set()
+            return {str(k) for k in (cp.get("done") or [])}
+        except Exception:
+            return set()
+
+    def _save_consolidate_checkpoint(self, sig: str, done: set[str]) -> None:
+        self.db.set_meta(self._CHECKPOINT_META, json.dumps(
+            {"sig": sig, "ts": int(time.time()), "done": sorted(done)},
+            ensure_ascii=False))
 
     def _write_build_stamp(self) -> None:
         try:
@@ -1395,7 +1448,8 @@ class HermesCore(Star):
 
     async def _consolidate_memories(self, dry_run: bool = False,
                                     focus_ids: set[int] | None = None,
-                                    deep: bool = False) -> str:
+                                    deep: bool = False,
+                                    force: bool = False) -> str:
         """把碎片化的记忆合并成更完整的条目。
 
         三种模式：
@@ -1414,7 +1468,7 @@ class HermesCore(Star):
         # 钉住的条目是用户明确要求保护的重要信息：不参与任何合并/丢弃归纳
         rows = [m for m in rows if not int(m.get("pinned") or 0)]
         if deep:
-            return await self._deep_consolidate(rows, dry_run)
+            return await self._deep_consolidate(rows, dry_run, force=force)
 
         threshold = float(self._get_cfg("consolidate_threshold", 0.3))
         max_clusters = max(1, int(self._get_cfg("consolidate_max_clusters", 6)))
@@ -1495,7 +1549,15 @@ class HermesCore(Star):
                 body += "\n（其余组因当前模型上下文不足未列出，可换更大上下文的模型再整理）"
             return head + body
 
-        text = await self.router.chat(builder=build, purpose="整理记忆")
+        # 普通整理只有一次调用，但仍要限住总时长：自动整理是挂在总结之后的，
+        # 卡上几分钟会把整个后台队列堵死。
+        _budget = max(30, int(self._get_cfg("consolidate_budget_seconds", 240)))
+        text = await self.router.chat(
+            builder=build, purpose="整理记忆",
+            timeout=min(45.0, float(_budget)),
+            max_attempts=3,
+            deadline=time.monotonic() + _budget,
+        )
         plan = self._extract_json_array(text)
 
         applied: list[str] = []
@@ -1533,15 +1595,24 @@ class HermesCore(Star):
         head = "记忆整理预览（未写入）" if dry_run else "记忆已整理"
         return f"{head}：{len(applied)} 组\n" + "\n".join(f"- {a}" for a in applied[:8])
 
-    async def _deep_consolidate(self, rows: list[dict], dry_run: bool) -> str:
+    async def _deep_consolidate(self, rows: list[dict], dry_run: bool,
+                                force: bool = False) -> str:
         """深度整理：全量记忆直接交给模型归纳，不依赖字面相似度聚类。
 
         与普通整理的区别：
-        - 同义改写/中英混排的重复（「友善温柔的女孩」vs「kind gentle assistant」）
+        - 同义改写/中英混排的重复（「友善温柔的女孩」vs 「kind gentle assistant」）
           字面相似度召回不到，只有全量喂给模型才看得出来；
         - 可以「丢弃」：一次性任务指令、闲聊反馈、技能清单这类条目没法跟谁合并，
           只能整体退出活跃池（merged_into = -1，保留原文可人工恢复）。
         按作用域分桶逐桶调用，绝不跨用户/跨群归纳。
+
+        防风控 / 防长等的四条约束（每条都是踩过坑之后加的）：
+        - 分片：单桶超过 chunk_size 条就切片，prompt 不至于过长，
+          超时只损失一片；大桶优先跑，预算不够时先保住影响面最大的；
+        - 总预算 deadline：整次整理最多跑 budget 秒，到点就停并如实报进度，
+          杜绝「等了 12 分钟最后全失败」；
+        - 连续失败止损：连着几片都调不通说明模型链整体挂了，继续跑只是烧时间；
+        - 断点续跑：跑完的片记进 meta，被中断后重发只补没跑的部分。
         """
         buckets: dict[tuple, list[dict]] = {}
         for m in rows:
@@ -1564,40 +1635,89 @@ class HermesCore(Star):
             "ids 至少 1 条。没有需要动的就输出 []。\n\n"
         )
 
+        # ---- 切片：单桶 100+ 条一次喂进去，prompt 长、出结果慢、超时全丢 ----
+        # 40 条约 6-8k 字符，多数模型 10-20 秒能收敛；记忆按写入时间排序，
+        # 同一话题产生的重复条目大概率落在相邻的片里。
+        chunk = max(10, min(80, int(self._get_cfg("consolidate_chunk_size", 40))))
+        units: list[tuple[str, list[dict]]] = []
+        for bucket, items in buckets.items():
+            if len(items) < 2:
+                continue
+            if len(items) <= chunk:
+                units.append((self._unit_key(items), items))
+                continue
+            for off in range(0, len(items), chunk):
+                part = items[off:off + chunk]
+                if len(part) >= 2:
+                    units.append((self._unit_key(part), part))
+        # 大块先跑：预算耗尽时优先保住影响面最大的那片
+        units.sort(key=lambda u: -len(u[1]))
+        total_units = len(units)
+        if not total_units:
+            return "没有需要整理的作用域（每个作用域都只有 1 条记忆）。"
+
+        # ---- 断点：记忆内容没变才复用上次进度 ----
+        sig = self._mem_signature(rows)
+        done_keys = set() if force else self._load_consolidate_checkpoint(sig)
+        reused = sum(1 for k, _ in units if k in done_keys)
+
+        budget = max(30, int(self._get_cfg("consolidate_budget_seconds", 240)))
+        deadline = time.monotonic() + budget
+        max_streak = max(1, int(self._get_cfg("consolidate_max_fail_streak", 3)))
+
+        def fail_note() -> str:
+            self._bump_consolidate_progress(idx, total_units)
+            return f"深度整理跳过一片（{idx}/{total_units}）"
+
         applied: list[str] = []
         total_merge = total_drop = 0
         skipped = 0
-        # 只统计真正要交给模型的桶（单条作用域直接跳过），用于中断时报告进度
-        total_buckets = sum(1 for v in buckets.values() if len(v) >= 2)
-        done_buckets = 0
-        for bucket, items in buckets.items():
+        fail_streak = 0
+        stopped = ""
+        idx = 0
+
+        for idx, (ukey, items) in enumerate(units, 1):
+            if ukey in done_keys:
+                continue
             listing = "\n".join(
                 f"- #{m['id']} ({m['kind']}) {str(m['content'])[:160]}"
-                for m in items[:120]
+                for m in items
             )
-            if len(items) < 2:
-                continue
             try:
                 text = await self.router.chat(
-                    builder=lambda budget, _l=listing: head
-                    + _l[:max(600, budget - len(head) - 40)],
+                    builder=lambda budget_chars, _l=listing: head
+                    + _l[:max(600, budget_chars - len(head) - 40)],
                     purpose="深度整理记忆",
-                    # 单桶最多 4 次尝试、单次 70 秒：整库是逐桶串行的，按默认的
-                    # 8 次 × 90 秒算，几个桶就能把一次整理拖到十几分钟。
-                    timeout=70.0,
-                    max_attempts=4,
+                    # 单次 45 秒、单片最多 3 次尝试：整理是逐片串行的，
+                    # 按 90 秒 × 8 次算，几片就能把一次整理拖到十几分钟。
+                    timeout=45.0,
+                    max_attempts=3,
+                    deadline=deadline,
                 )
             except Exception as exc:
-                # 一个作用域失败不能拖垮整次整理：前面成功的桶已经写库了，
-                # 这里跳过并计数，最后如实报告哪几个没整理到。
+                # deadline（预算用尽 / 限流保护等不到）是「停止整批」的信号，
+                # 不是「跳过这一片」——继续拿下一片去撞同一个限流模型只会更糟。
+                if isinstance(exc, ModelError) and exc.kind == "deadline":
+                    stopped = str(exc)
+                    self._bump_consolidate_progress(idx - 1, total_units)
+                    break
                 skipped += 1
-                logger.warning(f"[hermes_core] 深度整理跳过作用域 {bucket}: {str(exc)[:160]}")
+                fail_streak += 1
+                logger.warning(f"[hermes_core] {fail_note()}: {str(exc)[:160]}")
+                if fail_streak >= max_streak:
+                    stopped = (f"连续 {fail_streak} 片调用失败，模型链整体不可用，"
+                               "已停止以免继续空等")
+                    break
                 continue
-            finally:
-                done_buckets += 1
-                self._bump_consolidate_progress(done_buckets, total_buckets)
-            valid_ids = {int(m["id"]) for m in items[:120]}
-            id_scope = {int(m["id"]): _scope_bucket(m) for m in items[:120]}
+
+            fail_streak = 0
+            done_keys.add(ukey)
+            if not dry_run:
+                self._save_consolidate_checkpoint(sig, done_keys)
+            self._bump_consolidate_progress(idx, total_units)
+
+            valid_ids = {int(m["id"]) for m in items}
+            id_scope = {int(m["id"]): _scope_bucket(m) for m in items}
             for item in self._extract_json_array(text):
                 if not isinstance(item, dict):
                     continue
@@ -1622,8 +1742,9 @@ class HermesCore(Star):
                     content = str(item.get("content") or "").strip()
                     if len(ids) < 2 or not content:
                         continue
+                    id_set = set(ids)
                     old_texts = [str(m["content"]) for m in items
-                                 if int(m["id"]) in set(ids)]
+                                 if int(m["id"]) in id_set]
                     if dry_run:
                         applied.append(
                             f"#{'/'.join(map(str, ids))}：{' / '.join(old_texts)[:80]}"
@@ -1635,16 +1756,33 @@ class HermesCore(Star):
                         applied.append(
                             f"#{'/'.join(map(str, ids))} → {content[:80]}")
 
-        miss = f"，{skipped} 个作用域因模型失败跳过" if skipped else ""
-        if not applied:
-            return (f"深度整理完成：{len(buckets)} 个作用域，"
-                    f"模型认为没有需要合并或丢弃的条目{miss}。")
-        self._resident_cache.clear()
-        tag = "深度整理预览（未写入）" if dry_run else "深度整理完成"
-        return (f"{tag}：合并 {total_merge} 组、丢弃 {total_drop} 条{miss}\n"
-                + "\n".join(f"- {a}" for a in applied[:10]))
+        if applied and not dry_run:
+            self._resident_cache.clear()
+        # 全部跑完且没跳片：断点作废，下次是全新一轮
+        if not stopped and not skipped and not dry_run:
+            self.db.set_meta("consolidate_checkpoint", "")
 
-    async def _run_consolidate_job(self, deep: bool, dry_run: bool, origin: str):
+        notes: list[str] = []
+        if reused:
+            notes.append(f"沿用上次进度 {reused} 片")
+        if skipped:
+            notes.append(f"{skipped} 片因模型失败跳过")
+        if stopped:
+            notes.append(stopped)
+        miss = ("；" + "，".join(notes)) if notes else ""
+        if not applied and not stopped:
+            return (f"深度整理完成：{total_units} 片，"
+                    f"模型认为没有需要合并或丢弃的条目{miss}。")
+        tag = "深度整理预览（未写入）" if dry_run else "深度整理完成"
+        if stopped:
+            tag = "深度整理未跑完"
+        line = f"{tag}：合并 {total_merge} 组、丢弃 {total_drop} 条，共 {total_units} 片{miss}"
+        if applied:
+            line += "\n" + "\n".join(f"- {a}" for a in applied[:10])
+        return line
+
+    async def _run_consolidate_job(self, deep: bool, dry_run: bool, origin: str,
+                                   force: bool = False):
         """把一次手动整理跑完，结果落 meta 并主动推回发起会话。
 
         为什么要脱离事件处理：整库整理是逐作用域调用模型，慢的时候能到十分钟
@@ -1657,7 +1795,8 @@ class HermesCore(Star):
             ensure_ascii=False))
         ok = True
         try:
-            out = await self._consolidate_memories(dry_run=dry_run, deep=deep)
+            out = await self._consolidate_memories(dry_run=dry_run, deep=deep,
+                                                   force=force)
             if not dry_run:
                 self._reset_memory_queue()  # 全库刚整理过，队列里的 id 已经没意义
         except Exception:
@@ -2006,15 +2145,17 @@ class HermesCore(Star):
         if not self.router.has_model():
             yield event.plain_result("没有可用的对话模型，请先在插件页面「模型」标签配置。")
             return
-        deep = mode in ("深度", "deep", "彻底")
-        dry = mode in ("预览", "试运行", "dry", "dry-run")
+        deep = any(k in mode.lower() for k in ("深度", "deep", "彻底"))
+        dry = any(k in mode.lower() for k in ("预览", "试运行", "dry", "dry-run"))
+        # 「重来」= 忽略上次中断留下的断点，从第一片重新归纳
+        force = any(k in mode.lower() for k in ("重来", "全部", "从头", "force"))
         if self._consolidate_task and not self._consolidate_task.done():
             yield event.plain_result("上一次整理还在跑，发 /hermes 整理结果 看进度。")
             return
         # 不 await 在这里等：逐作用域调模型可能超过十分钟，等下去必定撞上平台
         # 被动回复有效期，结果发不出去。改成后台跑 + 完成后主动推送。
         self._consolidate_task = asyncio.create_task(
-            self._run_consolidate_job(deep=deep, dry_run=dry,
+            self._run_consolidate_job(deep=deep, dry_run=dry, force=force,
                                       origin=event.unified_msg_origin))
         yield event.plain_result(
             "深度整理已开始（全量交给模型归纳，会清理一次性指令和闲聊条目）。\n"

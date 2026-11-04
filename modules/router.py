@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
+import re
 import time
 import traceback
 from collections import deque
@@ -144,6 +146,89 @@ def _completion_text(resp: Any) -> str:
     return str(text or "")
 
 
+def retry_after_of(exc: BaseException) -> float:
+    """从 429 异常里挖出服务端要求的等待秒数，挖不到返回 0。
+
+    服务端说「等 12 秒」，我们 3 秒后就重试，只会把限流窗口越撞越死——
+    这是最容易把自己送进黑名单的写法。两种常见位置都认：
+    HTTP 头 Retry-After，以及正文里的 "Please try again in 12.3s"。
+    """
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        resp = getattr(exc, "response", None)
+        headers = getattr(resp, "headers", None) if resp is not None else None
+    if headers:
+        try:
+            val = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            val = None
+        if val:
+            try:
+                return max(0.0, min(600.0, float(val)))
+            except (TypeError, ValueError):
+                pass
+    m = re.search(r"try again in\s*([\d.]+)\s*s", str(exc) or "", re.I)
+    if m:
+        try:
+            return max(0.0, min(600.0, float(m.group(1))))
+        except ValueError:
+            pass
+    return 0.0
+
+
+class _Throttle:
+    """按 provider 的出站节流：最小间隔 + 每分钟次数上限。
+
+    为什么必须有：整理是「逐桶串行调用」，桶与桶之间没有任何自然停顿，
+    而免费/低配档模型普遍按分钟计 RPM。连着打必然 429，429 又触发重试，
+    短时间内把配额窗口撞得越来越死。
+
+    两层限制分别治两种病：
+    - min_interval 防「瞬时连击」（多数风控看的是每秒/每几秒的突发）；
+    - rpm 防「一分钟内打满」（免费档常见 10-20 RPM）。
+    rpm=0 表示不限制。
+    """
+
+    def __init__(self):
+        self._next_at: dict[str, float] = {}
+        self._hits: dict[str, deque] = {}
+
+    def _window(self, pid: str, now: float) -> deque:
+        q = self._hits.get(pid)
+        if q is None:
+            q = deque()
+            self._hits[pid] = q
+        while q and now - q[0] > 60.0:
+            q.popleft()
+        return q
+
+    def delay(self, pid: str, rpm: int, min_interval: float) -> float:
+        """还要等多久才能打这个 provider。0 表示现在就可以。"""
+        now = time.time()
+        wait = 0.0
+        nxt = self._next_at.get(pid, 0.0)
+        if nxt > now:
+            wait = nxt - now
+        if rpm > 0:
+            q = self._window(pid, now)
+            if len(q) >= rpm:
+                wait = max(wait, 60.0 - (now - q[0]) + 0.05)
+        return wait
+
+    def record(self, pid: str, min_interval: float) -> None:
+        now = time.time()
+        if min_interval > 0:
+            self._next_at[pid] = now + min_interval
+        self._window(pid, now).append(now)
+
+    def used_last_minute(self, pid: str) -> int:
+        return len(self._window(pid, time.time()))
+
+    def reset(self) -> None:
+        self._next_at.clear()
+        self._hits.clear()
+
+
 class ModelRouter:
     """按配置的模型链调用 LLM，负责重试、降级、冷却与日志。"""
 
@@ -152,11 +237,12 @@ class ModelRouter:
         self._logs: deque[dict] = deque(maxlen=300)
         self._stats: dict[str, dict] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._throttle = _Throttle()
         self._last_used: str = ""
         self._last_skipped: list[dict] = []
         # 汇总计数：页面上要能看出「主模型到底成不成、降级用了多少次」
         self.counters = {"calls": 0, "ok": 0, "fail": 0,
-                         "attempts": 0, "fallback_ok": 0}
+                         "attempts": 0, "fallback_ok": 0, "throttled": 0}
 
     # ---------- 配置 ----------
 
@@ -175,12 +261,16 @@ class ModelRouter:
         retry_on = [k for k in retry_on if k in ERROR_LABELS]
         return {
             "max_retries": max(0, min(9, _as_int(self._cfg("llm_max_retries", 2), 2))),
-            "timeout": max(5.0, min(600.0, _as_float(self._cfg("llm_timeout", 90), 90))),
+            # 整理/总结是后台任务，45 秒还没吐字就说明这个模型今天不行，
+            # 90 秒只是把整次整理拖长（一次整理 6 个桶 = 白等 9 分钟）。
+            "timeout": max(5.0, min(600.0, _as_float(self._cfg("llm_timeout", 45), 45))),
             "backoff": max(0.0, min(30.0, _as_float(self._cfg("llm_backoff", 1.5), 1.5))),
-            "total_attempts": max(1, min(30, _as_int(self._cfg("llm_total_attempts", 8), 8))),
+            "total_attempts": max(1, min(30, _as_int(self._cfg("llm_total_attempts", 4), 4))),
             "cooldown": max(0, min(3600, _as_int(self._cfg("llm_cooldown_seconds", 180), 180))),
             "max_prompt_chars": max(2000, min(200000, _as_int(self._cfg("llm_max_prompt_chars", 24000), 24000))),
             "retry_on": retry_on or DEFAULT_RETRY_ON,
+            "rpm": max(0, min(600, _as_int(self._cfg("llm_rpm", 10), 10))),
+            "min_interval": max(0.0, min(60.0, _as_float(self._cfg("llm_min_interval", 1.5), 1.5))),
         }
 
     def configured_primary(self) -> str:
@@ -298,8 +388,14 @@ class ModelRouter:
 
     # ---------- 链与冷却 ----------
 
-    def effective_chain(self, ignore_cooldown: bool = False) -> list[dict]:
-        """主模型 + 降级链，过滤掉不存在/未加载/冷却中的。"""
+    def effective_chain(self, ignore_cooldown: bool = False,
+                        strict_cooldown: bool = False) -> list[dict]:
+        """主模型 + 降级链，过滤掉不存在/未加载/冷却中的。
+
+        strict_cooldown=True 时，全部模型都在冷却就返回空链（调用方直接放弃），
+        不再「宁可撞一下」——批处理场景里撞一下的代价是一次 45 秒空等，
+        而对面明明刚说过限流。
+        """
         configs = self._configs()
         insts = self._insts()
         primary = self.configured_primary() or self.current_provider_id()
@@ -329,8 +425,8 @@ class ModelRouter:
                 "model": cfg.get("model", "") or pid,
             })
 
-        # 全部在冷却里：宁可撞一下也别直接不干活
-        if not chain and skipped:
+        # 全部在冷却里：宁可撞一下也别直接不干活（批处理场景除外）
+        if not chain and skipped and not strict_cooldown:
             for pid in wanted:
                 inst = insts.get(pid)
                 if inst is None:
@@ -349,7 +445,7 @@ class ModelRouter:
         until = self._cooldown_until.get(pid, 0)
         return max(0, int(until - time.time()))
 
-    def _mark_failed(self, pid: str, kind: str) -> None:
+    def _mark_failed(self, pid: str, kind: str, exc: BaseException | None = None) -> None:
         if kind not in COOLDOWN_KINDS:
             return
         sec = self.policy()["cooldown"]
@@ -357,7 +453,50 @@ class ModelRouter:
             return
         if kind == "auth":
             sec *= 4  # 鉴权失败修起来最慢，别频繁撞
+        if kind == "rate":
+            # 限流冷却要比普通失败更久，且尊重服务端给的 Retry-After：
+            # 对面说等 60 秒，我们 180 秒后再来才安全。
+            sec = max(sec * 3, int(retry_after_of(exc) if exc else 0))
         self._cooldown_until[pid] = time.time() + sec
+        self._persist_cooldowns()
+
+    # ---- 冷却跨重启：否则每次重载都先拿坏模型撞一遍 ----
+
+    _COOLDOWN_META = "llm_cooldown_until"
+
+    def _persist_cooldowns(self) -> None:
+        db = getattr(self.plugin, "db", None)
+        if db is None:
+            return
+        now = time.time()
+        alive = {k: int(v) for k, v in self._cooldown_until.items() if v > now}
+        self._cooldown_until = {k: float(v) for k, v in alive.items()}
+        try:
+            db.set_meta(self._COOLDOWN_META, json.dumps(alive))
+        except Exception:
+            pass
+
+    def load_cooldowns(self) -> int:
+        """启动时把上次遗留的冷却读回来，返回仍在冷却的模型数。"""
+        db = getattr(self.plugin, "db", None)
+        if db is None:
+            return 0
+        try:
+            raw = db.get_meta(self._COOLDOWN_META, "")
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            return 0
+        if not isinstance(data, dict):
+            return 0
+        now = time.time()
+        for pid, until in data.items():
+            try:
+                ts = float(until)
+            except (TypeError, ValueError):
+                continue
+            if ts > now:
+                self._cooldown_until[str(pid)] = ts
+        return len(self._cooldown_until)
 
     def clear_cooldowns(self) -> None:
         self._cooldown_until.clear()
@@ -387,6 +526,7 @@ class ModelRouter:
         ignore_cooldown: bool = False,
         timeout: float | None = None,
         max_attempts: int | None = None,
+        deadline: float | None = None,
     ) -> str:
         """按链调用，返回第一个成功模型的文本。
 
@@ -396,10 +536,24 @@ class ModelRouter:
         max_attempts 用来给「多桶串行」的批处理（如深度整理）压总预算：
         全库整理会一个作用域一次调用，若每次都能烧满 8 次尝试，光超时就能耗掉
         十几分钟，而调用方的消息早就过了平台有效期。
+
+        deadline 是 time.monotonic() 的绝对时刻，整次调用（含节流等待与重试）
+        不会越过它。用尽时抛 ModelError(kind="deadline")，调用方据此停止整批，
+        而不是继续拿下一个桶去撞同一个限流中的模型。
         """
         pol = self.policy()
-        chain = self.effective_chain(ignore_cooldown=ignore_cooldown)
+        started_call = time.monotonic()
+        left = (deadline - started_call) if deadline is not None else None
+        if left is not None and left <= 1.0:
+            raise ModelError("deadline", "本次整理的时间预算已用尽（未开始调用）")
+        chain = self.effective_chain(ignore_cooldown=ignore_cooldown,
+                                     strict_cooldown=deadline is not None)
         if not chain:
+            if deadline is not None and self._last_skipped:
+                raise ModelError("deadline",
+                                 "所有模型都在限流/失败冷却中，先不调用以免加重风控："
+                                 + "；".join(f"{s['id']} {s['reason']}"
+                                            for s in self._last_skipped[:3]))
             raise ModelError("no_provider",
                              "没有可用的对话模型：请先在 AstrBot 配置模型提供商，"
                              "再到本页选择总结模型。")
@@ -414,6 +568,9 @@ class ModelRouter:
         self.counters["calls"] += 1
         fallback_index = -1
 
+        def remaining() -> float | None:
+            return None if deadline is None else deadline - time.monotonic()
+
         for entry in chain:
             fallback_index += 1
             pid = entry["id"]
@@ -425,16 +582,41 @@ class ModelRouter:
                 model_prompt = prompt or ""
 
             model_failed_kind = ""
+            model_failed_exc: BaseException | None = None
             for i in range(per_model):
                 if attempts >= total_cap:
                     break
+
+                # 出站节流：整理逐桶串行，桶与桶之间没有自然停顿，
+                # 不主动拉开间隔就会把免费档模型的分钟配额打满。
+                wait = self._throttle.delay(pid, pol["rpm"], pol["min_interval"])
+                if wait > 0:
+                    left_now = remaining()
+                    if left_now is not None and wait > left_now - 1.0:
+                        # 等不起就别等：把剩下的预算留给下一次整理，
+                        # 而不是在这里睡到超时再报错。
+                        self.counters["throttled"] += 1
+                        raise ModelError(
+                            "deadline",
+                            f"{pid} 触发限流保护（每分钟最多 {pol['rpm']} 次），"
+                            f"还需等待 {int(wait)} 秒；本次整理先停在这里")
+                    logger.info(f"[hermes_core] {purpose} 节流等待 {wait:.1f}s（{pid}）")
+                    await asyncio.sleep(wait)
+
+                left_now = remaining()
+                if left_now is not None and left_now < 5.0:
+                    # 剩下不到一次最短请求的时间，打出去也必然超时，直接收工。
+                    raise ModelError("deadline", "本次整理的时间预算已用尽")
+                eff_limit = limit if left_now is None else min(limit, left_now)
+
                 attempts += 1
                 self.counters["attempts"] += 1
+                self._throttle.record(pid, pol["min_interval"])
                 started = time.time()
                 try:
                     resp = await asyncio.wait_for(
                         inst.text_chat(prompt=model_prompt, session_id=None),
-                        timeout=limit,
+                        timeout=eff_limit,
                     )
                     text = _completion_text(resp)
                     if not text.strip():
@@ -450,22 +632,31 @@ class ModelRouter:
                     kind = classify_error(exc)
                     msg = str(exc)[:300] or type(exc).__name__
                     model_failed_kind = kind
+                    model_failed_exc = exc
                     self._log(purpose, pid, entry["model"], i + 1, started, False, kind, msg)
                     tried.append({"provider": pid, "kind": kind, "error": msg, "attempt": i + 1})
                     logger.warning(
                         f"[hermes_core] {purpose} 失败 model={pid} 第{i + 1}次 "
                         f"[{ERROR_LABELS.get(kind, kind)}] {msg[:160]}"
                     )
+                    if kind == "rate":
+                        # 429 / 额度用尽：原地重试只会把限流窗口越撞越死，
+                        # 立刻换模型，同时按 Retry-After 给它一段更长的冷却。
+                        logger.warning(f"[hermes_core] {pid} 被限流，立即换模型并冷却")
+                        break
                     if kind not in pol["retry_on"]:
                         break  # 鉴权/超长等，重试无意义，换模型
                     if i < per_model - 1 and attempts < total_cap:
                         delay = min(10.0, pol["backoff"] * (2 ** i)) + random.uniform(0, 0.3)
+                        left_now = remaining()
+                        if left_now is not None and delay > left_now - 1.0:
+                            raise ModelError("deadline", "本次整理的时间预算已用尽")
                         if delay > 0:
                             await asyncio.sleep(delay)
 
             # 这个模型放弃了（重试耗尽或不可重试错误），进冷却，换下一个
             if model_failed_kind:
-                self._mark_failed(pid, model_failed_kind)
+                self._mark_failed(pid, model_failed_kind, model_failed_exc)
             if attempts >= total_cap:
                 break
 
@@ -569,7 +760,10 @@ class ModelRouter:
                 "llm_cooldown_seconds": pol["cooldown"],
                 "llm_max_prompt_chars": pol["max_prompt_chars"],
                 "llm_retry_on": pol["retry_on"],
+                "llm_rpm": pol["rpm"],
+                "llm_min_interval": pol["min_interval"],
             },
+            "counters": dict(self.counters),
             "providers": providers,
             "logs": self.logs(80),
             "skipped": self._last_skipped,

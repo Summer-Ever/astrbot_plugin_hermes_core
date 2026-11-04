@@ -107,6 +107,30 @@
         "default": 6,
         "description": "每次最多整理几组（控制单次花费）"
     },
+    "consolidate_chunk_size": {
+        "type": "int",
+        "default": 40,
+        "min": 10,
+        "max": 80,
+        "description": "深度整理时一个作用域最多几条记忆交给同一次模型调用",
+        "hint": "超出就切片分别调用。40 条约 6-8k 字符，单次 10-20 秒能出结果；调大能减少调用次数（更省 RPM 配额），但单次更容易超时"
+    },
+    "consolidate_budget_seconds": {
+        "type": "int",
+        "default": 240,
+        "min": 30,
+        "max": 1800,
+        "description": "一次整理最多跑多少秒（时间到就停下并报告进度）",
+        "hint": "防止模型链慢的时候一次整理拖成十几分钟；没跑完的片下次重发会接着跑，已完成的不重复调用"
+    },
+    "consolidate_max_fail_streak": {
+        "type": "int",
+        "default": 3,
+        "min": 1,
+        "max": 10,
+        "description": "连续几片调用失败就停止整次整理",
+        "hint": "连续失败通常说明模型链整体不可用，继续跑只会空等并加重限流"
+    },
     "skill_merge_same_name": {
         "type": "bool",
         "default": true,
@@ -168,11 +192,11 @@
     },
     "llm_timeout": {
         "type": "float",
-        "default": 90,
+        "default": 45,
         "min": 5,
         "max": 600,
         "description": "单次请求超时秒数",
-        "hint": "超时会计为可重试错误；长上下文模型整理大库时可能需要 120 以上"
+        "hint": "后台总结/整理用 45 秒足够；90 秒会把一次多片整理拖成十几分钟。模型链慢时可调到 60-90"
     },
     "llm_backoff": {
         "type": "float",
@@ -183,10 +207,11 @@
     },
     "llm_total_attempts": {
         "type": "int",
-        "default": 8,
+        "default": 4,
         "min": 1,
         "max": 30,
-        "description": "整条链最多尝试多少次，防止所有模型都挂时无限重试"
+        "description": "整条链最多尝试多少次，防止所有模型都挂时无限重试",
+        "hint": "按单次 45 秒算，8 次就是 6 分钟空等；后台任务 4 次足够（2 个模型各 2 次）"
     },
     "llm_cooldown_seconds": {
         "type": "int",
@@ -214,7 +239,23 @@
             "empty"
         ],
         "description": "这些错误会重试同一模型；未勾选的（如鉴权、上下文超长）直接换下一个模型",
-        "hint": "可选：timeout/conn/rate/server/empty/auth/ctx/other"
+        "hint": "可选：timeout/conn/rate/server/empty/auth/ctx/other。注意 rate（429/额度用尽）现在一律直接换模型并冷却，不会原地重试"
+    },
+    "llm_rpm": {
+        "type": "int",
+        "default": 10,
+        "min": 0,
+        "max": 600,
+        "description": "同一个模型每分钟最多调用几次（0 = 不限制）",
+        "hint": "免费档模型通常 10-20 RPM，超过就 429。整理是逐片连续调用，这是最容易触发风控的地方。付费模型可调大或设 0"
+    },
+    "llm_min_interval": {
+        "type": "float",
+        "default": 1.5,
+        "min": 0,
+        "max": 60,
+        "description": "同一个模型两次调用的最小间隔秒数",
+        "hint": "防瞬时连击；0 = 不间隔"
     },
     "summary_prompt": {
         "type": "text",
