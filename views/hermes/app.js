@@ -386,12 +386,21 @@
         : (r.group_id ? `<span class="muted">群 ${esc(String(r.group_id).slice(0, 10))}</span>` : '<span class="faint">全局</span>');
       const mergedChip = Number(r.merged_into) ? ' <span class="chip">已合并</span>' : "";
       const pinChip = Number(r.pinned) ? ' <span class="chip warn" title="钉住：每轮必注入，整理时不可合并/丢弃">钉住</span>' : "";
+      // 可见范围：私聊=只在私聊可用；群=只在来源群可用；公开=任何场景可用。
+      // 群聊场景默认不引用 private，这条徽标就是排查「群里为什么想不起来」的入口。
+      const visMap = {
+        private: ["chip", "仅私聊", "私聊里沉淀的内容，群里不会引用"],
+        group: ["chip blue", "群内", "只在来源群可见"],
+        public: ["chip ok", "公开", "任何场景都可引用"],
+      };
+      const vis = visMap[r.visibility] || visMap.private;
+      const visChip = `<button class="chip ${vis[0].replace("chip", "").trim()}" data-mem-vis="${r.id}" data-vis="${esc(r.visibility || "private")}" title="${vis[2]}（点击切换）" style="cursor:pointer">${vis[1]}</button>`;
       return `
         <tr data-id="${r.id}">
           <td><input type="checkbox" class="checkbox mem-check" data-id="${r.id}" ${m.selected.has(r.id) ? "checked" : ""}></td>
           <td class="mono faint">${r.id}</td>
           <td><span class="chip blue">${esc(KIND_LABEL[r.kind] || r.kind)}</span></td>
-          <td class="content"><div class="text">${esc(r.content)}</div>${mergedChip}${pinChip}</td>
+          <td class="content"><div class="text">${esc(r.content)}</div>${mergedChip}${pinChip}${visChip}</td>
           <td>${owner}</td>
           <td><span class="chip">${esc(r.source || "—")}</span></td>
           <td class="nowrap muted">${fmtTime(r.ts)}</td>
@@ -1224,6 +1233,20 @@
         try {
           await apiPost("memories/pin", { id, pinned: !pinned });
           toast(pinned ? "已取消钉住" : "已钉住：每轮必注入");
+          loadMemories();
+        } catch (_) { /* 错误已由 apiPost 提示 */ }
+        return;
+      }
+      const visBtn = e.target.closest("[data-mem-vis]");
+      if (visBtn) {
+        const id = Number(visBtn.dataset.memVis);
+        const cur = visBtn.dataset.vis || "private";
+        const next = cur === "private" ? "group" : (cur === "group" ? "public" : "private");
+        try {
+          await apiPost("memories/visibility", { id, visibility: next });
+          toast(next === "private" ? "已设为仅私聊：群里不再引用"
+            : next === "group" ? "已设为群内可见"
+            : "已设为公开：任何场景都可引用");
           loadMemories();
         } catch (_) { /* 错误已由 apiPost 提示 */ }
         return;

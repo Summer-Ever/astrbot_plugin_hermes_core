@@ -38,11 +38,20 @@ KIND_WEIGHT = {
 
 # 检索命中率低时的兜底：query 太短没有区分度，直接不检索
 MIN_QUERY_CHARS = 2
-# 覆盖率低于此值视为噪声。中文 bigram 下 0.30 大约是「九个词里至少中三个」，
-# 实测能挡住「只撞到 说过/什么 这类虚词」的假命中，同时保留真实相关条目。
+# 覆盖率低于此值视为噪声。门槛只在「内容词」上算（见 content_grams）——
+# 用全量 bigram 做分母时，一句正常问句会被「的/怎么/时候」这些虚词稀释到 0.3 以下，
+# 实测「部署的时候证书报错怎么办」正好 0.27 被误杀。
 MIN_COVERAGE = 0.30
 # MMR 去冗余阈值：两条记忆相似到这个程度就只留分高的那条
 DEDUP_SIM = 0.72
+
+# 虚词字符集：含这些字的 bigram 不计入覆盖率分母。
+# 只收纯功能字，刻意不包含「时/候/用/看/上/下/要/会/能/想/说」——
+# 它们常出现在实词里（用 winget、看日志、后端、上海）。
+_STOP_CHARS = set(
+    "的了嘛吗呢吧啊呀哦嗯我你您他她它们是在有和就都也还这那个什么怎"
+    "请帮把被给跟对从而且或之其与及呗哈呃诶"
+)
 
 
 def norm(text: str) -> str:
@@ -66,6 +75,17 @@ def jaccard(a: str, b: str) -> float:
         return 0.0
     inter = len(A & B)
     return inter / (len(A) + len(B) - inter)
+
+
+def content_grams(text: str) -> list[str]:
+    """只保留实词二元组，用于「这条相不相关」的门槛判断。
+
+    虚词构成的双字词（的时/时候/怎么/么办/这个）对判断相关性没有信息量，
+    却会把分母撑大。全被过滤时退回原始 bigram，避免空分母。
+    """
+    gs = grams(text)
+    out = [g for g in gs if not any(ch in _STOP_CHARS for ch in g)]
+    return out or gs
 
 
 def build_idf(docs: Iterable[str]) -> dict[str, float]:
@@ -157,20 +177,31 @@ def rank(query: str, docs: list[dict[str, Any]], *, k: int = 5,
     if len(norm(query)) < MIN_QUERY_CHARS:
         return []
     qg = grams(query)
-    if not qg:
+    qc = content_grams(query)
+    if not qg or not qc:
         return []
+    qc_set = set(qc)
     idf = build_idf([str(d.get(text_key, "")) for d in docs])
 
     scored: list[tuple[float, dict]] = []
     for d in docs:
         text = str(d.get(text_key, ""))
+        dc = set(content_grams(text))
+        hit_n = len(qc_set & dc)
+        cov = hit_n / len(qc)
+        # 双档门槛：
+        # - 短 query（≤3 个实词）命中一个强词即可，否则「这个报错怎么修」永远进不来；
+        # - 长 query 要求至少 2 个实词命中，防止一个烂大街的词把噪声拉进注入。
+        if len(qc) <= 3:
+            ok = hit_n >= 1 and cov >= 0.5
+        else:
+            ok = hit_n >= 2 and cov >= min_coverage
+        if not ok:
+            continue
         s = score(query, text, idf, qg=qg, ts=float(d.get(ts_key) or 0),
                   kind=str(d.get(kind_key) or ""), hits=int(d.get(hits_key) or 0),
                   half_life_days=half_life_days, now=now)
         if s <= 0:
-            continue
-        # 覆盖率门槛：防止「只撞到一个烂大街的双字词」就进注入
-        if _coverage(qg, set(grams(text))) < min_coverage:
             continue
         scored.append((s, d))
 
@@ -193,6 +224,67 @@ def rank_messages(query: str, docs: list[dict[str, Any]], *, k: int = 3,
                   now: float | None = None) -> list[dict]:
     """历史消息排序。消息没有 kind，衰减也更快（聊过的话时效性更强）。"""
     return rank(query, docs, k=k, half_life_days=90.0, now=now)
+
+
+def context_text(item: Any) -> tuple[str, str]:
+    """从 AstrBot 的 contexts 条目里取 (role, text)。
+
+    兼容 dict / 对象两种形态，以及多模态的 parts 列表——不同适配器结构不同，
+    取错就会把「继续」补全成空字符串。
+    """
+    if isinstance(item, dict):
+        role = str(item.get("role") or "")
+        content = item.get("content")
+    else:
+        role = str(getattr(item, "role", "") or "")
+        content = getattr(item, "content", "")
+    if isinstance(content, (list, tuple)):
+        buf: list[str] = []
+        for p in content:
+            if isinstance(p, dict):
+                buf.append(str(p.get("text") or ""))
+            else:
+                buf.append(str(getattr(p, "text", "") or p))
+        content = " ".join(buf)
+    return role.lower(), str(content or "")
+
+
+# 追击/指代线索：出现这些词说明这句在「接着说」，需要上一轮的话题才能检索。
+# 刻意不收「怎么办/怎么修」——它们也常出现在自带话题的完整问句里。
+_CUE_RE = re.compile(r"继续|然后|接着|还是|不行|这个|那个|刚才|刚刚|上面|再来|再试|呢$")
+
+
+def expand_query(query: str, contexts: Any, *, short_chars: int = 8,
+                 prev_chars: int = 120) -> str:
+    """短句/指代句用上一条用户发言补全检索词。
+
+    「继续」「然后呢」「这个怎么修」本身零信息，拿它当 query 只能召回 0 条，
+    等于跨会话直接断片。补上一条用户发言就能带上话题。
+    自带话题的长句不动——补全会把上一个话题的噪声带进来。
+    只影响检索，不改变注入内容。
+    """
+    q = str(query or "").strip()
+    if not q:
+        return q
+    nq = norm(q)
+    if len(nq) > int(short_chars) and not (_CUE_RE.search(q) and len(nq) <= 14):
+        return q
+    try:
+        items = list(contexts or [])
+    except (TypeError, ValueError):
+        return q
+    for item in reversed(items):
+        role, text = context_text(item)
+        if role != "user":
+            continue
+        text = text.strip()
+        if not text or text == q or text.startswith("/"):
+            continue
+        # 上一条也是「继续/嗯/？」，补了等于没补，继续往前找有信息的那条
+        if len(norm(text)) < 4:
+            continue
+        return f"{text[:int(prev_chars)]} {q}"
+    return q
 
 
 def filter_in_window(history: list[dict[str, Any]],

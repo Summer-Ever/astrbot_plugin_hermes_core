@@ -36,7 +36,8 @@ PLUGIN_NAME = "astrbot_plugin_hermes_core"
 # 配置项分组：只影响页面上的展示顺序
 CONFIG_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("记忆注入", ("memory_injection", "memory_scope", "per_user_history",
-                  "exclusive_memory", "inject_memories_topk", "inject_history_topk")),
+                  "group_private_memory", "exclusive_memory",
+                  "inject_memories_topk", "inject_history_topk")),
     ("自动总结", ("auto_summarize", "summarize_interval_minutes",
                   "min_new_messages", "summarize_grace_hours")),
     ("记忆整理", ("auto_consolidate", "consolidate_every_n_memories",
@@ -87,6 +88,8 @@ class HermesWebAPI:
             (f"{self.prefix}/memories/add", self.memory_add, ["POST"], "新增记忆"),
             (f"{self.prefix}/memories/update", self.memory_update, ["POST"], "修改记忆"),
             (f"{self.prefix}/memories/pin", self.memory_pin, ["POST"], "钉住/取消钉住记忆（常驻保护）"),
+            (f"{self.prefix}/memories/visibility", self.memory_visibility, ["POST"],
+             "设置记忆可见范围（私聊/群/公开）"),
             (f"{self.prefix}/memories/delete", self.memory_delete, ["POST"], "删除记忆"),
             (f"{self.prefix}/memories/merge", self.memory_merge, ["POST"], "合并多条记忆"),
             (f"{self.prefix}/skills", self.skills, ["GET"], "技能列表（含正文）"),
@@ -273,8 +276,25 @@ class HermesWebAPI:
         mid = self.plugin.db.add_memory(
             kind, content[:500], scope=scope, source="webui",
             owner_id=owner, platform=str(data.get("platform") or ""),
+            group_id=str(data.get("group_id") or ""),
+            visibility=str(data.get("visibility") or ""),
         )
         return json_response({"id": mid})
+
+    async def memory_visibility(self):
+        data = await self._body()
+        try:
+            mid = int(data.get("id"))
+        except (TypeError, ValueError):
+            return self._fail("缺少记忆 id")
+        vis = str(data.get("visibility") or "").strip().lower()
+        if vis not in ("private", "group", "public"):
+            return self._fail("visibility 只能是 private/group/public")
+        ok = self.plugin.db.set_visibility(mid, vis)
+        if not ok:
+            return self._fail("记忆不存在或已失效", 404)
+        self.plugin._resident_cache.clear()
+        return json_response({"id": mid, "visibility": vis})
 
     async def memory_update(self):
         data = await self._body()

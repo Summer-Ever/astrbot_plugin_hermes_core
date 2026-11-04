@@ -9,6 +9,7 @@
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -36,6 +37,14 @@ DEFAULT_KIND = "fact"
 # 去重时的否定词哨兵。只用于「两边是否同极性」的比较，不做语义分析。
 _NEG_WORDS = ("不", "没", "无", "别", "禁止", "取消", "勿", "无需")
 
+# 可互斥的「槽位」：同一槽位在常驻里只该有一个当前值。
+# 目前只识别称呼类——它是最典型的「值会被用户直接改掉」的槽位，
+# 且「兄弟」和「老爹」字面相似度为 0，字面去重完全抓不到。
+_SLOT_PATTERNS = (
+    ("address", re.compile(r"(叫我|喊我|称呼我|管我叫|叫我做|称呼为|称呼成)")),
+)
+
+
 
 def _ph(n: int) -> str:
     """生成 n 个逗号分隔的 SQL 占位符（`?,?,?`）。
@@ -57,6 +66,22 @@ def _where(conds: list[str]) -> str:
 
 
 def _neg_words(text: str) -> set[str]:    return {w for w in _NEG_WORDS if w in str(text or "")}
+
+
+def _slot_of(content: str) -> str:
+    """把记忆归到一个「只能有一个当前值」的槽位，没有则返回空串。
+
+    称呼是典型例子：用户先说「叫我兄弟」，后说「喊我老爹」，前者必须让位。
+    这两句字面相似度为 0，靠 jaccard 永远发现不了冲突，只能按语义槽位判定。
+    正则故意写窄——宁可漏判（靠模型 replaces 兜底），也不要误把
+    「叫我别忘了喝水」当成称呼槽位。
+    """
+    s = str(content or "")
+    for slot, pat in _SLOT_PATTERNS:
+        if pat.search(s):
+            return slot
+    return ""
+
 
 
 # 技能表：唯一键是 (owner_id, name)，同一个人不能有两条同名技能，
@@ -169,11 +194,43 @@ class HermesDB:
             "ALTER TABLE memories ADD COLUMN last_hit_ts REAL DEFAULT 0",
             # v0.12.4：重要信息保护。pinned=1 的条目必进常驻注入，整理时不可合并/丢弃
             "ALTER TABLE memories ADD COLUMN pinned INTEGER DEFAULT 0",
+            # v0.12.5：钉住也要能过期/被取代。pinned_ts 供注入时标注新旧，
+            # 让「兄弟→老爹」这类改动有据可依，而不是两条都永久常驻。
+            "ALTER TABLE memories ADD COLUMN pinned_ts REAL DEFAULT 0",
+            # v0.12.6：可见性。私聊里说的私事不能在群里被引用——同一个人
+            # 在群里 @ 机器人时，私聊记忆一旦注入，回复就是把私事当众说出来。
+            # private=仅私聊可用 / group=仅来源群可用 / public=任何场景可用
+            "ALTER TABLE memories ADD COLUMN visibility TEXT DEFAULT ''",
         ):
             try:
                 c.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # v0.12.5 存量回填：0.12.4 钉住的老条目没有 pinned_ts，用最后更新时间兜底，
+        # 否则注入时排不出新旧，也没法显示「钉于」。
+        try:
+            c.execute(
+                "UPDATE memories SET pinned_ts = COALESCE(NULLIF(updated_ts, 0), ts)"
+                " WHERE pinned = 1 AND COALESCE(pinned_ts, 0) <= 0"
+            )
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
+        # v0.12.6 存量回填：老库没有可见性信息，只能从当时的写入位置推断——
+        # 有 group_id 的是群场景产出（群内可见），无归属的群级/全局条是公共信息，
+        # 其余（有 owner、无 group_id）一律按私聊私有处理。宁可少用，不可误发。
+        try:
+            c.execute(
+                "UPDATE memories SET visibility = CASE"
+                " WHEN scope = 'global' OR (owner_id = '' AND group_id = ''"
+                "   AND session_id = '') THEN 'public'"
+                " WHEN group_id != '' THEN 'group'"
+                " ELSE 'private' END"
+                " WHERE COALESCE(visibility, '') = ''"
+            )
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
         # v0.3.0 迁移：消息也记录群原生 ID，供总结器写入群级记忆时定位
         try:
             c.execute("ALTER TABLE messages ADD COLUMN group_id TEXT DEFAULT ''")
@@ -302,33 +359,56 @@ class HermesDB:
             self.conn.commit()
             return len(ids)
 
-    def prune_messages(self, days: int, batch: int = 2000) -> int:
+    def _delete_message_batch(self, ids: list[int]) -> int:
+        """删一批消息并同步 FTS。ids 来自本文件内的 SELECT，不含外部输入。"""
+        if not ids:
+            return 0
+        if self._fts_enabled:
+            self.conn.executemany(
+                "DELETE FROM messages_fts WHERE rowid = ?", [(i,) for i in ids])
+        self.conn.executemany("DELETE FROM messages WHERE id = ?", [(i,) for i in ids])
+        self.conn.commit()
+        return len(ids)
+
+    def prune_messages(self, days: int, batch: int = 2000,
+                       require_summarized: bool = False) -> int:
         """TTL 保留期修剪：删除过期原始消息并同步 FTS，随后收缩 WAL。
 
         只动 messages（原始转写层，可再生）；memories / skills / identities
         是资产，不受影响。分批提交避免长事务阻塞在线写入。
         返回删除总条数。days <= 0 时直接返回 0（保留期关闭）。
+
+        require_summarized=True 时只删「水位之前」的消息——原文是总结的唯一证据，
+        没总结过就被删掉，那次对话的信息就永久消失了（实测水位 0 的旧消息会被直接删）。
         """
         if int(days) <= 0:
             return 0
         cutoff = time.time() - int(days) * 86400
         total = 0
         with self._lock:
-            # 海象循环：每批取一批删一批；批次大小受 LIMIT 约束，不会长事务
-            while (ids := [r[0] for r in self.conn.execute(
-                    "SELECT id FROM messages WHERE ts < ? LIMIT ?",
-                    (cutoff, int(batch)),
-            ).fetchall()]):
-                if self._fts_enabled:
-                    self.conn.executemany(
-                        "DELETE FROM messages_fts WHERE rowid = ?",
-                        [(i,) for i in ids])
-                self.conn.executemany(
-                    "DELETE FROM messages WHERE id = ?", [(i,) for i in ids])
-                self.conn.commit()
-                total += len(ids)
-                if len(ids) < int(batch):
-                    break
+            if require_summarized:
+                # 按会话各自的水位删，绝不越过未总结的部分
+                for sid in self.all_session_ids():
+                    wm = self.get_watermark(sid)
+                    if wm <= 0:
+                        continue
+                    while (ids := [r[0] for r in self.conn.execute(
+                            "SELECT id FROM messages WHERE session_id = ?"
+                            " AND ts < ? AND id <= ? LIMIT ?",
+                            (sid, cutoff, wm, int(batch)),
+                    ).fetchall()]):
+                        total += self._delete_message_batch(ids)
+                        if len(ids) < int(batch):
+                            break
+            else:
+                # 海象循环：每批取一批删一批；批次大小受 LIMIT 约束，不会长事务
+                while (ids := [r[0] for r in self.conn.execute(
+                        "SELECT id FROM messages WHERE ts < ? LIMIT ?",
+                        (cutoff, int(batch)),
+                ).fetchall()]):
+                    total += self._delete_message_batch(ids)
+                    if len(ids) < int(batch):
+                        break
             if total:
                 try:
                     self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -486,15 +566,38 @@ class HermesDB:
 
     # ---------- memories ----------
 
+    VISIBILITY = ("private", "group", "public")
+
+    @staticmethod
+    def _norm_visibility(visibility: str, owner_id: str = "", group_id: str = "") -> str:
+        """决定一条记忆可以被哪些场景读到。
+
+        没显式指定时按写入位置推断：群里的发言天然是当众说的 → group；
+        私聊里有归属人的 → private；无归属又无会话的全局信息 → public。
+        推断的意义在于「默认不越界」：群场景绝不会去读 private。
+        """
+        v = str(visibility or "").strip().lower()
+        if v in HermesDB.VISIBILITY:
+            return v
+        if group_id:
+            return "group"
+        if owner_id:
+            return "private"
+        return "public"
+
     def add_memory(self, kind: str, content: str, scope: str = "global",
                    source: str = "", owner_id: str = "", session_id: str = "",
-                   platform: str = "", group_id: str = "") -> int:
+                   platform: str = "", group_id: str = "",
+                   visibility: str = "") -> int:
+        vis = self._norm_visibility(visibility, owner_id, group_id)
         with self._lock:
             cur = self.conn.execute(
                 "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
-                " session_id, platform, group_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                " session_id, platform, group_id, visibility)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), self._norm_kind(kind), scope, content, source,
-                 owner_id or "", session_id or "", platform or "", group_id or ""),
+                 owner_id or "", session_id or "", platform or "", group_id or "",
+                 vis),
             )
             self.conn.commit()
             return cur.lastrowid
@@ -507,6 +610,7 @@ class HermesDB:
     def add_memory_smart(self, kind: str, content: str, scope: str = "global",
                          source: str = "", owner_id: str = "", session_id: str = "",
                          platform: str = "", group_id: str = "",
+                         visibility: str = "",
                          threshold: float = 0.70) -> tuple[int, bool]:
         """写入记忆前先判断「这条是不是已经说过了」。
 
@@ -518,18 +622,43 @@ class HermesDB:
         if not content:
             return 0, False
         kind = self._norm_kind(kind)
-        rows = self.conn.execute(
-            "SELECT id, content, importance FROM memories WHERE merged_into = 0"
-            " AND owner_id = ? AND group_id = ? AND session_id = ?"
-            " ORDER BY id DESC LIMIT 300",
-            (owner_id or "", group_id or "", session_id or ""),
-        ).fetchall()
+        vis = self._norm_visibility(visibility, owner_id, group_id)
+        # 去重池不能带 session_id：同一个人在私聊和群里各说一次同样的偏好，
+        # session 不同就会各存一条，两条又会同时进常驻（实测注入块里出现过
+        # 一模一样的重复条目）。按人/按群归并。
+        #
+        # 但去重必须同可见性：把群里说的话并进一条 private 记忆，等于让它
+        # 从此在群里消失；反过来把私聊内容并进 group 记忆，就是把私事搬到群里。
+        # 两者都不能自愈，所以宁可各留一条——常驻/检索按场景过滤，用户看不到重复。
+        if owner_id:
+            rows = self.conn.execute(
+                "SELECT id, content, importance, pinned FROM memories WHERE merged_into = 0"
+                " AND owner_id = ? AND (group_id = '' OR group_id = ?)"
+                " AND COALESCE(visibility, '') = ?"
+                " ORDER BY id DESC LIMIT 300",
+                (owner_id, group_id or "", vis),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT id, content, importance, pinned FROM memories WHERE merged_into = 0"
+                " AND owner_id = '' AND group_id = ? AND session_id = ?"
+                " AND COALESCE(visibility, '') = ?"
+                " ORDER BY id DESC LIMIT 300",
+                (group_id or "", session_id or "", vis),
+            ).fetchall()
         best_id, best_sim = 0, 0.0
+        corrections: list[int] = []
+        pin_old = False
         for r in rows:
             s = _recall.jaccard(content, r["content"] or "")
+            if s < 0.60:
+                continue
             # 否定词不一致时绝不去重：「喜欢猫」和「不喜欢猫」字面相似度 0.71，
-            # 但语义相反，合并会把偏好记反。
+            # 合并会把偏好记反。但这种「高度相似 + 极性相反」恰恰是用户改主意，
+            # 旧条必须退场，否则两个相反偏好会同时被召回、同时注入。
             if _neg_words(content) != _neg_words(r["content"] or ""):
+                corrections.append(int(r["id"]))
+                pin_old = pin_old or bool(int(r["pinned"] or 0))
                 continue
             if s > best_sim:
                 best_id, best_sim = int(r["id"]), s
@@ -546,10 +675,19 @@ class HermesDB:
                     (merged, time.time(), kind, best_id),
                 )
                 self.conn.commit()
+            if corrections:
+                self.supersede_memories(corrections, best_id)
             return best_id, False
-        return self.add_memory(kind, content, scope=scope, source=source,
-                               owner_id=owner_id, session_id=session_id,
-                               platform=platform, group_id=group_id), True
+        new_id = self.add_memory(kind, content, scope=scope, source=source,
+                                 owner_id=owner_id, session_id=session_id,
+                                 platform=platform, group_id=group_id,
+                                 visibility=vis)
+        if corrections:
+            self.supersede_memories(corrections, new_id)
+            if pin_old:
+                # 旧条本来是常驻的，新说法继续常驻，槽位不能空着
+                self.set_pinned(new_id, True)
+        return new_id, True
 
     def bump_hits(self, ids: list[int]) -> None:
         """注入/检索命中后累加访问计数，供后续排序加权。"""
@@ -567,56 +705,181 @@ class HermesDB:
 
     def resident_notes(self, owner_id: str, limit: int = 6,
                        max_chars: int = 400,
-                       kinds: tuple[str, ...] = ("profile", "preference")
-                        ) -> list[dict]:
+                       kinds: tuple[str, ...] = ("profile", "preference"),
+                       allow_private: bool = True) -> list[dict]:
         """常驻「关于你」条目：不依赖检索命中，每次对话固定注入。
 
         Hermes 的做法是把 MEMORY.md / USER.md 整块加载——「机器人记得你」的
         基线不该建立在「这次的关键词恰好撞上」之上。这里只取稳定的画像与偏好
         （fact 是具体事实，量大且多为一次性信息，走检索层按需召回），
         按重要度与命中次数排序，最后按字符预算截断。
+
+        allow_private=False 用于群聊场景：私聊里沉淀的条目一律不取。
+        这条不是「建议」，而是硬过滤——群里的回复是当众的，注进去就等于说出来。
         """
         if not owner_id:
             return []
         marks = _ph(len(kinds))
+        vis = "" if allow_private else " AND COALESCE(visibility, '') != 'private'"
         # 第一批：钉住的条目（任何 kind）——用户/模型明确要求「每轮必带」的信息，
         # 不受 kind 限制，也不受字符预算限制，这是重要信息的保护通道。
+        # 按 pinned_ts 倒序：同槽位冲突时最新的排前面，模型能看出先后。
         pinned_rows = self.conn.execute(
-            "SELECT id, kind, content, importance, hits, pinned FROM memories"
-            " WHERE merged_into = 0 AND owner_id = ? AND pinned = 1"
-            " ORDER BY id DESC LIMIT ?",
+            "SELECT id, kind, content, importance, hits, pinned, pinned_ts,"
+            " COALESCE(visibility, '') AS visibility FROM memories"
+            " WHERE merged_into = 0 AND owner_id = ? AND pinned = 1" + vis +
+            " ORDER BY COALESCE(pinned_ts, 0) DESC, id DESC LIMIT ?",
             (owner_id, max(1, int(limit))),
         ).fetchall()
-        # 第二批：画像/偏好优先于一次性事实，按重要度与命中次数排序
+        # 第二批：画像/偏好优先。重要度必须随时间衰减——importance 只在重复写入时
+        # +0.15、从不下降，按它硬排会让新偏好永远挤不进常驻（实测 6 条老条目
+        # importance 0.6 占满席位，新偏好 0 进不来）。改成「被召回/更新才续命」。
         rows = self.conn.execute(
-            f"SELECT id, kind, content, importance, hits, pinned FROM memories"
+            f"SELECT id, kind, content, importance, hits, pinned, pinned_ts,"
+            f" ts, updated_ts, last_hit_ts, COALESCE(visibility, '') AS visibility"
+            f" FROM memories"
             f" WHERE merged_into = 0 AND owner_id = ? AND pinned = 0 AND kind IN ({marks})"
-            f" ORDER BY CASE kind WHEN 'profile' THEN 0 WHEN 'preference' THEN 1 ELSE 2 END,"
-            f" COALESCE(importance, 0) DESC, COALESCE(hits, 0) DESC, id DESC"
-            f" LIMIT ?",
-            (owner_id, *kinds, max(1, int(limit))),
+            + vis +
+            f" ORDER BY id DESC LIMIT ?",
+            (owner_id, *kinds, max(40, int(limit) * 8)),
         ).fetchall()
+        now = time.time()
+        ranked: list[tuple] = []
+        for r in rows:
+            ref = float(r["last_hit_ts"] or r["updated_ts"] or r["ts"] or 0)
+            age_days = max(0.0, (now - ref) / 86400.0) if ref else 3650.0
+            fresh = 0.5 ** (age_days / 120.0)      # 120 天半衰：不碰就淡
+            score = ((1.0 + float(r["importance"] or 0))
+                     * fresh
+                     * (1.0 + min(0.5, float(r["hits"] or 0) * 0.02)))
+            kind_rank = 0 if r["kind"] == "profile" else 1
+            # 私聊场景里 private 比 group 更「贴身」：同一个人私下说的，比在群里
+            # 顺口说的一句更能代表他。排序靠前，配合下面的同义去重，留下私聊那条。
+            vis_rank = {"private": 0, "public": 1, "group": 2}.get(
+                str(r["visibility"] or "private"), 2)
+            ranked.append((kind_rank, vis_rank, -score, -int(r["id"]), r))
+        ranked.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        rows = [x[4] for x in ranked]
         out: list[dict] = []
         used = 0
         seen: set[int] = set()
-        for r in pinned_rows:      # 钉住条目先入，预算不约束
+        kept_texts: list[str] = []
+        # 钉住条目先入，不受字符预算约束；但总条数仍受 limit 约束——
+        # 否则「6 条 pin + 6 条画像」会变成 12 条常驻，钉得越多越贵。
+        for r in pinned_rows:
+            if len(out) >= limit:
+                break
             text = str(r["content"] or "").strip()
             if not text:
                 continue
             out.append(dict(r))
             seen.add(int(r["id"]))
+            kept_texts.append(text)
             used += len(text) + 3
         for r in rows:             # 其余条目受字符预算约束
+            if len(out) >= limit:
+                break
             if int(r["id"]) in seen:
                 continue
             text = str(r["content"] or "").strip()
             if not text:
                 continue
+            # 同一句话在私聊和群里各存了一条（可见性不同不能合并），
+            # 私聊场景会同时看到两条一模一样的——按字面去重，只留排前面的那条。
+            if any(_recall.jaccard(text, t) >= 0.85 for t in kept_texts):
+                continue
             if used + len(text) > max_chars and out:
                 break
             out.append(dict(r))
+            kept_texts.append(text)
             used += len(text) + 3
         return out
+
+    def pinned_memories(self, owner_id: str = "", limit: int = 30,
+                        allow_private: bool = True) -> list[dict]:
+        """全部钉住条目（可跨 owner），供总结时判断「哪条被改变了」。
+
+        allow_private=False 用于群会话的总结：私聊钉住的「叫我老爹」不该被塞进
+        一次群聊总结的提示里——那正是把私事写进群记忆的最短路径。
+        """
+        sql = ("SELECT id, kind, content, owner_id, pinned_ts, visibility"
+               " FROM memories WHERE merged_into = 0 AND pinned = 1")
+        args: list = []
+        if owner_id:
+            sql += " AND owner_id = ?"
+            args.append(owner_id)
+        if not allow_private:
+            sql += " AND COALESCE(visibility, '') != 'private'"
+        sql += " ORDER BY id ASC LIMIT ?"
+        args.append(max(1, int(limit)))
+        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+
+    def set_visibility(self, memory_id: int, visibility: str) -> bool:
+        """改一条记忆的可见范围（用户明确说「这个可以在群里说」时才放宽）。"""
+        v = str(visibility or "").strip().lower()
+        if v not in self.VISIBILITY:
+            return False
+        cur = self.conn.execute(
+            "UPDATE memories SET visibility = ?, updated_ts = ?"
+            " WHERE id = ? AND merged_into = 0",
+            (v, time.time(), int(memory_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def slot_conflicts(self, memory_id: int) -> list[int]:
+        """只读：这条记忆入常驻时会顶掉哪些同槽位旧条（用于提示用户）。"""
+        rec = self.memory_by_id(int(memory_id))
+        if not rec:
+            return []
+        slot = _slot_of(rec["content"])
+        if not slot:
+            return []
+        rows = self.conn.execute(
+            "SELECT id, content FROM memories WHERE merged_into = 0 AND pinned = 1"
+            " AND owner_id = ? AND id != ?",
+            (rec.get("owner_id") or "", int(memory_id)),
+        ).fetchall()
+        return [int(r["id"]) for r in rows if _slot_of(r["content"]) == slot]
+
+    def supersede_slot_conflicts(self, memory_id: int) -> list[int]:
+        """把同一个人、同一槽位里被这条新记忆顶掉的旧条退场。
+
+        只在 set_pinned 之后有意义（只处理已钉住的旧条）。旧条不删文本，
+        只把 merged_into 指向新条 —— 所有「活跃记忆」查询天然排除，
+        误顶替时可以按 id 捞回原文。
+        """
+        gone = self.slot_conflicts(int(memory_id))
+        if gone:
+            self.supersede_memories(gone, int(memory_id))
+        return gone
+
+    def supersede_memories(self, ids: list[int], new_id: int) -> int:
+        """旧记忆被新版本取代：退出活跃池（merged_into=new_id），并取消钉住。
+
+        与 merge_memories 的区别：这里不做内容合并，只是「新说法生效」。
+        原文保留，不物理删除。
+        """
+        new_id = int(new_id or 0)
+        clean = []
+        for x in ids or []:
+            try:
+                i = int(x)
+            except (TypeError, ValueError):
+                continue
+            if i and i != new_id:
+                clean.append(i)
+        if not clean or not new_id:
+            return 0
+        with self._lock:
+            cur = self.conn.execute(
+                f"UPDATE memories SET merged_into = ?, pinned = 0, pinned_ts = 0,"
+                f" updated_ts = ? WHERE id IN ({_ph(len(clean))})"
+                f" AND merged_into = 0 AND id != ?",
+                (new_id, time.time(), *clean, new_id),
+            )
+            self.conn.commit()
+            return cur.rowcount
 
     def all_active_memories(self, limit: int = 1000) -> list[dict]:
         """所有未合并的记忆，按 id 升序（即时间顺序），供巩固/去重使用。"""
@@ -637,13 +900,24 @@ class HermesDB:
         return dict(row) if row else None
 
     def set_pinned(self, memory_id: int, pinned: bool) -> bool:
-        """钉住/取消钉住一条记忆。钉住的条目：必进常驻注入，整理时不可合并或丢弃。"""
+        """钉住/取消钉住一条记忆。钉住的条目：必进常驻注入，整理时不可合并或丢弃。
+
+        钉住不是终身制：重新钉住会刷新 pinned_ts，并自动让同槽位的旧说法退场
+        （例如先说「叫我兄弟」后说「喊我老爹」，旧条 unpin 且退出活跃池）。
+        """
+        now = time.time()
         cur = self.conn.execute(
-            "UPDATE memories SET pinned = ?, updated_ts = ? WHERE id = ? AND merged_into = 0",
-            (1 if pinned else 0, time.time(), int(memory_id)),
+            "UPDATE memories SET pinned = ?, pinned_ts = ?, updated_ts = ?"
+            " WHERE id = ? AND merged_into = 0",
+            (1 if pinned else 0, now if pinned else 0, now, int(memory_id)),
         )
         self.conn.commit()
-        return cur.rowcount > 0
+        if cur.rowcount <= 0:
+            return False
+        if pinned:
+            # 顶掉同槽位的旧条；不删原文，只退出活跃池
+            self.supersede_slot_conflicts(int(memory_id))
+        return True
 
     def merge_memories(self, ids: list[int], content: str, kind: str = "") -> int:
         """把一组记忆合成一条新的，旧条只标记 merged_into 指向新条（不物理删除）。
@@ -715,7 +989,8 @@ class HermesDB:
                         session_id: str | None = None,
                         platform: str | None = None,
                         group_id: str | None = None,
-                        scan: int = 1200) -> list[dict]:
+                        scan: int = 1200,
+                        allow_private: bool = True) -> list[dict]:
         """记忆检索：作用域分层 + 本地相关性排序（bigram/IDF/时间衰减/去冗余）。
 
         群公共记忆的键用 (platform, group_id) 而不是 session_id(umo)，
@@ -723,13 +998,17 @@ class HermesDB:
 
         分层逐级补：用户私有 > 群共享 > 全局。分层后各自排序再串起来，
         比给不同层级乘系数更直观，也不会出现「全局的高分记忆把用户偏好挤出前 5」。
+
+        allow_private=False（群聊场景）时，private 条目不参与任何一层：
+        同一个人昨天在私聊说的「下周做手术」，今天在群里 @ 机器人时不能被召回。
         """
         tiers: list[tuple[str, list]] = []
+        vis = "" if allow_private else " AND COALESCE(visibility, '') != 'private'"
         if owner_id is None and group_id is None:
-            tiers.append(("merged_into = 0", []))
+            tiers.append(("merged_into = 0" + vis, []))
         else:
             if owner_id is not None:
-                tiers.append(("merged_into = 0 AND owner_id = ?", [owner_id]))
+                tiers.append(("merged_into = 0 AND owner_id = ?" + vis, [owner_id]))
             if group_id is not None:
                 cond = "merged_into = 0 AND ((group_id = ? AND platform = ?)"
                 args: list = [group_id, platform or ""]
@@ -738,7 +1017,7 @@ class HermesDB:
                     args.append(session_id)
                 else:
                     cond += ")"
-                tiers.append((cond, args))
+                tiers.append((cond + vis, args))
             tiers.append(
                 ("merged_into = 0 AND owner_id = '' AND session_id = ''"
                  " AND group_id = ''", [])
@@ -802,17 +1081,37 @@ class HermesDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_alias(self, alias_id: str) -> str:
+        """这个 alias 已经绑定到谁了；没绑过返回空串。"""
+        row = self.conn.execute(
+            "SELECT canonical_id FROM identities WHERE alias_id = ?", (alias_id,)
+        ).fetchone()
+        return str(row["canonical_id"] or "") if row else ""
+
+    def sender_seen(self, raw_id: str) -> bool:
+        """这个原始 ID 是否在本机说过话（用来判断「这是别人的活人账号」）。"""
+        row = self.conn.execute(
+            "SELECT 1 FROM messages WHERE sender_id = ? LIMIT 1", (raw_id,)
+        ).fetchone()
+        return bool(row)
+
     def delete_alias(self, alias_id: str) -> bool:
         with self._lock:
             cur = self.conn.execute("DELETE FROM identities WHERE alias_id = ?", (alias_id,))
             self.conn.commit()
             return cur.rowcount > 0
 
-    def all_memories(self, limit: int = 200) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM memories WHERE merged_into = 0 ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    def all_memories(self, limit: int = 200, owner_id: str = "") -> list[dict]:
+        if owner_id:
+            rows = self.conn.execute(
+                "SELECT * FROM memories WHERE merged_into = 0 AND owner_id = ?"
+                " ORDER BY id DESC LIMIT ?", (owner_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM memories WHERE merged_into = 0 ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def query_memories(self, q: str = "", scope: str = "", kind: str = "",
