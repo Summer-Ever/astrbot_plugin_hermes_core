@@ -386,11 +386,16 @@ class ModelRouter:
         builder: Callable[[int], str] | None = None,
         ignore_cooldown: bool = False,
         timeout: float | None = None,
+        max_attempts: int | None = None,
     ) -> str:
         """按链调用，返回第一个成功模型的文本。
 
         builder(char_budget) 用于按目标模型上下文重新生成 prompt；
         不传就直接用 prompt。
+
+        max_attempts 用来给「多桶串行」的批处理（如深度整理）压总预算：
+        全库整理会一个作用域一次调用，若每次都能烧满 8 次尝试，光超时就能耗掉
+        十几分钟，而调用方的消息早就过了平台有效期。
         """
         pol = self.policy()
         chain = self.effective_chain(ignore_cooldown=ignore_cooldown)
@@ -401,6 +406,8 @@ class ModelRouter:
 
         per_model = pol["max_retries"] + 1
         total_cap = pol["total_attempts"]
+        if max_attempts is not None:
+            total_cap = max(1, min(total_cap, int(max_attempts)))
         attempts = 0
         tried: list[dict] = []
         limit = timeout if timeout is not None else pol["timeout"]

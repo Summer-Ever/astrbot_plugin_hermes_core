@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.7"
+PLUGIN_VERSION = "0.12.8"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -279,6 +279,9 @@ class HermesCore(Star):
         # 所有总结/整理都走它：主模型失败自动降级，不依赖「当前对话模型」
         self.router = ModelRouter(self)
         self._bg_task: asyncio.Task | None = None
+        # 手动整理是长任务（逐作用域调用模型），不能占着事件处理等平台回话：
+        # QQ 官方被动回复只有 5 分钟有效期，超时后结果只能靠主动消息补发。
+        self._consolidate_task: asyncio.Task | None = None
         self._sum_lock = asyncio.Lock()
         self._resident_cache: dict[tuple[str, bool], tuple[float, list[dict]]] = {}
         self._inject_guard: dict[str, float] = {}
@@ -1514,6 +1517,7 @@ class HermesCore(Star):
 
         applied: list[str] = []
         total_merge = total_drop = 0
+        skipped = 0
         for bucket, items in buckets.items():
             listing = "\n".join(
                 f"- #{m['id']} ({m['kind']}) {str(m['content'])[:160]}"
@@ -1521,10 +1525,22 @@ class HermesCore(Star):
             )
             if len(items) < 2:
                 continue
-            text = await self.router.chat(
-                builder=lambda budget: head + listing[:max(600, budget - len(head) - 40)],
-                purpose="深度整理记忆",
-            )
+            try:
+                text = await self.router.chat(
+                    builder=lambda budget, _l=listing: head
+                    + _l[:max(600, budget - len(head) - 40)],
+                    purpose="深度整理记忆",
+                    # 单桶最多 4 次尝试、单次 70 秒：整库是逐桶串行的，按默认的
+                    # 8 次 × 90 秒算，几个桶就能把一次整理拖到十几分钟。
+                    timeout=70.0,
+                    max_attempts=4,
+                )
+            except Exception as exc:
+                # 一个作用域失败不能拖垮整次整理：前面成功的桶已经写库了，
+                # 这里跳过并计数，最后如实报告哪几个没整理到。
+                skipped += 1
+                logger.warning(f"[hermes_core] 深度整理跳过作用域 {bucket}: {str(exc)[:160]}")
+                continue
             valid_ids = {int(m["id"]) for m in items[:120]}
             id_scope = {int(m["id"]): _scope_bucket(m) for m in items[:120]}
             for item in self._extract_json_array(text):
@@ -1564,12 +1580,63 @@ class HermesCore(Star):
                         applied.append(
                             f"#{'/'.join(map(str, ids))} → {content[:80]}")
 
+        miss = f"，{skipped} 个作用域因模型失败跳过" if skipped else ""
         if not applied:
-            return (f"深度整理完成：{len(buckets)} 个作用域，模型认为没有需要合并或丢弃的条目。")
+            return (f"深度整理完成：{len(buckets)} 个作用域，"
+                    f"模型认为没有需要合并或丢弃的条目{miss}。")
         self._resident_cache.clear()
         tag = "深度整理预览（未写入）" if dry_run else "深度整理完成"
-        return (f"{tag}：合并 {total_merge} 组、丢弃 {total_drop} 条\n"
+        return (f"{tag}：合并 {total_merge} 组、丢弃 {total_drop} 条{miss}\n"
                 + "\n".join(f"- {a}" for a in applied[:10]))
+
+    async def _run_consolidate_job(self, deep: bool, dry_run: bool, origin: str):
+        """把一次手动整理跑完，结果落 meta 并主动推回发起会话。
+
+        为什么要脱离事件处理：整库整理是逐作用域调用模型，慢的时候能到十分钟
+        以上，而平台被动回复有有效期（QQ 官方 5 分钟、同一消息最多 5 条）。
+        后台跑 + 结果落库，最差也能用 /hermes 整理结果 查到，不会白跑。
+        """
+        started = int(time.time())
+        self.db.set_meta("consolidate_report", json.dumps(
+            {"ts": started, "running": True, "deep": bool(deep), "dry": bool(dry_run)},
+            ensure_ascii=False))
+        ok = True
+        try:
+            out = await self._consolidate_memories(dry_run=dry_run, deep=deep)
+            if not dry_run:
+                self._reset_memory_queue()  # 全库刚整理过，队列里的 id 已经没意义
+        except Exception:
+            ok = False
+            out = f"整理失败：{traceback.format_exc(limit=3)}"
+        report = {"ts": started, "running": False, "ok": ok, "deep": bool(deep),
+                  "dry": bool(dry_run), "text": out, "pushed": False}
+        # 主动消息：QQ 官方在被动回复过期后会自动降级到主动接口；群聊没有主动
+        # 消息权限就会失败，这不算错——结果已经在 meta 里，用户随时能查。
+        if origin and MessageChain is not None and Plain is not None:
+            body = out if len(out) <= 900 else out[:900] + "\n…（完整结果发 /hermes 整理结果 查看）"
+            try:
+                await self.context.send_message(origin, MessageChain([Plain(body)]))
+                report["pushed"] = True
+            except Exception:
+                logger.warning("[hermes_core] 整理结果推送失败，可改用 /hermes 整理结果 查看:\n"
+                               f"{traceback.format_exc(limit=2)}")
+        self.db.set_meta("consolidate_report", json.dumps(report, ensure_ascii=False))
+
+    def _consolidate_brief(self) -> str:
+        """给 /hermes 状态 用的一行摘要。"""
+        raw = self.db.get_meta("consolidate_report", "")
+        if not raw:
+            return "无记录"
+        try:
+            rep = json.loads(raw)
+        except Exception:
+            return "记录已损坏"
+        ts = time.strftime("%m-%d %H:%M", time.localtime(int(rep.get("ts") or 0)))
+        kind = "深度" if rep.get("deep") else "普通"
+        if rep.get("running"):
+            return f"{ts} 开始{kind}整理，仍在运行（/hermes 整理结果 看详情）"
+        state = "完成" if rep.get("ok") else "失败"
+        return f"{ts} {kind}整理{state}（/hermes 整理结果 看详情）"
 
     async def _merge_skill_content(self, name: str, old_trigger: str,
                                    old_content: str, new_trigger: str,
@@ -1847,7 +1914,8 @@ class HermesCore(Star):
             f"自动总结: {'每 ' + str(interval) + ' 分钟检查（单会话满 ' + str(min_new)
                          + ' 条或超 ' + str(grace) + ' 小时兜底）' if self._get_cfg('auto_summarize', True) else '关闭'}\n"
             f"待总结: {pend_info}\n"
-            f"自动整理: {self._queue_progress()}"
+            f"自动整理: {self._queue_progress()}\n"
+            f"最近整理: {self._consolidate_brief()}"
         )
 
     @hermes.command("总结")
@@ -1867,22 +1935,58 @@ class HermesCore(Star):
         if not self._is_admin(event):
             yield event.plain_result(self._deny_admin(event, "整理记忆"))
             return
+        mode = mode.strip()
+        if mode in ("结果", "报告", "report"):
+            # 兼容 /hermes 整理 结果（带空格）与 /hermes 整理结果（独立指令）
+            yield event.plain_result(self._consolidate_report_text())
+            return
         if not self.router.has_model():
             yield event.plain_result("没有可用的对话模型，请先在插件页面「模型」标签配置。")
             return
-        mode = mode.strip()
         deep = mode in ("深度", "deep", "彻底")
         dry = mode in ("预览", "试运行", "dry", "dry-run")
+        if self._consolidate_task and not self._consolidate_task.done():
+            yield event.plain_result("上一次整理还在跑，发 /hermes 整理结果 看进度。")
+            return
+        # 不 await 在这里等：逐作用域调模型可能超过十分钟，等下去必定撞上平台
+        # 被动回复有效期，结果发不出去。改成后台跑 + 完成后主动推送。
+        self._consolidate_task = asyncio.create_task(
+            self._run_consolidate_job(deep=deep, dry_run=dry,
+                                      origin=event.unified_msg_origin))
         yield event.plain_result(
-            "正在深度整理记忆（全量交给模型归纳，会清理一次性指令和闲聊条目）……"
-            if deep else "正在整理记忆（先本地聚类，有候选才会调用模型）……")
+            "深度整理已开始（全量交给模型归纳，会清理一次性指令和闲聊条目）。\n"
+            "整理完会用主动消息推给你；群里主动消息可能没权限，"
+            "没收到就发 /hermes 整理结果 查看。"
+            if deep else
+            "记忆整理已开始（先本地聚类，有候选才会调用模型）。\n"
+            "整理完会推给你，也可以发 /hermes 整理结果 查看。")
+
+    def _consolidate_report_text(self) -> str:
+        raw = self.db.get_meta("consolidate_report", "")
+        if not raw:
+            return "还没有整理记录。发 /hermes 整理 或 /hermes 整理 深度 开始一次。"
         try:
-            out = await self._consolidate_memories(dry_run=dry, deep=deep)
-            if not dry:
-                self._reset_memory_queue()  # 全库刚整理过，队列里的 id 已经没意义
-            yield event.plain_result(out)
+            rep = json.loads(raw)
         except Exception:
-            yield event.plain_result(f"整理失败：{traceback.format_exc(limit=3)}")
+            return str(raw)[:1500]
+        ts = time.strftime("%m-%d %H:%M", time.localtime(int(rep.get("ts") or 0)))
+        kind = "深度整理" if rep.get("deep") else "普通整理"
+        if rep.get("running"):
+            return (f"[{kind}] {ts} 开始，仍在运行。\n"
+                    "模型链慢的时候可能要几分钟；跑完会主动推给你，也可以稍后再查。")
+        head = f"[{kind}] {ts} " + ("完成" if rep.get("ok") else "失败")
+        if rep.get("dry"):
+            head += "（预览，未写入）"
+        head += "｜结果推送：" + ("成功" if rep.get("pushed") else "未送达，就在本条")
+        return head + "\n" + str(rep.get("text") or "")[:1500]
+
+    @hermes.command("整理结果")
+    async def hermes_consolidate_report(self, event: AstrMessageEvent):
+        """/hermes 整理结果 —— 查最近一次手动整理的产出（后台任务跑完后靠它取结果）"""
+        if not self._is_admin(event):
+            yield event.plain_result(self._deny_admin(event, "查看整理结果"))
+            return
+        yield event.plain_result(self._consolidate_report_text())
 
     @hermes.command("技能整理")
     async def hermes_skill_consolidate(self, event: AstrMessageEvent, mode: str = ""):
