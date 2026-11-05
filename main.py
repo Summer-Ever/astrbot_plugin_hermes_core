@@ -450,14 +450,14 @@ class HermesCore(Star):
         if not pid:
             logger.warning(
                 "[hermes_core] 插件未设置总结模型，AstrBot 也没有可用的对话模型；"
-                "请到 Hermes →「模型」页选择主模型")
+                "请到 Hermes记忆系统 →「模型」页选择主模型")
             return
 
         known = {p["id"]: p for p in self.router.all_providers()}
         if pid not in known:
             logger.warning(
                 f"[hermes_core] 无法快照总结模型：{pid} 不在 AstrBot 的模型列表里；"
-                "请到 Hermes →「模型」页手动选择")
+                "请到 Hermes记忆系统 →「模型」页手动选择")
             return
 
         snap: dict = {"llm_primary_provider": pid}
@@ -1349,7 +1349,7 @@ class HermesCore(Star):
         """
         if not self.router.has_model():
             return ("本插件还没设置总结模型（它不跟随 AstrBot 主体的对话模型）："
-                    "请到 Hermes 插件页「模型」标签选择主模型。")
+                    "请到 Hermes记忆系统 插件页「模型」标签选择主模型。")
 
         min_new = max(1, int(self._get_cfg("min_new_messages", 8)))
         grace_h = float(self._get_cfg("summarize_grace_hours", 6))
@@ -2504,7 +2504,7 @@ class HermesCore(Star):
         pend_info = (f"{len(pending)} 个会话共 {sum(p['count'] for p in pending)} 条"
                      if pending else "无")
         yield event.plain_result(
-            f"[Hermes 记忆系统]\n"
+            f"[Hermes记忆系统]\n"
             f"版本: v{PLUGIN_VERSION} (code {self._build_hash()})\n"
             f"对话消息: {s['messages']} 条 / {s['sessions']} 个会话\n"
             f"长期记忆: {s['memories']} 条（已合并 {s.get('merged', 0)} 条）\n"
