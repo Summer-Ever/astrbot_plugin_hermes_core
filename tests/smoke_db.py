@@ -508,6 +508,34 @@ def main() -> int:
     check("message_signatures 覆盖已有消息",
           ("user", "新的保留消息") in db.message_signatures("s1"))
 
+    # --- v0.12.18 虚词句召回：query 的每个 bigram 都含虚字时也必须能召回
+    #     旧实现把文档侧的含虚字 bigram 也删掉，交集恒为空——「看我会怎」这种
+    #     精确子串都召回 0（真实库 300 条消息抽查 25 条中招）。
+    stop_id = db.add_memory("fact", "我不太好奇你想看我会怎么反应",
+                            owner_id="u80", visibility="private")
+    check("全虚词 bigram 的 query 能召回记忆（精确子串）",
+          any(r["id"] == stop_id for r in db.search_memories(
+              "看我会怎", owner_id="u80", allow_private=True)),
+          str([r["id"] for r in db.search_memories(
+              "看我会怎", owner_id="u80", allow_private=True)]))
+    sid80 = "umo:FriendMessage:u80"
+    mid80 = db.add_message(sid80, "user", "我只是在意你会不会一直陪着我")
+    check("全虚词 bigram 的 query 能召回历史消息",
+          any(r["id"] == mid80 for r in db.search_messages(
+              "我只是一", session_id=sid80)),
+          str([r["id"] for r in db.search_messages("我只是一", session_id=sid80)]))
+    check("全虚词 query 不误伤无关文档",
+          not db.search_messages("看我会怎", session_id=sid80))
+
+    # --- v0.12.18 跨层去重：owner+group 都有的条目在多层命中时只返回一次
+    dup_id = db.add_memory("preference", "跨层去重测试条目三角洲",
+                           owner_id="u90", group_id="G90", visibility="group")
+    hits = db.search_memories("跨层去重测试条目", limit=8, owner_id="u90",
+                              group_id="G90", platform="", allow_private=False)
+    check("同一条记忆不被多层重复返回",
+          [r["id"] for r in hits].count(dup_id) == 1,
+          str([r["id"] for r in hits]))
+
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")
     if FAIL:

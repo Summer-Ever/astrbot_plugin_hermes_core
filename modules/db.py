@@ -1326,6 +1326,7 @@ class HermesDB:
             )
 
         out: list[dict] = []
+        seen_ids: set[int] = set()
         for cond, args in tiers:
             if len(out) >= limit:
                 break
@@ -1339,7 +1340,16 @@ class HermesDB:
             docs = [dict(r) for r in rows]
             if not docs:
                 continue
-            out.extend(_recall.rank(query, docs, k=limit - len(out)))
+            # 跨层去重：同一条记忆常常同时落在「按人」和「群/无归属」两层里
+            # （比如 owner+group_id 都有的条目）。不去重的话它会被返回两次，
+            # 白白占掉两个注入名额——实测「我电脑是什么系统」返回
+            # [159, 177, 73, 159, 177]。MMR 只在单层内做，挡不住跨层重复。
+            for item in _recall.rank(query, docs, k=limit - len(out)):
+                mid = int(item["id"])
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                out.append(item)
         return out[:limit]
 
     # ---------- 身份别名 ----------

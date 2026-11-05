@@ -134,12 +134,6 @@ def content_grams(text: str) -> list[str]:
     return _content_grams_of(grams(text))
 
 
-def _content_set_of(gset: set[str]) -> set[str]:
-    """集合版的实词过滤；全被过滤时退回全集（与 content_grams 的退化规则一致）。"""
-    out = {g for g in gset if not _STOP_RE.search(g)}
-    return out or gset
-
-
 def _content_grams_of(gs: list[str]) -> list[str]:
     """content_grams 的内核：接收已算好的 bigram，避免重复分词。
 
@@ -282,8 +276,13 @@ def rank(query: str, docs: list[dict[str, Any]], *, k: int = 5,
         # 只有少数候选会走到正则过滤，避免为几千条不相关文档付过滤成本。
         if not (qc_set & gset):
             continue
-        dc = _content_set_of(gset)
-        hit_n = len(qc_set & dc)
+        # 门槛只该问「query 的实词在文档里出没出现」，文档侧不能再做虚词过滤。
+        # qc 非空时其中的 gram 本就不含虚字，过滤文档侧对它毫无影响；
+        # 真正受影响的是 qc 全被过滤、退回全量 bigram 的情况——「看我会怎」
+        # 「你记得我吗」这类每个二字组都带虚字的句子。此时把文档侧的对应 bigram
+        # 也删掉，交集恒为空，哪怕 query 是原文的精确子串也召回 0。
+        # 真实生产库 300 条消息抽查里有 25 条正是这样丢的。
+        hit_n = len(qc_set & gset)
         cov = hit_n / len(qc)
         # 双档门槛：
         # - 短 query（≤3 个实词）命中一个强词即可，否则「这个报错怎么修」永远进不来；
