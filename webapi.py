@@ -641,7 +641,9 @@ class HermesWebAPI:
             return self._fail("本插件还没设置总结模型，请先在「模型」标签选择主模型")
         result = await self.plugin._consolidate_memories(dry_run=dry)
         if not dry:
-            self.plugin._reset_memory_queue()
+            # 整理被跳过（已有另一条在跑）时这里不能清队列——
+            # 重建逻辑只退场「真被评估过」的 id，被跳过时评估集为空，等于保留全部
+            self.plugin._requeue_after_consolidate()
         return json_response({"result": result, "dry_run": dry})
 
     async def action_skill_consolidate(self):

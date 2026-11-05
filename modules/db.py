@@ -15,10 +15,13 @@ import time
 
 try:  # 跑在 AstrBot 里：迁移日志统一走它的日志体系（WebUI 可见、带级别）
     from astrbot.api import logger
-except Exception:  # 独立跑测试时没有 astrbot，退到标准库，行为不变
+except Exception:  # 独立跑测试时没有 astrbot，退到标准库，行为不变。
+    # 刻意的退化路径：本模块必须能在无 AstrBot 的纯 Python 环境导入
+    # （tests/smoke_db.py、inspect_db.py 都不依赖 astrbot），删掉这个分支
+    # 测试就跑不起来；运行时优先走上面的官方 logger。
     import logging
 
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger(__name__)  # asb-audit: ignore=ASB-07 无 astrbot 的测试环境的刻意退化，运行时优先官方 logger
 
 try:  # 正常情况（包内导入）
     from . import recall as _recall
@@ -332,7 +335,7 @@ class HermesDB:
         return fts_ok
 
     def _repair_orphan_private(self, c) -> None:
-        """修复 v0.12.16 及更早版本留下的「孤儿私聊记忆」。
+        """修复「孤儿私聊记忆」：owner 漏写 + visibility='private' 的活跃行。
 
         总结模型有时不给 owner（或给了昵称而不是 ID），私聊里就会落成
         owner_id='' + visibility='private'。这种行按人检索查不到（按 owner 过滤），
@@ -342,11 +345,14 @@ class HermesDB:
         私聊会话只有一个人，归属可以无歧义地从消息记录（或 umo 的
         FriendMessage 段）反推。只修「无群、无归属、私聊可见」的活跃行，
         群里的无归属行是群公共记忆，不能动。
+
+        幂等、每次启动都跑（与 _normalize_private_scope 同策略）：
+        v0.12.17 初版用 meta 标记只跑一次，但「拿不到 sender_id 的适配器」
+        在运行期还会持续产生这种行——实测第一次修复写标记后，运行期新孤儿
+        重启也不再被修复，永久沉默。UPDATE 天然幂等（修过的行不再匹配过滤
+        条件），无标记也不会重复劳动，代价只是一次启动期 SELECT。
         """
         try:
-            if c.execute("SELECT 1 FROM meta WHERE key = ?",
-                         ("mig_orphan_private_v01217",)).fetchone():
-                return
             rows = c.execute(
                 "SELECT id, session_id, platform FROM memories"
                 " WHERE merged_into = 0 AND COALESCE(owner_id, '') = ''"
@@ -354,8 +360,6 @@ class HermesDB:
                 "   AND COALESCE(visibility, '') = 'private'"
             ).fetchall()
             if not rows:
-                # 新库/已修复的库：不写标记。否则「先建库、后写入孤儿行」
-                # （降级回旧版本、或从备份恢复）会永远错过修复。
                 return
             fixed = 0
             now = time.time()
@@ -383,16 +387,12 @@ class HermesDB:
                     (owner, now, int(r["id"])),
                 )
                 fixed += 1
-            c.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                ("mig_orphan_private_v01217", str(fixed)),
-            )
             if fixed:
                 # 只在真有修复时打日志，避免每次启动都刷一行
                 logger.info(
                     f"[hermes_core] 已修复 {fixed} 条无归属的私聊记忆（重新挂回本人）")
         except sqlite3.OperationalError:
-            # identities 表尚未建好等边缘情况：不写 meta，下次启动重试
+            # identities 表尚未建好等边缘情况：下次启动重试
             pass
 
     def _normalize_private_scope(self, c) -> None:
@@ -1032,12 +1032,19 @@ class HermesDB:
 
     def pinned_memories(self, owner_id: str = "", limit: int = 30,
                         allow_private: bool = True,
-                        group_id: str = "") -> list[dict]:
-        """全部钉住条目（可跨 owner），供总结时判断「哪条被改变了」。
+                        group_id: str = "",
+                        viewer_owner: str = "") -> list[dict]:
+        """全部钉住条目，供总结时判断「哪条被改变了」。
 
         allow_private=False 用于群会话的总结：私聊钉住的「叫我老爹」不该被塞进
         一次群聊总结的提示里——那正是把私事写进群记忆的最短路径。
         group_id 同样要参与：别的群里钉住的内容不能被拿来当本群总结的依据。
+
+        viewer_owner 是「这次总结在替谁看」：私聊总结传 solo_owner，
+        private 钉住条目才可见。不传时（或传空）fail-closed——
+        v0.12.17 的无身份不放行 private 修复落地时漏改了这个调用点，
+        导致私聊里钉的称呼/偏好从未进过总结提示，"replaces 旧编号"
+        机制对私聊钉住完全失效（旧说法一直活着、每轮注入）。
         """
         sql = ("SELECT id, kind, content, owner_id, group_id, pinned_ts, visibility"
                " FROM memories WHERE merged_into = 0 AND pinned = 1")
@@ -1045,10 +1052,13 @@ class HermesDB:
         if owner_id:
             sql += " AND owner_id = ?"
             args.append(owner_id)
-        vis, vis_args = _visible_clause(allow_private, group_id, owner_id)
+        vis, vis_args = _visible_clause(allow_private, group_id,
+                                        viewer_owner or owner_id)
         sql += vis
         args += vis_args
-        sql += " ORDER BY id ASC LIMIT ?"
+        # 最新优先：钉住超过 limit 条时，最近钉的（称呼刚改、偏好刚变）
+        # 才是这次总结最需要对照的；按 id 升序取会把新钉的挤出提示窗。
+        sql += " ORDER BY id DESC LIMIT ?"
         args.append(max(1, int(limit)))
         return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
 
@@ -1715,6 +1725,29 @@ class HermesDB:
         return [dict(r) for r in rows]
 
     # ---------- meta ----------
+
+    def prune_stale_session_meta(self) -> int:
+        """删掉「会话已不存在」的按会话 meta 键（水位、总结失败退避）。
+
+        summarized:<sid> / sumfail:<sid> 每个会话各占两行，会话随群聊/私聊
+        不断新增，而清空记录、修剪过期消息都会让会话消失——孤儿键从此
+        永远留在 meta 表里（慢漏）。水位键删掉是安全的：新消息的 id 因
+        AUTOINCREMENT 必然大于任何历史水位，删了也只会把「未总结」范围
+        算大，不会误删、也不会重复总结。
+        """
+        with self._lock:
+            n = 0
+            for prefix in ("summarized:", "sumfail:"):
+                cur = self.conn.execute(
+                    f"DELETE FROM meta WHERE key LIKE ?"
+                    f" AND substr(key, {len(prefix) + 1}) NOT IN"
+                    f" (SELECT session_id FROM messages)",
+                    (prefix + "%",),
+                )
+                n += cur.rowcount
+            if n:
+                self.conn.commit()
+            return n
 
     def get_meta(self, key: str, default: str = "") -> str:
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()

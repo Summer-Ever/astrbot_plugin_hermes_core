@@ -1,6 +1,6 @@
 name: astrbot_plugin_hermes_core
 display_name: Hermes记忆系统
 desc: Hermes 风格学习闭环：持久记忆 + 全文检索 + 自动总结 + 技能沉淀，带可视化管理页面
-version: v0.12.19
+version: v0.12.20
 author: Natsu
 repo: https://github.com/Summer-Ever/astrbot_plugin_hermes_core

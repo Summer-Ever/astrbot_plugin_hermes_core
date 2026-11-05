@@ -211,8 +211,10 @@ def score(query: str, doc: str, idf: dict[str, float], *,
         return 0.0
     wcov = _weighted_coverage(qg, dg, idf)
 
-    # 密度项：长文档天然更容易撞到 gram，用 sqrt(len) 归一化后只占小权重
-    density = min(1.0, len(set(qg) & dg) / math.sqrt(len(dg)))
+    # 密度项：长文档天然更容易撞到 gram，用 sqrt(len) 归一化后只占小权重。
+    # 交集与 _coverage 用同一份 query 集合，不再每条文档重建一次 set(qg)。
+    qset = qg_set if qg_set is not None else set(qg)
+    density = min(1.0, len(qset & dg) / math.sqrt(len(dg)))
     base = wcov * 0.62 + cov * 0.16 + density * 0.22
 
     # 精确包含：用户问「computer-power 技能」时，正文里就有这个词，应该重排到最前

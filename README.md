@@ -529,6 +529,38 @@ pin 的越权与不存在边界、search_memory 不泄他人私聊。
 同轮清掉 ruff 残留 4 项（db.py 未用 import 与无占位符 f-string、router.py
 死变量、smoke_db 一处断言不完整）。
 
+## 全文件精读排查（v0.12.20）：总结提示被 fail-closed 误伤等五处
+
+不看任何外部资料，把 main.py / db.py / recall.py / router.py / skill_hub.py /
+webapi.py / 前端逐行读一遍，疑点全部写探针实测，确认了才动手：
+
+1. **总结的常驻提示看不到私聊钉住**（v0.12.17 的回归，本轮新测试当场抓住）。
+   「无身份不放行 private」落地时漏改了 `_summarize_session` 的调用点——
+   `pinned_memories()` 不传查看者，私聊里钉的称呼/偏好**从未进过总结提示**，
+   "replaces 旧编号"机制对私聊钉住完全失效：用户改了称呼，旧说法永远活着。
+   修法：`pinned_memories` 增加 `viewer_owner` 参数，总结提示传 `solo_owner`；
+   同时改为**最新优先**（钉住超过 30 条时，最近改的才是该对照的）。
+2. **孤儿私聊记忆会复发**。`_repair_orphan_private` 用 meta 标记只跑一次，
+   但「拿不到 sender_id 的适配器」在运行期还会持续产生孤儿——实测第一次修复
+   写标记后，运行期新孤儿重启也不再被修，永久沉默。改为幂等、每次启动都跑
+   （与 `_normalize_private_scope` 同策略，UPDATE 天然幂等，代价一次 SELECT）。
+3. **自动整理会静默丢任务**。整理跑完一律清空待整理队列，但 focus 模式每轮
+   最多评估 `max_clusters` 组（默认 6）——排不进前 N 的新记忆没被模型看过
+   就被丢出队列，之后出现更相似的新记忆也没有配对机会。改为「重建队列」：
+   只退场真被评估过的、和已不活跃的 id；被跳过（互斥锁）时队列原样保留
+   （WebUI 的同款问题一并修掉）。
+4. **聚类把事件循环按住 1.7 秒**。`_similarity` 每对比较重算两份 bigram 集合，
+   600 条普通聚类 1.7 秒、focus 模式 200 焦点 × 全池 2 秒，全在事件循环上
+   （机器人这期间不回任何消息）。预计算每条的 bigram 后：174ms / 220ms（约 9 倍）。
+5. **会话游标慢漏 + 两处小问题**。`summarized:<sid>` / `sumfail:<sid>` 键随会话
+   数无限增长（清空记录、修剪过期消息都会让会话消失，孤儿键永远留下），
+   现在每日维护时清理失效键；技能清单的「等 N 个」提示是死分支（先 break 后
+   计数，永远触发不了），修为真实溢出数；`score()` 的密度项不再每条文档重建一次 query 集合。
+
+测试：smoke_db 132、smoke_tools 16（新增运行期孤儿自愈、游标清理、
+钉住最新优先、队列重建）、router 29、consolidate 38 全绿；
+生产库体检无坏数据。
+
 ## 清上下文 vs 清记忆：两套独立存储
 
 很容易混淆的一点：**上下文和记忆在物理上是分开存的**。
@@ -558,11 +590,12 @@ pin 的越权与不存在边界、search_memory 不泄他人私聊。
 python tests/smoke_db.py
 ```
 
-126 项断言：消息写入与检索、FTS trigram 三字窗口（含非连续短语、超出最近窗口的旧消息）、
+132 项断言：消息写入与检索、FTS trigram 三字窗口（含非连续短语、超出最近窗口的旧消息）、
 记忆去重、常驻区块按身份隔离、
 技能按身份隔离与同名共存、可见性隔离（含跨群不串味、群内不读私聊、无身份不放行私聊）、
-钉住生命周期、召回门槛与查询补全、全虚词 bigram 查询召回（精确子串不丢、无关文档不误伤）、
-同一条记忆跨层不重复返回、孤儿私聊记忆自动重挂、私聊作用域规范化、
+钉住生命周期与最新优先、召回门槛与查询补全、全虚词 bigram 查询召回（精确子串不丢、无关文档不误伤）、
+同一条记忆跨层不重复返回、孤儿私聊记忆自动重挂（含运行期孤儿重启自愈）、
+私聊作用域规范化、失效会话游标清理、
 删合并父条后子条恢复活跃、注入块渲染、导出、`safe_join` 反例。
 改完 `modules/db.py` 或 `recall.py` 先跑一遍。
 
@@ -571,7 +604,7 @@ python tests/smoke_db.py
 ```bash
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 29 项：节流、429 退避、冷却下限、两级预算
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 38 项：切片、断点、单片超时、连续失败止损、模型落款
-D:/Local/AstrBot/backend/python/python.exe tests/smoke_tools.py       # 13 项：save/pin/search_memory 的编号边界与越权
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_tools.py       # 16 项：save/pin/search_memory 的编号边界与越权、整理队列重建
 ```
 
 `smoke_tools.py` 用最小假事件直接调 `@filter.llm_tool` 方法——模型会填错编号、

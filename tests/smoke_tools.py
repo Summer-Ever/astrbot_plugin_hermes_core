@@ -25,6 +25,9 @@ if os.path.isdir(_ASTROOT) and _ASTROOT not in sys.path:
     sys.path.insert(0, _ASTROOT)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+# 必须在 import main 之前换目录：import astrbot 会在 CWD 生成 data/cmd_config.json
+# 等运行时文件，留在仓库工作区会触发提交审计的 ASB-20（router/consolidate 同款做法）。
+os.chdir(tempfile.mkdtemp(prefix="hermes-cwd-"))
 try:
     import main as m  # noqa: E402
 except ImportError:
@@ -81,6 +84,7 @@ def make_plugin(db: HermesDB):
             setattr(fake, k, v)
     for name in ("_scope_keys", "_is_admin", "_id_seen", "_clear_resident",
                  "_queue_memories", "_pending_memory_ids",
+                 "_requeue_after_consolidate",
                  "tool_save_memory", "tool_pin_memory", "tool_search_memory"):
         setattr(fake, name, types.MethodType(getattr(m.HermesCore, name), fake))
     return fake
@@ -166,6 +170,23 @@ def main() -> int:
                   visibility="private")
     r = asyncio.run(p.tool_search_memory(ev, query="私聊偏好"))
     check("search_memory 不含他人 private", "别人的私聊偏好" not in r, r[:120])
+
+    # ---- 整理后队列重建：只退场「已评估/已不活跃」的 id ----
+    print("== 整理队列重建 ==")
+    q1 = db.add_memory("fact", "队列里的新记忆一", owner_id="u1", visibility="private")
+    q2 = db.add_memory("fact", "队列里的新记忆二", owner_id="u1", visibility="private")
+    p._queue_memories([q1, q2])
+    p._last_evaluated = {q1}          # 模拟这轮只把 q1 交给模型看过
+    db.supersede_memories([q2], 1)    # q2 已不活跃
+    p._requeue_after_consolidate()
+    rest = p._pending_memory_ids()
+    check("已评估的 id 退出队列", q1 not in rest, str(rest))
+    check("已不活跃的 id 退出队列", q2 not in rest, str(rest))
+    p._last_evaluated = set()         # 整理被跳过（评估集为空）
+    p._queue_memories([q1])
+    p._requeue_after_consolidate()
+    check("被跳过时队列原样保留（不清空）",
+          q1 in p._pending_memory_ids(), str(p._pending_memory_ids()))
 
     db.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")

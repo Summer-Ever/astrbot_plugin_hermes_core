@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.19"
+PLUGIN_VERSION = "0.12.20"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -172,7 +172,14 @@ def _similarity(a: str, b: str) -> float:
 
     "喜欢吃香蕉" vs "喜欢吃苹果" ≈ 0.5（该合）；"喜欢看动漫" vs "喜欢吃香蕉" ≈ 0.33（不该合）。
     """
-    A, B = _bigrams(a), _bigrams(b)
+    return _similarity_sets(_bigrams(a), _bigrams(b))
+
+
+def _similarity_sets(A: set, B: set) -> float:
+    """已算好 bigram 集合的版本。批量两两比较必须走这条：
+    实测 600 条普通聚类里，_similarity 每对重算两个 bigram 集合占掉 80% 耗时
+    （1.7 秒，全在事件循环上）；预计算后降到毫秒级。
+    """
     if not A or not B:
         return 0.0
     inter = len(A & B)
@@ -228,9 +235,14 @@ def _is_injection(text: str) -> bool:
 
 def _cluster_by_similarity(items: list[dict], threshold: float,
                            text_key: str = "content") -> list[list[dict]]:
-    """把相似的条目聚成簇（并查集）。O(n²)，记忆量在千条以内可接受。"""
+    """把相似的条目聚成簇（并查集）。O(n²)，记忆量在千条以内可接受。
+
+    bigram 集合每条只算一次——两两循环里重算是纯浪费，600 条时实测
+    占掉 1.7 秒里的 80%（而且这段是同步代码，直接按住事件循环）。
+    """
     n = len(items)
     parent = list(range(n))
+    grams = [_bigrams(str(it.get(text_key, ""))) for it in items]
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -244,9 +256,13 @@ def _cluster_by_similarity(items: list[dict], threshold: float,
             parent[rb] = ra
 
     for i in range(n):
+        gi = grams[i]
+        if not gi:
+            continue
         for j in range(i + 1, n):
-            if _similarity(str(items[i].get(text_key, "")),
-                           str(items[j].get(text_key, ""))) >= threshold:
+            if not grams[j]:
+                continue
+            if _similarity_sets(gi, grams[j]) >= threshold:
                 union(i, j)
 
     groups: dict[int, list[dict]] = {}
@@ -906,16 +922,20 @@ class HermesCore(Star):
                 # 的小写名归一后去重，只留第一个。
                 seen_keys: set[str] = set()
                 names: list[str] = []
+                overflow = 0
                 for s in personal:
                     key = (str(s["name"]).lower()
                            .replace("-", "").replace("_", "").replace(" ", ""))
                     if key in seen_keys:
                         continue
                     seen_keys.add(key)
-                    names.append(str(s["name"]))
                     if len(names) >= 12:
-                        break
-                more = f" 等 {len(seen_keys)} 个" if len(seen_keys) > len(names) else ""
+                        overflow += 1
+                        continue
+                    names.append(str(s["name"]))
+                # overflow 是「去重之后仍超出展示上限」的个数——
+                # 原实现先 break，seen_keys 永远等于已展示数，这句提示是死分支。
+                more = f" 等 {len(names) + overflow} 个" if overflow else ""
                 parts.append(f"我的技能：{'、'.join(names)}{more}")
             if system:
                 parts.append(f"系统技能（本体安装，只读）：{len(system)} 个")
@@ -1286,6 +1306,14 @@ class HermesCore(Star):
                 n = self.db.prune_messages(days, require_summarized=True)
                 if n:
                     parts.append(f"按 {days} 天保留期修剪 {n} 条已总结消息")
+            # 会话水位/退避键随会话数无限增长，而清空记录和修剪都会让会话消失；
+            # 不清的话 meta 表按「每个会话 2 行」慢漏。
+            try:
+                n2 = self.db.prune_stale_session_meta()
+                if n2:
+                    parts.append(f"清理 {n2} 条失效会话游标")
+            except Exception:
+                pass
             self.db.set_meta("last_sweep_ts", str(now))
         # v0.12 一次性清理：渲染模块已移除，这两个目录不再有任何用途
         if not self.db.get_meta("render_cleanup_v012", ""):
@@ -1439,7 +1467,7 @@ class HermesCore(Star):
                 else:
                     if note and not note.startswith("记忆只有"):
                         summary += "\n" + note
-                    self._reset_memory_queue()
+                    self._requeue_after_consolidate()
                     self._clear_auto_consolidate_backoff()
             except Exception:
                 # 出错不清队列，下一轮重试；但连续失败要退避，否则模型链坏掉时
@@ -1549,7 +1577,8 @@ class HermesCore(Star):
             # 群会话还要再收一层：私聊钉住的「叫我老爹」进了这段提示，模型很可能
             # 顺手写进群记忆——那就是把私事带进群的最短路径。
             pins = [p for p in self.db.pinned_memories(
-                        limit=30, allow_private=not bool(gid), group_id=gid)
+                        limit=30, allow_private=not bool(gid), group_id=gid,
+                        viewer_owner=solo_owner)
                     if not p.get("owner_id") or p["owner_id"] in batch_owners]
         except Exception:
             pins = []
@@ -1689,6 +1718,29 @@ class HermesCore(Star):
     def _reset_memory_queue(self):
         self.db.set_meta("consolidate_pending_memories", "[]")
 
+    def _requeue_after_consolidate(self) -> None:
+        """整理完成后重建待整理队列，而不是整批清空。
+
+        原来 `_summarize_impl` / WebUI / 手动整理三条路径跑完一律
+        `_reset_memory_queue()`——但 focus 模式每轮最多评估 max_clusters 组
+        （默认 6），排不进前 N 的新记忆根本没被模型看过就被丢出队列，
+        之后即使出现更相似的新记忆也没有配对机会，等于静默漏整理。
+        现在只退场两类 id：这次真被评估过的（合或不合都算结案）、
+        以及已经不活跃的（被合并/丢弃/删除）。
+        """
+        pending = self._pending_memory_ids()
+        if not pending:
+            return
+        ev = getattr(self, "_last_evaluated", set())
+        keep: list[int] = []
+        for i in pending:
+            if i in ev:
+                continue
+            row = self.db.memory_by_id(i)
+            if row and int(row.get("merged_into") or 0) == 0:
+                keep.append(i)
+        self.db.set_meta("consolidate_pending_memories", json.dumps(keep))
+
     def _bump_skill_queue(self, n: int) -> int:
         cur = int(self.db.get_meta("skill_consolidate_pending", "0") or 0) + max(0, n)
         self.db.set_meta("skill_consolidate_pending", str(cur))
@@ -1780,6 +1832,9 @@ class HermesCore(Star):
         if self._consolidating:
             return "整理正在进行中，这次跳过（发 /hermes 整理结果 看进度）。"
         self._consolidating = True
+        # 每次整理开始前清空上次的「已评估」记录：被跳过（拿不到锁）时
+        # 它保持为空集，调用方的重建队列逻辑就等于什么也不清。
+        self._last_evaluated = set()
         try:
             return await self._consolidate_inner(
                 dry_run=dry_run, focus_ids=focus_ids, deep=deep, force=force)
@@ -1821,16 +1876,23 @@ class HermesCore(Star):
         if focus_ids:
             clusters: list[list[dict]] = []
             by_bucket: dict[tuple, list[dict]] = {}
+            # bigram 每条只算一次：focus 模式是「200 焦点 × 全池」的两两比较，
+            # 逐对重算 bigram 实测把事件循环按住 2 秒（千条记忆时更久）。
+            grams_by_id = {m["id"]: _bigrams(str(m.get("content") or "")) for m in rows}
             for m in rows:
                 by_bucket.setdefault(_scope_bucket(m), []).append(m)
             for m in rows:
                 if m["id"] not in focus_ids:
                     continue
+                mg = grams_by_id.get(m["id"]) or set()
+                if not mg:
+                    continue
                 pool = [r for r in by_bucket[_scope_bucket(m)] if r["id"] != m["id"]]
                 if not pool:
                     continue
-                scored = sorted(((_similarity(m["content"], r["content"]), r) for r in pool),
-                                key=lambda x: -x[0])
+                scored = sorted(
+                    ((_similarity_sets(mg, grams_by_id[r["id"]] or set()), r) for r in pool),
+                    key=lambda x: -x[0])
                 picked = [r for s, r in scored[:3] if s >= threshold]
                 if picked:
                     # 组内按 id 排序，新记忆排最后（LLM 能看出时间顺序）
@@ -1864,6 +1926,9 @@ class HermesCore(Star):
             seen.add(key)
             uniq.append(g)
         clusters = sorted(uniq, key=lambda g: -len(g))[:max_clusters]
+        # 这批 id 已交给模型判断过（合或不合都算结案），整理后从队列里退场；
+        # 没进前 max_clusters 组的焦点 id 保留，等下一轮和更晚出现的相似记忆配对。
+        self._last_evaluated = {int(x["id"]) for g in clusters for x in g}
 
         listing: list[str] = []
         id_to_group: dict[int, int] = {}
@@ -2016,6 +2081,8 @@ class HermesCore(Star):
         total_units = len(units)
         if not total_units:
             return "没有需要整理的作用域（每个作用域都只有 1 条记忆）。"
+        # 深度整理把全部片都过一遍（含断点沿用的片），队列里的 id 可全部结案
+        self._last_evaluated = {int(m["id"]) for u in units for m in u}
 
         # ---- 断点：整片都整理过的才跳过 ----
         done_ids = set() if force else self._load_consolidate_checkpoint()
@@ -2188,7 +2255,8 @@ class HermesCore(Star):
             out = await self._consolidate_memories(dry_run=dry_run, deep=deep,
                                                    force=force)
             if not dry_run:
-                self._reset_memory_queue()  # 全库刚整理过，队列里的 id 已经没意义
+                # 保留没被这次整理评估过的 id（原来是无条件清空）
+                self._requeue_after_consolidate()
         except Exception:
             ok = False
             out = f"整理失败：{traceback.format_exc(limit=3)}"

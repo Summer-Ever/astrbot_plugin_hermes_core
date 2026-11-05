@@ -27,6 +27,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def main() -> int:
+    # 换工作目录再跑：否则从插件目录执行时，import db（→ astrbot.logger 探测失败
+    # 退化的分支除外）会把 data/cmd_config.json 等运行时残渣留在仓库工作区里，
+    # 每次都触发提交审计的 ASB-20。测试本来就该在临时目录里进行。
+    os.chdir(tempfile.mkdtemp(prefix="hermes-smoke-cwd-"))
     tmp = tempfile.mkdtemp(prefix="hermes-smoke-")
     db = HermesDB(tmp, "smoke.db")
     print(f"[1] schema  fts={db.fts_enabled}")
@@ -537,6 +541,59 @@ def main() -> int:
     check("同一条记忆不被多层重复返回",
           [r["id"] for r in hits].count(dup_id) == 1,
           str([r["id"] for r in hits]))
+
+    # --- v0.12.20 运行期产生的孤儿私聊记忆：重启后必须也能修复。
+    #     旧实现修复用 meta 标记只跑一次，第一次修复写标记后，
+    #     「拿不到 sender_id 的适配器」在运行期继续产生的孤儿就永久沉默了。
+    odir = os.path.join(tmp, "orphan2")
+    os.makedirs(odir, exist_ok=True)
+    o1 = HermesDB(odir, "o.db")
+    o1.add_memory("fact", "启动期孤儿", scope="group", owner_id="",
+                  session_id="p:FriendMessage:OA", platform="p", visibility="private")
+    o1.add_message("p:FriendMessage:OA", "user", "hi", platform="p", sender_id="OA")
+    o1.close()
+    o2 = HermesDB(odir, "o.db")  # 第一次重启：修复
+    late = o2.add_memory("fact", "运行期孤儿", scope="user", owner_id="",
+                        session_id="p:FriendMessage:OB", platform="p",
+                        visibility="private")
+    o2.add_message("p:FriendMessage:OB", "user", "yo", platform="p", sender_id="OB")
+    o2.close()
+    o3 = HermesDB(odir, "o.db")  # 第二次重启：新孤儿也要被修复
+    check("运行期孤儿重启后也重挂 owner",
+          (o3.memory_by_id(late).get("owner_id") or "") == "OB",
+          str(o3.memory_by_id(late).get("owner_id")))
+    o3.close()
+
+    # --- v0.12.20 失效会话游标清理：水位/退避键随会话数无限增长
+    db.set_meta("summarized:dead_session", "99")
+    db.set_meta("sumfail:dead_session", "{}")
+    db.set_meta("summarized:s1", "5")  # s1 有消息，必须保留
+    n_stale = db.prune_stale_session_meta()
+    check("失效会话游标被清理",
+          n_stale >= 2 and db.get_meta("summarized:dead_session") == ""
+          and db.get_meta("sumfail:dead_session") == "",
+          f"removed={n_stale}")
+    check("活跃会话水位保留", db.get_meta("summarized:s1") == "5",
+          db.get_meta("summarized:s1"))
+
+    # --- v0.12.20 常驻提示的最新优先：钉住超过 limit 条时取最近钉的
+    p_owner = "u_pin_order"
+    db.add_memory("fact", "老钉住条目", owner_id=p_owner, visibility="private")
+    old_p = db.add_memory("fact", "老钉住条目二", owner_id=p_owner, visibility="private")
+    db.set_pinned(old_p, True)
+    new_p = db.add_memory("fact", "新钉住条目", owner_id=p_owner, visibility="private")
+    db.set_pinned(new_p, True)
+    pins = db.pinned_memories(limit=1, allow_private=True, viewer_owner=p_owner)
+    check("钉住清单截断时最新优先（带查看者）",
+          pins and int(pins[0]["id"]) == new_p, str([p["id"] for p in pins]))
+    check("带查看者才能看到本人 private 钉住",
+          any(r["id"] in (old_p, new_p) for r in db.pinned_memories(
+              allow_private=True, viewer_owner=p_owner)))
+    check("不带查看者仍不放行 private 钉住（fail-closed）",
+          not any(r["id"] in (old_p, new_p) for r in db.pinned_memories(
+              allow_private=True)))
+    db.set_pinned(old_p, False)
+    db.set_pinned(new_p, False)
 
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")
