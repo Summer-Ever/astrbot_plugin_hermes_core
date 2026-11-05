@@ -857,23 +857,28 @@ class HermesDB:
         #
         # 但去重必须同可见性：把群里说的话并进一条 private 记忆，等于让它
         # 从此在群里消失；反过来把私聊内容并进 group 记忆，就是把私事搬到群里。
-        # 两者都不能自愈，所以宁可各留一条——常驻/检索按场景过滤，用户看不到重复。
-        if owner_id:
-            rows = self.conn.execute(
-                "SELECT id, content, importance, pinned FROM memories WHERE merged_into = 0"
-                " AND owner_id = ? AND (group_id = '' OR group_id = ?)"
-                " AND COALESCE(visibility, '') = ?"
-                " ORDER BY id DESC LIMIT 300",
-                (owner_id, group_id or "", vis),
-            ).fetchall()
+        #
+        # group_id 只在 visibility='group' 时才参与收窄——那是唯一「可见域由
+        # 群决定」的一档，跨群合并会把 A 群的内容搬到 B 群。private 只看 owner
+        # （且只在私聊可见）、public 全员可见，两者都与 group_id / session_id
+        # 无关；原来一律按 group_id 收窄，导致「群里沉淀了一条 private、私聊
+        # 再说同一句」时查不到旧条、又新建一条，生产库里这种 private+group_id
+        # 的条目实测有 4 条。
+        if vis == "group":
+            if owner_id:
+                pool_cond, pool_args = "owner_id = ? AND group_id = ?", (owner_id, group_id or "")
+            else:
+                pool_cond, pool_args = "owner_id = '' AND group_id = ?", (group_id or "",)
         else:
-            rows = self.conn.execute(
-                "SELECT id, content, importance, pinned FROM memories WHERE merged_into = 0"
-                " AND owner_id = '' AND group_id = ? AND session_id = ?"
-                " AND COALESCE(visibility, '') = ?"
-                " ORDER BY id DESC LIMIT 300",
-                (group_id or "", session_id or "", vis),
-            ).fetchall()
+            pool_cond = "owner_id = ?" if owner_id else "owner_id = ''"
+            pool_args = (owner_id,) if owner_id else ()
+        rows = self.conn.execute(
+            "SELECT id, content, importance, pinned FROM memories WHERE merged_into = 0"
+            " AND " + pool_cond +
+            " AND COALESCE(visibility, '') = ?"
+            " ORDER BY id DESC LIMIT 300",
+            (*pool_args, vis),
+        ).fetchall()
         best_id, best_sim = 0, 0.0
         corrections: list[int] = []
         pin_old = False
@@ -989,12 +994,19 @@ class HermesDB:
                      * (1.0 + min(0.5, float(r["hits"] or 0) * 0.02)))
             kind_rank = 0 if r["kind"] == "profile" else 1
             # 私聊场景里 private 比 group 更「贴身」：同一个人私下说的，比在群里
-            # 顺口说的一句更能代表他。排序靠前，配合下面的同义去重，留下私聊那条。
+            # 顺口说的一句更能代表他。
             vis_rank = {"private": 0, "public": 1, "group": 2}.get(
                 str(r["visibility"] or "private"), 2)
-            ranked.append((kind_rank, vis_rank, -score, -int(r["id"]), r))
-        ranked.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-        rows = [x[4] for x in ranked]
+            # kind / 可见性只能当轻微偏好，不能当第一排序键：原来按
+            # (kind_rank, vis_rank, -score) 排，profile 永远排在 preference 前面，
+            # 新鲜度与重要度的加权被彻底架空——实测 6 条老 profile 占满席位，
+            # 刚写入的新 preference 无论多新都挤不进常驻，正是这条注释声称
+            # 要解决的「新偏好永远进不来」。改成乘进 score，主导权还给新鲜度。
+            kind_boost = 1.10 if kind_rank == 0 else 1.0
+            vis_boost = (1.05, 1.0, 0.95)[vis_rank]
+            ranked.append((-score * kind_boost * vis_boost, -int(r["id"]), r))
+        ranked.sort(key=lambda x: (x[0], x[1]))
+        rows = [x[2] for x in ranked]
         out: list[dict] = []
         used = 0
         seen: set[int] = set()
@@ -1251,12 +1263,24 @@ class HermesDB:
             return new_id
 
     def unmerge(self, new_id: int) -> int:
-        """撤销一次合并：恢复旧条，删除合并产生的条目。返回恢复条数。"""
+        """撤销一次合并：恢复旧条，删除合并产生的条目。返回恢复条数。
+
+        与 delete_memory 同理：合并链是单链表，删掉中间节点会让指向它的子条
+        永久悬空。这里把子条重挂到被删节点自己的父上（没有父就恢复活跃），
+        而不是一律置 0 —— 二次合并（A+B→C，C+D→E）时撤销 C 才不会丢链。
+        """
         with self._lock:
+            row = self.conn.execute(
+                "SELECT merged_into FROM memories WHERE id = ?", (int(new_id),)
+            ).fetchone()
+            if not row:
+                return 0
+            parent = int(row["merged_into"] or 0)
             n = self.conn.execute(
-                "UPDATE memories SET merged_into = 0 WHERE merged_into = ?", (new_id,)
+                "UPDATE memories SET merged_into = ? WHERE merged_into = ?",
+                (parent if parent > 0 else 0, int(new_id)),
             ).rowcount
-            self.conn.execute("DELETE FROM memories WHERE id = ?", (new_id,))
+            self.conn.execute("DELETE FROM memories WHERE id = ?", (int(new_id),))
             self.conn.commit()
             return n
 
@@ -1322,15 +1346,25 @@ class HermesDB:
                 tiers.append(("merged_into = 0 AND owner_id = ?" + vis,
                               [owner_id, *va]))
             if group_id is not None:
-                cond = "merged_into = 0 AND ((group_id = ? AND platform = ?)"
-                args: list = [group_id, platform or ""]
-                if session_id is not None:
-                    cond += " OR (session_id = ? AND group_id = ''))"
-                    args.append(session_id)
-                else:
-                    cond += ")"
                 vis, va = _visible_clause(allow_private, group_id, viewer)
-                tiers.append((cond + vis, [*args, *va]))
+                # 新数据：三态可见性严格判定（group 必须匹配来源群）。
+                new_part = "(group_id = ? AND platform = ?" + vis + ")"
+                args: list = [group_id, platform or "", *va]
+                if session_id is not None:
+                    # 老数据没有 group_id，只靠 session_id(umo) 认群。
+                    # 原来把 vis 条件接在整个括号外，其中「group 要匹配
+                    # group_id = ?」把 group_id='' 的老行全排除了——这个 OR
+                    # 分支是死代码，实测 visibility='group' 的老群共享记忆
+                    # 在来源群召回 0 条。老行本就限定在本会话内，不存在跨群
+                    # 问题，只要不是 private 就放行（群聊绝不读私聊内容）。
+                    old_part = ("(session_id = ? AND COALESCE(group_id, '') = ''"
+                                " AND COALESCE(NULLIF(visibility, ''), 'public')"
+                                " <> 'private')")
+                    args.append(session_id)
+                    cond = "merged_into = 0 AND (" + new_part + " OR " + old_part + ")"
+                else:
+                    cond = "merged_into = 0 AND " + new_part
+                tiers.append((cond, args))
             vis, va = _visible_clause(allow_private, "", viewer)
             tiers.append(
                 ("merged_into = 0 AND owner_id = '' AND session_id = ''"

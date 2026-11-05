@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.20"
+PLUGIN_VERSION = "0.12.21"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -772,10 +772,17 @@ class HermesCore(Star):
                 return
             # 一次用户发言可能触发多轮 LLM 请求（工具调用循环），每轮都注入
             # 会把同一段记忆反复塞进上下文，既费 token 又干扰模型。同一句话在
-            # 5 分钟内只注入一次；换了新问题（内容不同）照常注入。
+            # 短期内只注入一次；换了新问题（内容不同）照常注入。
+            #
+            # 窗口原来是 300 秒：用户 5 分钟内把同一句话再问一遍（「继续」、
+            # 「帮我看看」这类短句很常见），整个注入块——包括不依赖检索的常驻
+            # 「关于这位用户」——会被整块跳过，机器人连称呼都忘了。注入走临时
+            # part 不落会话历史，第二次提问时模型上下文里一条都没有。
+            # 45 秒足够覆盖一次工具循环，又不会让重复提问长时间失忆。
             key = f"{event.unified_msg_origin}\u0000{hash(query)}"
             now = time.time()
-            if now - self._inject_guard.get(key, 0) < 300:
+            ttl = 45
+            if now - self._inject_guard.get(key, 0) < ttl:
                 return
             block = self._build_context_block(event, query, req)
             if not block:
@@ -784,7 +791,7 @@ class HermesCore(Star):
             # 同一个问题在 5 分钟内都不会再尝试注入——一次偶发失败变成静默失忆。
             self._inject_guard[key] = now
             if len(self._inject_guard) > 200:
-                cutoff = now - 300
+                cutoff = now - ttl
                 self._inject_guard = {k: v for k, v in self._inject_guard.items() if v > cutoff}
             if TextPart is not None and hasattr(req, "extra_user_content_parts"):
                 part = TextPart(text=block)

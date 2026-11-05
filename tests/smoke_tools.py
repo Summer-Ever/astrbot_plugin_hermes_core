@@ -9,9 +9,11 @@
     D:/Local/AstrBot/backend/python/python.exe tests/smoke_tools.py
 """
 import asyncio
+import json
 import os
 import sys
 import tempfile
+import time
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -187,6 +189,81 @@ def main() -> int:
     p._requeue_after_consolidate()
     check("被跳过时队列原样保留（不清空）",
           q1 in p._pending_memory_ids(), str(p._pending_memory_ids()))
+
+    # ---- WebUI 写记忆后必须让常驻缓存失效（60 秒缓存会注入幽灵/旧内容）----
+    print("== WebUI 记忆管理与常驻缓存 ==")
+    import webapi as wa
+
+    payload: dict = {}
+
+    async def fake_body():
+        return payload
+
+    wa.HermesWebAPI._body = staticmethod(fake_body)
+    wap = types.SimpleNamespace(
+        db=db, _resident_cache={}, config=None,
+        _sanitize_memory=m.HermesCore._sanitize_memory,
+        _looks_like_injection=m.HermesCore._looks_like_injection,
+        _pending_memory_ids=lambda: [],
+    )
+    api = wa.HermesWebAPI(wap)
+
+    def seed_cache():
+        wap._resident_cache[("u1", True, "")] = (time.time(), [{"id": 1}])
+
+    def api_add(text):
+        payload.clear()
+        payload.update({"content": text, "owner_id": "u1",
+                        "scope": "user", "kind": "preference"})
+        return json.loads(asyncio.run(api.memory_add()).body)["id"]
+
+    seed_cache()
+    wa_a = api_add("WebUI 新增的记忆甲内容")
+    check("memory_add 后常驻缓存失效", not wap._resident_cache)
+    seed_cache()
+    wa_b = api_add("WebUI 新增的记忆乙内容")
+    wap._resident_cache.clear()
+
+    seed_cache()
+    payload.clear()
+    payload.update({"id": wa_a, "content": "WebUI 改过的记忆甲内容"})
+    asyncio.run(api.memory_update())
+    check("memory_update 后常驻缓存失效", not wap._resident_cache)
+
+    seed_cache()
+    payload.clear()
+    payload.update({"ids": [wa_a, wa_b], "content": "WebUI 合并后的记忆"})
+    asyncio.run(api.memory_merge())
+    check("memory_merge 后常驻缓存失效", not wap._resident_cache)
+
+    seed_cache()
+    payload.clear()
+    payload.update({"id": wa_b})
+    asyncio.run(api.memory_delete())
+    check("memory_delete 后常驻缓存失效", not wap._resident_cache)
+
+    # ---- 注入守卫窗口：旧值 300 秒会让重复提问整体失忆 ----
+    print("== 注入守卫窗口 ==")
+    gfake = types.SimpleNamespace(
+        _get_cfg=lambda k, d=None: True, _inject_guard={}, calls=[])
+
+    def fake_build(ev, q, req):
+        gfake.calls.append(q)
+        return "[记忆系统上下文] 测试块"
+
+    gfake._build_context_block = fake_build   # 真实实现是同步方法
+    gev = types.SimpleNamespace(unified_msg_origin="umo:FriendMessage:u1",
+                                message_str="继续")
+    greq = types.SimpleNamespace(system_prompt="")
+    on_req = types.MethodType(m.HermesCore.on_llm_request, gfake)
+    asyncio.run(on_req(gev, greq))
+    asyncio.run(on_req(gev, greq))
+    check("同一句短期重复请求只注入一次", len(gfake.calls) == 1, str(gfake.calls))
+    gkey = next(iter(gfake._inject_guard))
+    gfake._inject_guard[gkey] = time.time() - 46   # 模拟 46 秒后再问同一句
+    asyncio.run(on_req(gev, greq))
+    check("重复提问超过窗口后重新注入（不再失忆 5 分钟）",
+          len(gfake.calls) == 2, str(gfake.calls))
 
     db.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")

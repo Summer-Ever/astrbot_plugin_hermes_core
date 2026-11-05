@@ -292,6 +292,8 @@ class HermesWebAPI:
             group_id=str(data.get("group_id") or ""),
             visibility=str(data.get("visibility") or ""),
         )
+        # 常驻块有 60 秒缓存：新增的画像/偏好不清缓存就最多晚 60 秒才注入。
+        self.plugin._resident_cache.clear()
         return json_response({"id": mid})
 
     async def memory_visibility(self):
@@ -329,6 +331,8 @@ class HermesWebAPI:
         ok = self.plugin.db.update_memory(mid, content, None if kind is None else str(kind))
         if not ok:
             return self._fail("记忆不存在或没有改动", 404)
+        # 改了正文/类型后，缓存里的旧内容还会被注入最多 60 秒
+        self.plugin._resident_cache.clear()
         return json_response({"id": mid, "record": self.plugin.db.memory_by_id(mid)})
 
     async def memory_pin(self):
@@ -354,6 +358,8 @@ class HermesWebAPI:
         if ok:
             queue = [i for i in self.plugin._pending_memory_ids() if i != mid]
             self.plugin.db.set_meta("consolidate_pending_memories", json.dumps(queue))
+            # 删掉的条目若还在缓存里，接下来 60 秒会继续注入一条幽灵记忆
+            self.plugin._resident_cache.clear()
         return json_response({"deleted": bool(ok)})
 
     async def memory_merge(self):
@@ -386,6 +392,8 @@ class HermesWebAPI:
             return self._fail("合并失败", 500)
         queue = [i for i in self.plugin._pending_memory_ids() if i not in set(ids)]
         self.plugin.db.set_meta("consolidate_pending_memories", json.dumps(queue))
+        # 旧条退出活跃池、新条产生：常驻缓存必须跟着失效
+        self.plugin._resident_cache.clear()
         return json_response({"id": new_id})
 
     # ---------- 技能 ----------

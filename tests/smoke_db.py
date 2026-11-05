@@ -17,6 +17,7 @@ sys.path.insert(0, ROOT)
 
 from modules.db import HermesDB  # noqa: E402
 from modules.paths import UnsafePath, safe_join  # noqa: E402
+from modules import recall as rc  # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -213,7 +214,9 @@ def main() -> int:
     fresh = suppress_repeats(items, {1: 9}, cur_turn=10, gap=4)
     check("suppress_repeats 跳过近期已注入", [x["id"] for x in fresh] == [2, 3], str(fresh))
     all_seen = suppress_repeats(items, {1: 10, 2: 10, 3: 10}, cur_turn=10, gap=4)
-    check("suppress_repeats 全抑制保留头部", [x["id"] for x in all_seen] == [1], str(all_seen))
+    # v0.12.21：全抑制时不再只保底 1 条（注入不落历史，等于断供），补到半数
+    check("suppress_repeats 全抑制时补足半数而非只剩头部",
+          [x["id"] for x in all_seen] == [1, 2], str(all_seen))
     check("suppress_repeats 首次全保留", len(suppress_repeats(items, {}, 10, 4)) == 3)
 
     # --- 注入块渲染：类型提到分组标题、编号放行尾（正文优先）
@@ -594,6 +597,101 @@ def main() -> int:
               allow_private=True)))
     db.set_pinned(old_p, False)
     db.set_pinned(new_p, False)
+
+    # --- v0.12.21 短 query 门槛：3 个实词只命中 1 个不该被硬编码的 0.5 砍掉
+    q_docs = [{"id": 1, "content": "证书续期的处理办法要记下来", "kind": "fact"},
+              {"id": 2, "content": "完全无关的晚饭吃了什么", "kind": "fact"}]
+    short_hits = rc.rank("证书过期怎么办", q_docs, k=2)
+    check("短 query 命中单个实词仍可召回",
+          any(r["id"] == 1 for r in short_hits), str([r["id"] for r in short_hits]))
+    check("放宽短档门槛后零命中噪声仍不混入",
+          not any(r["id"] == 2 for r in short_hits), str([r["id"] for r in short_hits]))
+    check("min_coverage 对短 query 生效",
+          not rc.rank("证书过期怎么办", q_docs, k=2, min_coverage=0.9))
+
+    # --- v0.12.21 重复抑制：连续追问不能只剩 1 条，也不能让后排永远饿死
+    its = [{"id": i} for i in range(1, 6)]
+    rep_seen: dict = {}
+    counts, touched = [], set()
+    for turn in range(1, 8):
+        fresh = rc.suppress_repeats(its, rep_seen, turn)
+        for x in fresh:
+            rep_seen[x["id"]] = turn
+        counts.append(len(fresh))
+        touched.update(x["id"] for x in fresh)
+    check("连续追问注入量不低于半数", min(counts) >= 3, str(counts))
+    check("重复抑制会轮转，不饿死后排记忆", len(touched) >= 4, str(sorted(touched)))
+    check("首次注入仍给满", counts[0] == 5, str(counts[0]))
+
+    # --- v0.12.21 常驻排序：新鲜度主导，久未碰的老画像不能靠 kind 霸占席位
+    sort_owner = "u_res_sort"
+    for i in range(6):
+        db.add_memory("profile", f"久未更新的老画像第{i}条说明文字",
+                      owner_id=sort_owner, visibility="private")
+    aged = time.time() - 300 * 86400
+    with db._lock:
+        db.conn.execute("UPDATE memories SET importance=0.9, ts=?, updated_ts=?,"
+                        " last_hit_ts=? WHERE owner_id=?",
+                        (aged, aged, aged, sort_owner))
+        db.conn.commit()
+    fresh_pref = db.add_memory("preference", "用户刚说以后回答都要一句话讲完",
+                               owner_id=sort_owner, visibility="private")
+    res_ids = [int(r["id"]) for r in db.resident_notes(
+        sort_owner, limit=6, max_chars=4000)]
+    check("新偏好能挤进被老画像占满的常驻", fresh_pref in res_ids, str(res_ids))
+
+    # --- v0.12.21 去重池：visible=private/public 不受 group_id 限制，group 仍按群隔离
+    dedup_owner = "u_dedup_scope"
+    same = "用户喜欢在深夜听爵士乐放松"
+    a_id = db.add_memory("preference", same, owner_id=dedup_owner,
+                         group_id="GX", visibility="private")
+    b_id, b_new = db.add_memory_smart("preference", same, owner_id=dedup_owner,
+                                      group_id="", visibility="private")
+    check("群里沉淀的 private 与私聊同句复用而非重复建条",
+          (not b_new) and b_id == a_id, f"{b_id} created={b_new}")
+    g1 = db.add_memory("preference", "只在甲群成立的偏好测试内容",
+                       owner_id=dedup_owner, group_id="G1", visibility="group")
+    g2, g2_new = db.add_memory_smart("preference", "只在甲群成立的偏好测试内容",
+                                     owner_id=dedup_owner, group_id="G2",
+                                     visibility="group")
+    check("group 可见性仍按来源群隔离（防跨群合并回归）",
+          g2_new and g2 != g1, f"{g2} created={g2_new}")
+
+    # --- v0.12.21 群层老数据兼容分支：group_id='' 靠 session_id 认群的行
+    legacy_sid = "p:GroupMessage:GLEGACY"
+    legacy = db.add_memory("fact", "老版本群共享记忆：本群约定的周会时间点",
+                           owner_id="", session_id=legacy_sid, platform="p",
+                           group_id="", visibility="group")
+    legacy_priv = db.add_memory("fact", "老版本群里的私聊内容周会时间点",
+                                owner_id="u_legacy", session_id=legacy_sid,
+                                platform="p", group_id="", visibility="private")
+    lg = [r["id"] for r in db.search_memories(
+        "周会时间点", limit=8, session_id=legacy_sid, platform="p",
+        group_id="GLEGACY", viewer_owner="u_legacy", allow_private=False)]
+    check("老群共享记忆（无 group_id）在本群可召回", legacy in lg, str(lg))
+    check("群聊仍读不到老数据里的 private", legacy_priv not in lg, str(lg))
+    lg_other = [r["id"] for r in db.search_memories(
+        "周会时间点", limit=8, session_id="p:GroupMessage:OTHER", platform="p",
+        group_id="GOTHER", viewer_owner="", allow_private=False)]
+    check("老群共享记忆不会跨群泄漏", legacy not in lg_other, str(lg_other))
+
+    # --- v0.12.21 unmerge 中间节点：子条重挂祖父，不能被一律置 0 造成内容重复
+    chain_owner = "u_unmerge_chain"
+    c1 = db.add_memory("fact", "合并链甲内容之一", owner_id=chain_owner,
+                       visibility="private")
+    c2 = db.add_memory("fact", "合并链甲内容之二", owner_id=chain_owner,
+                       visibility="private")
+    cc = db.merge_memories([c1, c2], "一次合并产物", "fact")
+    cd = db.add_memory("fact", "合并链丁内容", owner_id=chain_owner,
+                       visibility="private")
+    ce = db.merge_memories([cc, cd], "二次合并产物", "fact")
+    db.unmerge(cc)
+    check("unmerge 中间节点后子条重挂祖父",
+          int(db.memory_by_id(c1)["merged_into"]) == ce
+          and int(db.memory_by_id(c2)["merged_into"]) == ce,
+          f"c1={db.memory_by_id(c1)['merged_into']} c2={db.memory_by_id(c2)['merged_into']}")
+    check("撤销祖父可一次恢复全部来源条", db.unmerge(ce) >= 3,
+          str([int(db.memory_by_id(x)["merged_into"]) for x in (c1, c2, cd)]))
 
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")

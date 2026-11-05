@@ -289,8 +289,13 @@ def rank(query: str, docs: list[dict[str, Any]], *, k: int = 5,
         # 双档门槛：
         # - 短 query（≤3 个实词）命中一个强词即可，否则「这个报错怎么修」永远进不来；
         # - 长 query 要求至少 2 个实词命中，防止一个烂大街的词把噪声拉进注入。
+        # 短档的覆盖率下限也走 min_coverage（默认 0.30）：原来硬编码 0.5，
+        # 3 个实词只命中 1 个时 cov=0.33 被拒——注释写着「命中一个强词即可」，
+        # 实现却要求至少 2 个，实测「证书过期怎么办」↔「证书续期的处理办法」
+        # 这种明明相关、只共享一个实词的记忆永远召不回。噪声由 IDF 加权分数
+        # 和 MMR 兜住，门槛不该在这里把候选直接砍死。
         if len(qc) <= 3:
-            ok = hit_n >= 1 and cov >= 0.5
+            ok = hit_n >= 1 and cov >= min_coverage
         else:
             ok = hit_n >= 2 and cov >= min_coverage
         if not ok:
@@ -444,15 +449,30 @@ def format_memory_lines(items: list[dict[str, Any]], *,
 
 def suppress_repeats(items: list[dict[str, Any]], seen: dict[int, int],
                      cur_turn: int, gap: int = 4) -> list[dict[str, Any]]:
-    """重复抑制：近 gap 轮注入过的记忆本轮跳过。
+    """重复抑制：近 gap 轮注入过的记忆本轮降权，但不断供。
 
-    注入走临时 part 不进会话历史，下一轮模型确实看不到，所以注入本身不能省；
-    但相邻几轮查询措辞相近时同几条记忆反复入选是浪费。全被抑制时保留排名
-    最高的第一条，避免相关记忆彻底断供。
+    注入走临时 part 不进会话历史，下一轮模型确实看不到，所以**不能把已注入
+    过的记忆整批省掉**——原实现 `fresh` 为空时才保底留 items[:1]，实测连续
+    追问同一话题时第 2~4 轮只剩 1 条（5 条相关记忆被砍掉 4 条），而模型上下文
+    里一条都没有，等于静默失忆。
+
+    折中：按原排名补足到至少一半席位（向上取整）。被抑制的条目排在 fresh
+    之后、且名次不变，既压住「同样几条反复刷屏」，又保住召回量。
     """
     if not items:
         return items
-    fresh = [x for x in items if cur_turn - seen.get(int(x["id"]), -10**9) >= gap]
-    if not fresh:
-        fresh = items[:1]
+    fresh: list[dict] = []
+    held: list[tuple[int, int, dict]] = []
+    for pos, x in enumerate(items):
+        last = seen.get(int(x["id"]), -10**9)
+        if cur_turn - last >= gap:
+            fresh.append(x)
+        else:
+            held.append((last, pos, x))
+    floor = max(1, (len(items) + 1) // 2)
+    if len(fresh) < floor:
+        # 补进来的必须是「最久没注入过」的那几条，而不是原排名最前的几条：
+        # 否则 seen 每轮被刷新后永远是同一批占着席位，后排记忆彻底饿死。
+        held.sort(key=lambda t: (t[0], t[1]))
+        fresh.extend(x for _, _, x in held[:floor - len(fresh)])
     return fresh
