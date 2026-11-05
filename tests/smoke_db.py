@@ -158,7 +158,9 @@ def main() -> int:
     u1_skills = db.list_skills("u1", "")
     u2_skills = db.list_skills("u2", "")
     check("技能按身份隔离（u1 看不到 u2 私版）",
-          any(s["name"] == "deploy" for s in u1_skills) and len(u1_skills) == 1, str(len(u1_skills)))
+          any(s["name"] == "deploy" for s in u1_skills) and len(u1_skills) == 1
+          and any(s["name"] == "deploy" for s in u2_skills),
+          f"u1={len(u1_skills)} u2={len(u2_skills)}")
     u2_got = db.get_skill("deploy", "u2", "")
     check("同名技能可共存", bool(u2_got) and "步骤二" in str(u2_got.get("content")),
           str(u2_got.get("content") if u2_got else None))

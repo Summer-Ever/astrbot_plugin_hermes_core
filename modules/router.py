@@ -634,7 +634,6 @@ class ModelRouter:
             soft_left = (soft - now) if soft is not None else float("inf")
             return "deadline" if hard_left <= soft_left else "unit_deadline"
 
-        started_call = time.monotonic()
         left = remaining()
         if left is not None and left <= 1.0:
             raise ModelError(expired_kind(), "本次整理的时间预算已用尽（未开始调用）")

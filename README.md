@@ -507,6 +507,28 @@ v0.12.17 加了启动迁移 `_repair_orphan_private`：扫出这类行，
 （「你记得我让你叫我什么吗」↔「用户希望助手以后称呼他为哥哥」）仍是关键词检索的天花板，
 要彻底解决得引入向量检索，目前不在本次范围。
 
+## 工具链两处静默故障（v0.12.19）：replaces 失效时当成功汇报
+
+沿数据流复查 `save_memory` 工具的 `replaces`（「顶掉旧记忆」）路径，模型填错编号
+是常态，而这条路径有两种不报错、只静默做错的形态：
+
+1. **编号不存在时直接崩**。`old.get("owner_id")` 执行在 `old and` 守卫之前，
+   `memory_by_id` 返回 None 就 AttributeError——模型每次误填编号都会撞上，
+   工具调用以异常收场，用户看到的是调用失败而不是「这条不存在」。
+2. **替换被拒时汇报「已保存」**。旧条不属于你 / 已被合并 / 不在本会话可见范围时，
+   `replaces` 被静默跳过，返回值仍是「已保存记忆 #N」。模型据此认为旧说法已退场
+   （典型场景：称呼从「兄弟」改成「老爹」），实际两种矛盾说法都还活着、都会被注入。
+
+修法：每个拒绝理由都如实回给模型（「旧记忆 #N 不属于你（公共记忆需要管理员），
+它仍然有效，两种说法可能并存」）；且 replaces 的处理从「仅新建时」扩展到
+「合并强化到已有条目时」——后者漏掉同样会留下旧说法。
+
+新增 `tests/smoke_tools.py`（13 项）用最小假事件直接调 llm_tool 方法：
+编号不存在/别人的/已合并/不可见四种拒绝路径、正常替换（含常驻身份继承）、
+pin 的越权与不存在边界、search_memory 不泄他人私聊。
+同轮清掉 ruff 残留 4 项（db.py 未用 import 与无占位符 f-string、router.py
+死变量、smoke_db 一处断言不完整）。
+
 ## 清上下文 vs 清记忆：两套独立存储
 
 很容易混淆的一点：**上下文和记忆在物理上是分开存的**。
@@ -544,12 +566,16 @@ python tests/smoke_db.py
 删合并父条后子条恢复活跃、注入块渲染、导出、`safe_join` 反例。
 改完 `modules/db.py` 或 `recall.py` 先跑一遍。
 
-模型链与整理编排另有两个冒烟脚本（不联网，用假 provider 模拟各种失败）：
+模型链、整理编排与 LLM 工具链另有两个冒烟脚本（不联网，用假 provider 模拟各种失败）：
 
 ```bash
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 29 项：节流、429 退避、冷却下限、两级预算
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 38 项：切片、断点、单片超时、连续失败止损、模型落款
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_tools.py       # 13 项：save/pin/search_memory 的编号边界与越权
 ```
+
+`smoke_tools.py` 用最小假事件直接调 `@filter.llm_tool` 方法——模型会填错编号、
+会试图动别人的记忆、会在 replaces 失效时以为替换成功，这些路径单元测试覆盖不到。
 
 ### 生产库体检（只读副本）
 

@@ -7,12 +7,18 @@
 - meta:     游标等元信息（如上次总结到的消息 id）
 """
 
-import json
 import os
 import re
 import sqlite3
 import threading
 import time
+
+try:  # 跑在 AstrBot 里：迁移日志统一走它的日志体系（WebUI 可见、带级别）
+    from astrbot.api import logger
+except Exception:  # 独立跑测试时没有 astrbot，退到标准库，行为不变
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 try:  # 正常情况（包内导入）
     from . import recall as _recall
@@ -383,9 +389,7 @@ class HermesDB:
             )
             if fixed:
                 # 只在真有修复时打日志，避免每次启动都刷一行
-                import logging
-
-                logging.getLogger(__name__).info(
+                logger.info(
                     f"[hermes_core] 已修复 {fixed} 条无归属的私聊记忆（重新挂回本人）")
         except sqlite3.OperationalError:
             # identities 表尚未建好等边缘情况：不写 meta，下次启动重试
@@ -411,9 +415,7 @@ class HermesDB:
                 "   AND COALESCE(scope, '') <> 'user'"
             )
             if cur.rowcount:
-                import logging
-
-                logging.getLogger(__name__).info(
+                logger.info(
                     f"[hermes_core] 已把 {cur.rowcount} 条私聊记忆从群作用域挪回 user")
         except sqlite3.OperationalError:
             pass
@@ -973,7 +975,7 @@ class HermesDB:
             f" FROM memories"
             f" WHERE merged_into = 0 AND owner_id = ? AND pinned = 0 AND kind IN ({marks})"
             + vis +
-            f" ORDER BY id DESC LIMIT ?",
+            " ORDER BY id DESC LIMIT ?",
             (owner_id, *kinds, *vis_args, max(40, int(limit) * 8)),
         ).fetchall()
         now = time.time()

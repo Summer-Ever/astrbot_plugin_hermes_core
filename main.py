@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.18"
+PLUGIN_VERSION = "0.12.19"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -1126,33 +1126,48 @@ class HermesCore(Star):
         )
         if created and pinned:
             self.db.set_pinned(mid, True)
+        # replaces 的处理：无论「新建」还是「合并强化到已有条目」都要生效——
+        # 模型明确要求顶掉旧条时，后者同样不能漏，否则旧说法依旧活着。
+        # 每个被拒理由都要如实回给模型：原来统一返回「已保存」，
+        # 模型以为旧条已被替换（如「兄弟→老爹」），实际两种说法并存注入。
         replaced = 0
-        if created and replaces:
+        reject = ""
+        if replaces:
             try:
                 old = self.db.memory_by_id(int(replaces))
             except (TypeError, ValueError):
                 old = None
-            # 只能替换自己的记忆，且不能替换自己；公共（无归属）条目会被
-            # 全员共用，任何群友都能借 replaces 把它从所有人视野里顶掉，
-            # 因此只有管理员能替换。编号同样必须是本会话可见过的。
-            mine_old = bool(sc["owner_id"]) and \
-                (old.get("owner_id") or "") == sc["owner_id"]
-            shared_old = bool(old) and not (old.get("owner_id") or "")
-            if old and int(old.get("merged_into") or 0) == 0 and int(replaces) != mid \
-                    and (mine_old or (shared_old and self._is_admin(event))) \
-                    and self._id_seen(sc["sid"], int(replaces)):
-                # 被替换的旧条原本是常驻的，新条要继承「常驻」身份，
-                # 否则「以后别叫我兄弟」会把称呼槽位整个清空。
-                inherit = bool(int(old.get("pinned") or 0))
-                replaced = self.db.supersede_memories([int(replaces)], mid)
-                if inherit:
-                    self.db.set_pinned(mid, True)
+            if old is None:
+                reject = f"旧记忆 #{replaces} 不存在"
+            elif int(old.get("merged_into") or 0) != 0:
+                reject = f"旧记忆 #{replaces} 已失效（被合并或丢弃）"
+            elif int(replaces) == mid:
+                reject = ""  # 顶掉的正是自己（合并强化场景），无需处理
+            else:
+                # 只能替换自己的记忆。公共（无归属）条目会被全员共用，
+                # 任何群友都能借 replaces 把它从所有人视野里顶掉，只有管理员能替换。
+                mine_old = bool(sc["owner_id"]) and \
+                    (old.get("owner_id") or "") == sc["owner_id"]
+                shared_old = not (old.get("owner_id") or "")
+                if not (mine_old or (shared_old and self._is_admin(event))):
+                    reject = f"旧记忆 #{replaces} 不属于你（公共记忆需要管理员）"
+                elif not self._id_seen(sc["sid"], int(replaces)):
+                    reject = f"旧记忆 #{replaces} 不在本会话可见范围内"
+                else:
+                    # 被替换的旧条原本是常驻的，新条要继承「常驻」身份，
+                    # 否则「以后别叫我兄弟」会把称呼槽位整个清空。
+                    inherit = bool(int(old.get("pinned") or 0))
+                    replaced = self.db.supersede_memories([int(replaces)], mid)
+                    if inherit:
+                        self.db.set_pinned(mid, True)
         self._clear_resident(sc["owner_id"])
+        tail = f"，已替换旧记忆 #{int(replaces)}" if replaced else ""
+        if reject:
+            tail += f"；注意：{reject}，它仍然有效，两种说法可能并存"
         if created:
             self._queue_memories([mid])  # 手动存的也进整理队列，攒够阈值一起合并
-            tail = f"，已替换旧记忆 #{int(replaces)}" if replaced else ""
             return f"已保存记忆 #{mid}{tail}。"
-        return f"这条和已有记忆 #{mid} 高度重合，已合并强化，没有新增。"
+        return f"这条和已有记忆 #{mid} 高度重合，已合并强化，没有新增{tail}。"
 
     @filter.llm_tool(name="list_skills")
     async def tool_list_skills(self, event: AstrMessageEvent) -> str:
