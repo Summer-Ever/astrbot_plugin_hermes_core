@@ -1312,9 +1312,9 @@ class HermesCore(Star):
 
     @filter.llm_tool(name="search_memory")
     async def tool_search_memory(self, event: AstrMessageEvent, query: str) -> str:
-        """按关键词检索长期记忆与历史对话。当需要回忆当前用户偏好、之前聊过的内容时调用。
+        """按关键词检索长期记忆与历史对话。用户问「记不记得/我是不是说过」时，必须先调用本工具核实再回答：常驻注入不是记忆的全部，常驻被清空也不代表归档被删；一次没搜到就换关键词再搜一次，不能据此断言「记忆已清空」。
         Args:
-            query (string): 检索关键词
+            query (string): 检索关键词，用一两个区分度高的核心词；没命中就换别的关键词再调用一次，不要把很多词塞进同一次查询（会稀释排序相关性）
         """
         sc = self._scope_keys(event)
         mems = self.db.search_memories(
