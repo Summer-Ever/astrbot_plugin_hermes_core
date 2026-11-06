@@ -1,7 +1,6 @@
-# -*- coding: utf-8 -*-
 """存储层冒烟测试：不依赖 AstrBot 运行时，直接跑 SQLite。
 
-logger 由 tests/_astrbot_stub.py 在导入前打桩；插件运行时仍只用
+logger 由 tests/_bootstrap.py 在导入前打桩；插件运行时仍只用
 astrbot.api 提供的官方 logger。
 
     python tests/smoke_db.py
@@ -13,17 +12,16 @@ import tempfile
 import time
 import traceback
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, "tests"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _astrbot_stub import ensure_astrbot_logger  # noqa: E402
+from _bootstrap import db_module, paths_module, recall_module
 
-ensure_astrbot_logger()
-
-from modules.db import HermesDB  # noqa: E402
-from modules.paths import UnsafePath, safe_join  # noqa: E402
-from modules import recall as rc  # noqa: E402
+_db = db_module()
+_paths = paths_module()
+rc = recall_module()
+HermesDB = _db.HermesDB
+UnsafePath = _paths.UnsafePath
+safe_join = _paths.safe_join
 
 PASS, FAIL = [], []
 

@@ -7,6 +7,7 @@
 - meta:     游标等元信息（如上次总结到的消息 id）
 """
 
+import functools
 import os
 import re
 import sqlite3
@@ -16,10 +17,22 @@ import time
 from astrbot.api import logger
 
 try:  # 正常情况（包内导入）
-    from . import recall as _recall
+    from .recall import (
+        fts_windows as _fts_windows,
+        jaccard as _jaccard,
+        norm as _norm,
+        rank as _rank,
+        rank_messages as _rank_messages,
+    )
 except ImportError:  # 插件被按文件路径加载时，退化为同名模块
     try:
-        from modules import recall as _recall  # type: ignore
+        from modules.recall import (
+            fts_windows as _fts_windows,
+            jaccard as _jaccard,
+            norm as _norm,
+            rank as _rank,
+            rank_messages as _rank_messages,
+        )
     except ImportError:  # 最后兜底：按路径加载，不污染 sys.path
         import importlib.util as _ilu
 
@@ -27,13 +40,45 @@ except ImportError:  # 插件被按文件路径加载时，退化为同名模块
         _rc_spec = _ilu.spec_from_file_location("astrbot_plugin_hermes_core_recall", _rc_file)
         _rc_mod = _ilu.module_from_spec(_rc_spec)
         _rc_spec.loader.exec_module(_rc_mod)
-        _recall = _rc_mod
+        _fts_windows = _rc_mod.fts_windows
+        _jaccard = _rc_mod.jaccard
+        _norm = _rc_mod.norm
+        _rank = _rc_mod.rank
+        _rank_messages = _rc_mod.rank_messages
 
 # 记忆类型白名单。模型偶尔会自创类型（历史上出现过 conclusion），
 # 不校验的话会污染统计和 UI 筛选；未知类型统一归为 fact。
 ALLOWED_KINDS = ("fact", "preference", "profile", "summary",
                  "event", "plan", "conclusion", "relation")
 DEFAULT_KIND = "fact"
+
+
+def _db_locked(fn):
+    """给「直连 self.conn」的方法加锁：同一个 SQLite 连接不能被并发操作。
+
+    sqlite3 的 Connection 不是线程安全的：同一个连接对象被两个线程同时
+    execute 时，cursor 状态在多线程间共享，实测会抛
+    ``InterfaceError('bad parameter or other API misuse')`` 或
+    ``IndexError: tuple index out of range')``。触发条件是「≥2 个并发读线程」
+    ——单事件循环里的协程不会真并行（sqlite 调用是同步的），所以平时碰不到；
+    但面板的 WebAPI 请求与机器人消息处理不在同一个线程，正好就是「2 读」。
+
+    写方法本来就已经持 ``self._lock``，读方法补上同一把锁之后，连接不会再
+    被两个线程同时操作。
+
+    必须用**可重入**锁：有几处方法会调用同样要加锁的方法
+    （search_messages → _fts_candidates、unsummarized_by_session →
+    all_session_ids、slot_conflicts → memory_by_id），不可重入的 Lock
+    在这里会自己把自己锁死。
+
+    用装饰器而不是在方法体里写 ``with``：只动方法签名，不动方法体，
+    不用重排缩进，也就不会漏掉某个提前 return 的分支。
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 # 去重时的否定词哨兵。只用于「两边是否同极性」的比较，不做语义分析。
 _NEG_WORDS = ("不", "没", "无", "别", "禁止", "取消", "勿", "无需")
@@ -66,6 +111,20 @@ def _where(conds: list[str]) -> str:
     return (" WHERE " + " AND ".join(conds)) if conds else ""
 
 
+def _vis_expr(prefix: str = "") -> str:
+    """可见性判定表达式（唯一的可见性口径来源）。
+
+    约定：visibility 为空串或 NULL 一律按 public 处理——早期版本写入的
+    条目没有 visibility 字段，值就是空串。判定必须和 _visible_clause 用
+    同一个表达式，否则同一个条目在不同查询里会被判成两种可见性。
+
+    单抽出来是为了让「按 owner 取」和「取公共条目」两处查询能共用同一口径：
+    常驻块要同时取「本人的钉住条目」和「所有人的公共钉住条目」，这两支
+    必须按同一条规则切分，否则一边判 public、另一边判非 public，会漏。
+    """
+    return f"COALESCE(NULLIF({prefix}visibility, ''), 'public')"
+
+
 def _visible_clause(allow_private: bool, group_id: str, viewer_owner: str = "",
                     prefix: str = "") -> tuple[str, list]:
     """当前场景能读到哪些 visibility 的条目（唯一的可见性判定口径）。
@@ -81,7 +140,7 @@ def _visible_clause(allow_private: bool, group_id: str, viewer_owner: str = "",
 
     返回 (SQL 片段, 参数)。调用方把片段接在 WHERE 条件后面。
     """
-    vis = f"COALESCE(NULLIF({prefix}visibility, ''), 'public')"
+    vis = _vis_expr(prefix)
     parts = [f"{vis} = 'public'"]
     args: list = []
     if allow_private:
@@ -159,7 +218,10 @@ class HermesDB:
     def __init__(self, data_dir: str, db_name: str = "hermes.db"):
         os.makedirs(data_dir, exist_ok=True)
         self.path = os.path.join(data_dir, db_name)
-        self._lock = threading.Lock()
+        # 可重入锁：读方法用 @_db_locked 装饰器补锁，而有几个读方法会调用
+        # 另一个读方法（search_messages → _fts_candidates 等），普通 Lock
+        # 在这里会自死锁。详见 _db_locked 的说明。
+        self._lock = threading.RLock()
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # 热重载/面板进程与机器人进程短时并存时，没有 busy_timeout 会直接抛
@@ -174,6 +236,7 @@ class HermesDB:
 
     # ---------- schema ----------
 
+    @_db_locked
     def _init_schema(self) -> bool:
         c = self.conn
         c.executescript(
@@ -319,6 +382,14 @@ class HermesDB:
                 ON memories(merged_into, kind, id);
             CREATE INDEX IF NOT EXISTS idx_msg_sender
                 ON messages(session_id, sender_id, id);
+            -- 公共钉住条目的部分索引。常驻块要同时取「本人的钉住条目」和
+            -- 「所有人的公共钉住条目」，写成 (owner_id = ? OR visibility='public')
+            -- 会让 SQLite 放弃 idx_mem_active、改走 idx_mem_kind 全扫，
+            -- 实测 2000 条时 0.022ms -> 0.141ms。这条部分索引只索引 pinned=1
+            -- 的行，两个分支就都能走索引（实测 0.025ms），写入侧几乎无开销
+            -- （非 pinned 的行根本不进这个索引）。
+            CREATE INDEX IF NOT EXISTS idx_mem_pubpin
+                ON memories(merged_into, visibility) WHERE pinned = 1;
             """
         )
         self._repair_orphan_private(c)
@@ -523,6 +594,7 @@ class HermesDB:
             args.append(sender_id)
         return _where(conds), args
 
+    @_db_locked
     def count_messages(self, session_id: str | None = None,
                        sender_id: str | None = None) -> int:
         where, args = self._msg_where(session_id, sender_id)
@@ -545,6 +617,7 @@ class HermesDB:
             self.conn.commit()
             return len(ids)
 
+    @_db_locked
     def _delete_message_batch(self, ids: list[int]) -> int:
         """删一批消息并同步 FTS。ids 来自本文件内的 SELECT，不含外部输入。"""
         if not ids:
@@ -612,6 +685,7 @@ class HermesDB:
                 pass
         return total
 
+    @_db_locked
     def recent_message_ids(self, session_id: str | None, sender_id: str | None,
                            n: int) -> list[int]:
         """取本会话最近 n 条消息的 id（与消息查询同口径），用于注入窗口去重。
@@ -626,6 +700,7 @@ class HermesDB:
         ).fetchall()
         return [r["id"] for r in rows]
 
+    @_db_locked
     def _fts_candidates(self, query: str, cap: int,
                         session_id: str | None,
                         sender_id: str | None) -> list[dict] | None:
@@ -644,7 +719,7 @@ class HermesDB:
         """
         if not self._fts_enabled:
             return None
-        wins = _recall.fts_windows(str(query))
+        wins = _fts_windows(str(query))
         if not wins:
             return None
         # FTS5 要求 MATCH 左侧写表名，别名不可用；rank 只在 MATCH 时存在
@@ -665,6 +740,7 @@ class HermesDB:
         except sqlite3.OperationalError:
             return None
 
+    @_db_locked
     def search_messages(self, query: str, limit: int = 5,
                         session_id: str | None = None,
                         sender_id: str | None = None,
@@ -678,7 +754,7 @@ class HermesDB:
         扫满 scan 条——原来无论命中多少都扫满，等于快路径白付一次查询。
         返回按 id 倒序（最新在前），与旧实现保持一致，调用方无需调整。
         """
-        if len(_recall.norm(query)) < 4:
+        if len(_norm(query)) < 4:
             # 两三个字的寒暄没有区分度，检索只会带回噪声
             return []
         cap = max(50, int(scan))
@@ -695,9 +771,10 @@ class HermesDB:
         if fts:
             seen = {d["id"] for d in docs}
             docs.extend([d for d in fts if d["id"] not in seen])
-        hits = _recall.rank_messages(query, docs, k=max(1, int(limit)))
+        hits = _rank_messages(query, docs, k=max(1, int(limit)))
         return sorted(hits, key=lambda x: -int(x["id"]))
 
+    @_db_locked
     def recent_messages(self, session_id: str, limit: int = 20) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
@@ -705,6 +782,7 @@ class HermesDB:
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    @_db_locked
     def message_signatures(self, session_id: str, limit: int = 20000) -> set[tuple]:
         """(role, content) 去重集，供「导入原生历史」做幂等判断。
 
@@ -717,6 +795,7 @@ class HermesDB:
         ).fetchall()
         return {(str(r["role"]), str(r["content"])) for r in rows}
 
+    @_db_locked
     def messages_since(self, since_id: int, limit: int = 200) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?",
@@ -735,15 +814,18 @@ class HermesDB:
     def set_watermark(self, session_id: str, msg_id: int) -> None:
         self.set_meta(f"summarized:{session_id}", str(int(msg_id)))
 
+    @_db_locked
     def all_session_ids(self) -> list[str]:
         rows = self.conn.execute(
             "SELECT DISTINCT session_id FROM messages").fetchall()
         return [r[0] for r in rows]
 
+    @_db_locked
     def max_message_id(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()
         return int(row[0]) if row else 0
 
+    @_db_locked
     def unsummarized_by_session(self) -> list[dict]:
         """每个会话待总结的消息统计（各自独立水位，互不影响）。"""
         out: list[dict] = []
@@ -759,6 +841,7 @@ class HermesDB:
                             "oldest": row["o"], "max_id": row["m"], "watermark": wm})
         return out
 
+    @_db_locked
     def session_batch(self, session_id: str, watermark: int,
                       limit: int = 200) -> list[dict]:
         rows = self.conn.execute(
@@ -768,6 +851,7 @@ class HermesDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def stats(self) -> dict:
         m = self.conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"]
         mem = self.conn.execute(
@@ -872,7 +956,7 @@ class HermesDB:
         corrections: list[int] = []
         pin_old = False
         for r in rows:
-            s = _recall.jaccard(content, r["content"] or "")
+            s = _jaccard(content, r["content"] or "")
             if s < 0.60:
                 continue
             # 否定词不一致时绝不去重：「喜欢猫」和「不喜欢猫」字面相似度 0.71，
@@ -929,6 +1013,7 @@ class HermesDB:
             )
             self.conn.commit()
 
+    @_db_locked
     def resident_notes(self, owner_id: str, limit: int = 6,
                        max_chars: int = 400,
                        kinds: tuple[str, ...] = ("profile", "preference"),
@@ -953,12 +1038,44 @@ class HermesDB:
         # 第一批：钉住的条目（任何 kind）——用户/模型明确要求「每轮必带」的信息，
         # 不受 kind 限制，也不受字符预算限制，这是重要信息的保护通道。
         # 按 pinned_ts 倒序：同槽位冲突时最新的排前面，模型能看出先后。
+        #
+        # owner_id 不能是硬条件：public 条目没有归属人（owner_id 为空串），
+        # 它本来就对所有人可见（见 _visible_clause），钉住它的人表达的也是
+        # 「每轮都要带上这条全局规则」。原来写死 owner_id = ?，public 钉住条目
+        # 谁都匹配不上——面板里显示已钉住，模型每轮却收不到，钉住语义在最关键
+        # 的这条通道上失效，而且两处口径不一致（pinned_memories 在 owner_id 为空
+        # 时是不加 owner 过滤的）。
+        #
+        # 拆成 UNION ALL 两支而不是一条 OR：OR 会让 SQLite 放弃 idx_mem_active
+        # 改走全扫（实测 0.022ms -> 0.141ms）。两支各走各的索引，实测 0.025ms。
+        # 外层再套一层 SELECT *：SQLite 的复合查询里 ORDER BY 只能按列名或
+        # 列序号排，不能写 COALESCE(pinned_ts, 0) 这种表达式，直接套在 UNION
+        # 后面会报 "1st ORDER BY term does not match any column"。
+        #
+        # 两支的切分必须**互斥**。UNION ALL 不去重，一旦同一条记录两支都命中，
+        # 它就会在常驻块里出现两次——白占注入预算，还可能触发槽位冲突误判。
+        # 切分线划在「是否公共」上，而不是「owner 是本人 / 是公共」这两条
+        # 正交的轴上：
+        #   支1：owner 是本人 且 **非公共**（private / group 等）
+        #   支2：**公共**（visibility 为空串或 'public'），不论归属人
+        # 两支互补且互斥，任何一条记录最多命中一支。
+        # 判定用 _vis_expr()——和 _visible_clause 同一个表达式。支2 若写成
+        # `visibility = 'public'` 硬比较，早期没有 visibility 字段、值为空串
+        # 的老条目会判不出来，公共钉住条目凭空消失。
+        visx = _vis_expr()
         pinned_rows = self.conn.execute(
-            "SELECT id, kind, content, importance, hits, pinned, pinned_ts,"
+            "SELECT * FROM ("
+            " SELECT id, kind, content, importance, hits, pinned, pinned_ts,"
             " COALESCE(visibility, '') AS visibility FROM memories"
-            " WHERE merged_into = 0 AND owner_id = ? AND pinned = 1" + vis +
-            " ORDER BY COALESCE(pinned_ts, 0) DESC, id DESC LIMIT ?",
-            (owner_id, *vis_args, max(1, int(limit))),
+            " WHERE merged_into = 0 AND pinned = 1 AND owner_id = ?"
+            " AND " + visx + " != 'public'" + vis +
+            " UNION ALL "
+            " SELECT id, kind, content, importance, hits, pinned, pinned_ts,"
+            " COALESCE(visibility, '') AS visibility FROM memories"
+            " WHERE merged_into = 0 AND pinned = 1"
+            " AND " + visx + " = 'public'" + vis +
+            ") ORDER BY COALESCE(pinned_ts, 0) DESC, id DESC LIMIT ?",
+            (owner_id, *vis_args, *vis_args, max(1, int(limit))),
         ).fetchall()
         # 第二批：画像/偏好优先。重要度必须随时间衰减——importance 只在重复写入时
         # +0.15、从不下降，按它硬排会让新偏好永远挤不进常驻（实测 6 条老条目
@@ -1022,7 +1139,7 @@ class HermesDB:
                 continue
             # 同一句话在私聊和群里各存了一条（可见性不同不能合并），
             # 私聊场景会同时看到两条一模一样的——按字面去重，只留排前面的那条。
-            if any(_recall.jaccard(text, t) >= 0.85 for t in kept_texts):
+            if any(_jaccard(text, t) >= 0.85 for t in kept_texts):
                 continue
             if used + len(text) > max_chars and out:
                 break
@@ -1031,6 +1148,7 @@ class HermesDB:
             used += len(text) + 3
         return out
 
+    @_db_locked
     def pinned_memories(self, owner_id: str = "", limit: int = 30,
                         allow_private: bool = True,
                         group_id: str = "",
@@ -1078,6 +1196,7 @@ class HermesDB:
             self.conn.commit()
         return cur.rowcount > 0
 
+    @_db_locked
     def slot_conflicts(self, memory_id: int) -> list[int]:
         """只读：这条记忆入常驻时会顶掉哪些同槽位旧条（用于提示用户）。"""
         rec = self.memory_by_id(int(memory_id))
@@ -1137,6 +1256,7 @@ class HermesDB:
             self.conn.commit()
             return cur.rowcount
 
+    @_db_locked
     def all_active_memories(self, limit: int | None = None) -> list[dict]:
         """所有未合并的记忆，按 id 升序（即时间顺序），供巩固/去重使用。
 
@@ -1152,6 +1272,7 @@ class HermesDB:
         rows = self.conn.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def active_memory_ids_since(self, since_id: int) -> set[int]:
         """只取 id，供「本轮新增了哪些记忆」这类判断，避免把正文全读进内存。"""
         rows = self.conn.execute(
@@ -1174,10 +1295,12 @@ class HermesDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def max_memory_id(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) m FROM memories").fetchone()
         return int(row["m"] or 0)
 
+    @_db_locked
     def memory_by_id(self, memory_id: int) -> dict | None:
         row = self.conn.execute(
             "SELECT * FROM memories WHERE id = ?", (memory_id,)
@@ -1211,6 +1334,11 @@ class HermesDB:
 
         保留旧条是为了可回滚：误合并时调 unmerge() 就能还原。
         作用域字段全部继承组内最早的那条，绝不跨用户/跨群合并。
+
+        这一层自己再校验一次归属，不依赖调用方分桶：合并产物继承最早那条的
+        group_id，一旦组里混进了别的群的条目，越界的那份内容就会跟着漏出去，
+        而原群那条就此消失。调用方（整理链路、面板入口）本来就该先分好桶，
+        这里做的是最后一道闸——将来新增调用点忘了分桶，也不会把数据合并坏。
         """
         ids = [int(i) for i in ids if i]
         if not ids:
@@ -1235,6 +1363,16 @@ class HermesDB:
             # 「!= 'private'」，空串照样被召回——并进组里的私聊条目就漏到群里了。
             vis = self._norm_visibility(
                 base["visibility"], base["owner_id"] or "", base["group_id"] or "")
+            # 归属三元组（人 / 群 / 可见性）必须完全一致，否则整组拒绝：
+            # 宁可少合并一次，也不能让一条记忆同时属于两个群。
+            base_scope = (str(base["owner_id"] or "").strip(),
+                          str(base["group_id"] or "").strip(), vis)
+            for r in rows[1:]:
+                r_vis = self._norm_visibility(
+                    r["visibility"], r["owner_id"] or "", r["group_id"] or "")
+                if (str(r["owner_id"] or "").strip(),
+                        str(r["group_id"] or "").strip(), r_vis) != base_scope:
+                    return 0
             now = time.time()
             try:
                 cur = self.conn.execute(
@@ -1307,6 +1445,7 @@ class HermesDB:
             self.conn.commit()
             return cur.rowcount
 
+    @_db_locked
     def search_memories(self, query: str, limit: int = 5,
                         owner_id: str | None = None,
                         session_id: str | None = None,
@@ -1393,7 +1532,7 @@ class HermesDB:
             # （比如 owner+group_id 都有的条目）。不去重的话它会被返回两次，
             # 白白占掉两个注入名额——实测「我电脑是什么系统」返回
             # [159, 177, 73, 159, 177]。MMR 只在单层内做，挡不住跨层重复。
-            for item in _recall.rank(query, docs, k=limit - len(out)):
+            for item in _rank(query, docs, k=limit - len(out)):
                 mid = int(item["id"])
                 if mid in seen_ids:
                     continue
@@ -1424,6 +1563,7 @@ class HermesDB:
             self.conn.commit()
             return created
 
+    @_db_locked
     def resolve_owner(self, raw_id: str, platform: str = "") -> str:
         """沿别名链解析出规范 ID（最多 5 跳，防环）。未登记则原样返回。"""
         cur = raw_id
@@ -1436,12 +1576,14 @@ class HermesDB:
             cur = row["canonical_id"]
         return cur
 
+    @_db_locked
     def list_aliases(self) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM identities ORDER BY ts DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def get_alias(self, alias_id: str) -> str:
         """这个 alias 已经绑定到谁了；没绑过返回空串。"""
         row = self.conn.execute(
@@ -1449,6 +1591,7 @@ class HermesDB:
         ).fetchone()
         return str(row["canonical_id"] or "") if row else ""
 
+    @_db_locked
     def sender_seen(self, raw_id: str) -> bool:
         """这个原始 ID 是否在本机说过话（用来判断「这是别人的活人账号」）。"""
         row = self.conn.execute(
@@ -1462,6 +1605,7 @@ class HermesDB:
             self.conn.commit()
             return cur.rowcount > 0
 
+    @_db_locked
     def all_memories(self, limit: int = 200, owner_id: str = "") -> list[dict]:
         if owner_id:
             rows = self.conn.execute(
@@ -1475,6 +1619,7 @@ class HermesDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def query_memories(self, q: str = "", scope: str = "", kind: str = "",
                        owner_id: str = "", include_merged: bool = False,
                        limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
@@ -1530,6 +1675,7 @@ class HermesDB:
             self.conn.commit()
             return cur.rowcount > 0
 
+    @_db_locked
     def memory_kind_counts(self) -> dict[str, int]:
         rows = self.conn.execute(
             "SELECT kind, COUNT(*) c FROM memories WHERE merged_into = 0 GROUP BY kind"
@@ -1605,6 +1751,7 @@ class HermesDB:
             self.conn.commit()
             return created
 
+    @_db_locked
     def list_skills(self, owner_id: str = "", group_id: str = "") -> list[dict]:
         """列出发言人当前能看到的技能，自己的排最前。"""
         rows = self.conn.execute(
@@ -1616,6 +1763,7 @@ class HermesDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def all_skills(self, owner_id: str | None = None,
                    group_id: str | None = None) -> list[dict]:
         """带正文的完整技能列表，供 WebUI 展示/编辑。
@@ -1636,6 +1784,7 @@ class HermesDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def _pick_skill(self, name: str, owner_id: str, group_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM skills WHERE name = ? AND " + SKILL_VISIBLE_SQL +
@@ -1684,12 +1833,14 @@ class HermesDB:
         except sqlite3.IntegrityError:
             return False
 
+    @_db_locked
     def skill_by_id(self, skill_id: int) -> dict | None:
         row = self.conn.execute(
             "SELECT * FROM skills WHERE id = ?", (skill_id,)
         ).fetchone()
         return dict(row) if row else None
 
+    @_db_locked
     def owner_names(self) -> dict[str, str]:
         """从历史消息里捞每位用户的昵称，供 WebUI 标注技能归属。"""
         try:
@@ -1741,6 +1892,7 @@ class HermesDB:
             self.conn.commit()
         return dict(row)
 
+    @_db_locked
     def skill_owners(self) -> list[dict]:
         """按归属统计技能数量，供技能整理分组和 WebUI 筛选。"""
         rows = self.conn.execute(
@@ -1750,6 +1902,7 @@ class HermesDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_db_locked
     def skills_in(self, owner_id: str = "", scope: str = "private",
                   group_id: str = "") -> list[dict]:
         """取出某个归属域内的全部技能（整理合并只在这个域里做）。"""
@@ -1786,6 +1939,7 @@ class HermesDB:
                 self.conn.commit()
             return n
 
+    @_db_locked
     def get_meta(self, key: str, default: str = "") -> str:
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
@@ -1823,6 +1977,7 @@ class HermesDB:
         """让后台批次任务（TTL 修剪）在下一批之前收手。"""
         self._closing.set()
 
+    @_db_locked
     def close(self):
         # 先立旗再关连接：后台线程（TTL 修剪）每批都会检查，尽量在关库前收手。
         self._closing.set()

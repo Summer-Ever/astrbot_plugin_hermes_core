@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import subprocess
@@ -69,7 +70,9 @@ def call(url: str, token: str, path: str, method: str = "POST",
             return r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
-    except Exception as e:  # noqa: BLE001
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        # 连不上、超时、HTTP 协议异常、URL 非法：都算「没调通」，把原因带回去。
+        # urllib.error.URLError 与 socket.timeout 都是 OSError 的子类。
         return 0, f"{type(e).__name__}: {e}"
 
 

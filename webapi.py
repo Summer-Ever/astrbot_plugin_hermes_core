@@ -21,11 +21,7 @@ import time
 import traceback
 
 from astrbot.api import logger
-
-try:
-    from astrbot.api.web import error_response, json_response, request
-except ImportError:  # pragma: no cover - 极老版本没有 web 模块
-    error_response = json_response = request = None
+from astrbot.api.web import error_response, json_response, request
 
 try:
     from .modules.paths import safe_join
@@ -301,7 +297,7 @@ class HermesWebAPI:
         if not content:
             return self._fail("记忆内容不能为空")
         if self.plugin._looks_like_injection(content):
-            return self._fail("内容含指令式语句（如「忽略以上」「你现在是」），"
+            return self._fail("内容含指令式语句（想改写规则或身份），"
                               "记忆会被逐轮注入，不能这样写")
         kind = str(data.get("kind") or "fact").strip()
         if kind not in MEMORY_KINDS:
@@ -350,7 +346,7 @@ class HermesWebAPI:
             if not content:
                 return self._fail("记忆内容不能为空")
             if self.plugin._looks_like_injection(content):
-                return self._fail("内容含指令式语句（如「忽略以上」「你现在是」），"
+                return self._fail("内容含指令式语句（想改写规则或身份），"
                                   "记忆会被逐轮注入，不能这样写")
         if kind is not None and str(kind) not in MEMORY_KINDS:
             return self._fail("未知的记忆类型")

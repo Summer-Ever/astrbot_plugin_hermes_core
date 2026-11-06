@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """LLM 工具链冒烟测试：save_memory / pin_memory / search_memory 的边界行为。
 
 三套 smoke（db / router / consolidate）覆盖的是模块内部逻辑，但插件真正暴露给
@@ -16,29 +15,21 @@ import tempfile
 import time
 import types
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-# main.py import astrbot.*：AstrBot 的 app 目录要在 path 里（部署位置可能不同，
-# 按常见安装路径探测，找不到就跳过并说明）。
-# 注意插入顺序：插件目录必须在最后插入（path 最前），否则 app 目录下同名的
-# main 模块会把插件入口截胡。
-_ASTROOT = r"D:\Local\AstrBot\backend\app"
-if os.path.isdir(_ASTROOT) and _ASTROOT not in sys.path:
-    sys.path.insert(0, _ASTROOT)
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-# 必须在 import main 之前换目录：import astrbot 会在 CWD 生成 data/cmd_config.json
-# 等运行时文件，留在仓库工作区会触发提交审计的 ASB-20（router/consolidate 同款做法）。
-os.chdir(tempfile.mkdtemp(prefix="hermes-cwd-"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _bootstrap import db_module, enable_astrbot_backend, plugin_main
+
+enable_astrbot_backend()
+
 try:
-    import main as m  # noqa: E402
+    m = plugin_main()
 except ImportError:
     print("跳过：需要 AstrBot 运行环境"
           "（确认 D:/Local/AstrBot/backend/app 存在，"
           "或用 D:/Local/AstrBot/backend/python/python.exe 运行）")
     sys.exit(0)
 
-from modules.db import HermesDB  # noqa: E402
+HermesDB = db_module().HermesDB
 
 PASS: list[str] = []
 FAIL: list[str] = []

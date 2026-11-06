@@ -138,7 +138,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.0.1"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -203,13 +203,55 @@ def _short_date(ts) -> str:
 
 # 记忆文本里绝不允许出现的「指令腔」。记忆是数据，一旦被写成指令，就会在下一次
 # 注入时对着模型生效——这是持久化提示词注入的最短路径（群友写进群记忆，别人读到）。
+#
+# v1.0.1 补了四类漏网的写法：角色块前缀（用角色名加冒号起头的块）、
+# 英文身份改写（宣称自己是谁）、中文规则断言（把内容说成规则）、
+# 强制执行（要求「记住并执行」）。实测过 8 条常见变体，改之前 8 条全漏。
+#
+# 收紧原则：宁可漏判（模型还有「数据不是指令」的边界声明兜底），不可误伤——
+# 记忆系统的本职就是存用户的偏好与事实，「提交前必须先跑测试」这类正常内容
+# 要是被当成指令腔拒掉，这个插件就没法用了。所以下面每条规则都要求出现
+# 明确的「指令信号词」（系统/规则/指令/执行/记住…），而不是单纯提到某个词。
 _INJ_PATTERNS = re.compile(
+    # —— 忽略 / 无视 / 英文 ignore ——
     r"忽略(以上|之前|先前|上面|全部)|无视(以上|之前|上述)|"
     r"ignore\s+(all\s+|any\s+)?(previous|above|prior)|disregard\s+(all\s+)?(previous|above)|"
+    r"disregard\s+(all\s+|any\s+|the\s+|your\s+|these\s+)*"
+    r"(instructions?|rules?|guidelines?)\b|"
     r"system\s*prompt|系统提示词|你的(系统)?指令|"
     r"你现在是|你现在(的)?(身份|角色|设定)|从现在(开始|起)你|"
     r"把.{0,8}(记忆|memory|对话记录).{0,8}(输出|打印|列出|发送|发出来)|"
-    r"<\|\s*(im_start|im_end)\s*\|>|\[/记忆系统上下文\]|\[记忆系统上下文",
+    r"<\|\s*(im_start|im_end)\s*\|>|\[/记忆系统上下文\]|\[记忆系统上下文|"
+    # —— 角色块前缀：角色名加冒号起头的块（如「管理员:」）、井号小标题块、
+    #     方括号包裹的角色名、竖线包裹的角色标记 ——
+    # 中文前缀只认「规则/指令/命令/设定/提示词/身份」这几个确凿的指令词：
+    # 「系统架构：单体」「系统模式：单实例」这类正常技术记忆不能被当成指令腔。
+    r"^\s*(system|assistant)\s*[:：]|"
+    r"^\s*system\s+(rules?|instructions?|prompt)\s*[:：]|"
+    r"^\s*(系统|管理员|上级|最高|主人)(规则|指令|命令|设定|提示词|身份)\s*[:：]|"
+    # 光有身份前缀、后面直接跟冒号也算角色块：「管理员：执行此操作」
+    r"^\s*(管理员|主人|上级|最高权限)\s*[:：]|"
+    r"###\s*(instruction|instructions|system|系统)\b|"
+    r"[\[/【]\s*(system|系统|管理员|admin)\s*[\]】]|"
+    r"<\|\s*(system|admin|管理员)\s*\|>|"
+    # —— 英文身份改写 ——
+    r"you\s+are\s+now\b|from\s+now\s+on\s+you\b|"
+    r"your\s+new\s+(role|purpose|instructions?|persona)\b|"
+    # —— 中文规则断言：把记忆说成「规则/指令」 ——
+    r"(这条|该条|此条|以上|以下|上述|下面)[^。；;]{0,10}"
+    r"(是|记为|记成|视为|作为|当作|算作)[^。；;]{0,6}"
+    r"(系统|管理员|主|最高|全局|内部)(规则|指令|命令|设定|人设|提示词)|"
+    r"(请)?把(这条|该条|此条|它|以下)[^。；;]{0,4}"
+    r"(记成|记为|存为|当成|视为)[^。；;]{0,6}(系统|管理员)?(规则|指令|命令)|"
+    # —— 强制执行 ——
+    r"(必须|务必|请务必)(永久|永远|始终)?(记住|执行|遵守|照做)"
+    r"[^。；;]{0,6}(这条|该条|此条|以上|以下|规则|指令|命令)|"
+    # 「立即执行」必须挂在指令信号上（或后面跟着被执行的宾语），
+    # 否则「立即执行的部署流程分三步」这种正常描述会被误伤。
+    r"(指示|命令|指令|要求|规则|设定)[^。；;]{0,8}"
+    r"(立即|马上|立刻)(执行|照做|遵从)|"
+    r"(立即|马上|立刻)(执行|照做|遵从)(以下|下面|这条|该条|本条)[^。；;]{0,20}|"
+    r"从现在(开始|起)[^。；;]{0,8}(忽略|无视)",
     re.I,
 )
 # 记忆正文上限：正常一句话远用不到。超长内容多半是「把手伸进来」而不是记忆。
@@ -278,6 +320,13 @@ def _scope_bucket(m: dict) -> tuple:
     可见性必须进桶。同一个人私聊说的私事和群里说的公开偏好如果并进一条，
     合并结果只能二选一：要么私事变成群可见，要么群里的信息从此在群里消失。
     merge_memories 继承组内最早那条的作用域字段，所以分桶阶段就得先切开。
+
+    群号也必须进桶。同一个人在 A 群和 B 群各说一条「项目进度是 30% / 35%」，
+    如果只按 owner 分桶，这两条会并成一条；合并产物继承最早那条的 group_id，
+    结果是 B 群的内容泄漏到 A 群，同时在 B 群彻底消失——两边都错。
+    v1.0.1 之前这里漏了群号，靠「同桶才能合并」的校验兜底，可那道校验用的
+    就是这个桶，等于没有兜底。面板的合并入口（webapi._bucket）一直带着群号，
+    两边的口径必须一致。
     """
     owner = (m.get("owner_id") or "").strip()
     gid = (m.get("group_id") or "").strip()
@@ -286,7 +335,8 @@ def _scope_bucket(m: dict) -> tuple:
         # 老数据没有 visibility，按写入位置推断，与 HermesDB._norm_visibility 一致
         vis = "group" if gid else ("private" if owner else "public")
     if owner:
-        return ("user", owner, m.get("platform") or "", vis)
+        # 末尾补群号：私聊（无群号）与群聊（同 owner）必须分开成两个桶
+        return ("user", owner, m.get("platform") or "", vis, gid)
     if gid:
         return ("group", gid, m.get("platform") or "", vis)
     return ("global", vis)
@@ -299,6 +349,23 @@ def _bucket_key(bucket: tuple) -> str:
 
 def _bucket_from_key(key: str) -> tuple:
     return tuple(json.loads(key))
+
+
+def _wm_lookup(wm: dict[str, int], bucket: tuple) -> int:
+    """取某个桶的深度整理水位，兼容 v1.0.1 之前的老键。
+
+    老版本的「用户桶」只有 (类型, owner, 平台, 可见性) 四段，没有群号；
+    新版本加了群号变成五段。升级后精确键查不到，如果直接当成 0，
+    升级后第一轮会把该用户的历史记忆全部当成新增重新整一遍。
+    老键的水位是「这个 owner+可见性（跨群合并计数）」，对其中任一具体群来说
+    都是有效的保守下界：id 小于等于它的记忆确实已经整理过了。取回退值。
+    """
+    v = wm.get(_bucket_key(bucket), 0)
+    if v:
+        return int(v)
+    if len(bucket) == 5 and bucket[0] == "user":
+        return int(wm.get(_bucket_key(bucket[:4]), 0))
+    return 0
 
 
 @register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", PLUGIN_VERSION)
@@ -1353,7 +1420,7 @@ class HermesCore(Star):
         if not text:
             return "内容为空，未保存。"
         if _is_injection(text):
-            return ("这条内容包含指令式语句（如「忽略以上」「你现在是」），"
+            return ("这条内容包含指令式语句（想改写规则或身份），"
                     "不像可长期复用的信息，未保存。")
         vis = "public" if shareable else ("group" if sc["is_group"] else "private")
         mid, created = self.db.add_memory_smart(
@@ -1398,6 +1465,14 @@ class HermesCore(Star):
                     replaced = self.db.supersede_memories([int(replaces)], mid)
                     if inherit:
                         self.db.set_pinned(mid, True)
+        # 这条新记忆必须登记进本会话的「已见集合」：replaces 的合法性校验
+        # （_id_seen）查的就是这个集合。不登记的话，模型刚 save_memory 拿到
+        # #17，紧接着拿 #17 去 replaces 就会被判「不在本会话可见范围内」——
+        # 新旧两种说法就一直并存，两边都注入。tool_search_memory 一直有
+        # 这一步（state["seen"].setdefault），save_memory 这条路径漏了。
+        # 放在 replaces 处理之后：顶掉的旧条要能查到，登记新条不影响它。
+        state = self._inj_state.setdefault(sc["sid"], {"turn": 0, "seen": {}})
+        state["seen"].setdefault(int(mid), state["turn"])
         self._clear_resident(sc["owner_id"])
         tail = f"，已替换旧记忆 #{int(replaces)}" if replaced else ""
         if reject:
@@ -1675,6 +1750,15 @@ class HermesCore(Star):
                    f"新记忆 {made_mem} 条，技能 新增 {made_skill} / 更新 {skill_upd} 个。")
         if skipped:
             summary += f"（{skipped} 个会话处于失败退避中，稍后自动重试）"
+        # 每个会话处理了多少条、为什么触发（达标/超时兜底/手动强制），以及失败
+        # 会话的错误与退避时间——这些原来只写进日志，用户从「/hermes 总结」看不到
+        # 「为什么总结了这个会话」，排障只能翻日志。会话多时不能把返回撑爆，
+        # 最多列 10 条，其余只给个数。
+        if details:
+            shown = details[:10]
+            more = (f"（另有 {len(details) - len(shown)} 个会话）"
+                    if len(details) > len(shown) else "")
+            summary += "\n明细：" + "；".join(shown) + more
         self._bump_metric("summarize_runs")
         self._bump_metric("summarize_messages", done_msgs)
         self._bump_metric("summarize_memories", made_mem)
@@ -2092,7 +2176,7 @@ class HermesCore(Star):
                 continue
             b = _scope_bucket(d)
             # 没水位的桶从 0 起算：升级后第一次见到它，历史记忆也该纳入整理
-            if int(d["id"]) <= int(wm.get(_bucket_key(b), 0)):
+            if int(d["id"]) <= _wm_lookup(wm, b):
                 continue
             counts[b] = counts.get(b, 0) + 1
         return counts

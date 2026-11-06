@@ -24,15 +24,11 @@ import sqlite3
 import sys
 import tempfile
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
-sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 插件运行时只用 astrbot.api 的官方 logger；纯 Python 体检脚本没有 AstrBot，
-# 在下面延迟导入 modules.db 之前先由测试侧注入替身。
-from _astrbot_stub import ensure_astrbot_logger  # noqa: E402
-
-ensure_astrbot_logger()
+# 由测试侧在导入插件模块之前注入替身。
+from _bootstrap import db_module
 
 ORPHAN_SQL = (
     "SELECT id, session_id FROM memories WHERE merged_into = 0"
@@ -123,7 +119,7 @@ def cross_group_probe(db_path: str) -> list:
     if not kw:
         return ["（条目正文为空，跳过）"]
 
-    from modules.db import HermesDB  # 延迟导入：只在需要真正检索时加载
+    HermesDB = db_module().HermesDB  # 延迟导入：只在需要真正检索时加载
 
     db = HermesDB(os.path.dirname(db_path))
     try:
@@ -173,7 +169,7 @@ def main() -> int:
             print("  " + line if not line.startswith(" ") else line)
 
         if args.repair:
-            from modules.db import HermesDB
+            HermesDB = db_module().HermesDB
 
             print("\n== 在副本上跑一次启动修复 ==")
             db = HermesDB(tmpdir)

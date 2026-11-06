@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """深度整理冒烟测试：分片、断点续跑、连续失败止损、总预算。
 
     D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py
@@ -15,20 +14,13 @@ import tempfile
 import threading
 import types
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.dirname(ROOT))   # 让 astrbot_plugin_hermes_core 作为包被导入
-ASTROOT = r"D:\Local\AstrBot\backend\app"
-if os.path.isdir(ASTROOT) and ASTROOT not in sys.path:
-    sys.path.insert(0, ASTROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# import astrbot 会以当前工作目录为根生成 data/，落在插件目录里会被审计判成
-# 「运行时文件入库」。先切到临时目录再导入。
-os.chdir(tempfile.mkdtemp(prefix="hermes-cwd-"))
+from _bootstrap import enable_astrbot_backend, package_main
 
-import importlib  # noqa: E402
+enable_astrbot_backend()
 
-m = importlib.import_module("astrbot_plugin_hermes_core.main")
+m = package_main()
 
 PASS, FAIL = [], []
 
@@ -89,9 +81,17 @@ def seed_buckets(db) -> None:
                       visibility="group")
 
 
-UA = ("user", "UA", "", "private")
-UB = ("user", "UB", "", "private")
+# 作用域桶键。v1.0.1 起「用户桶」末尾多了一段群号：同一个人在 A 群和 B 群
+# 各自的群可见记忆必须分开成两个桶，否则整理时会被并成一条，产物继承最早
+# 那条的群号——B 群的内容就泄漏到 A 群、同时在 B 群消失。上面 seed 的
+# UA / UB 都是私聊（无群号），所以末段是空串；群公共条目没有归属人，走
+# 群桶，形态不变。
+UA = ("user", "UA", "", "private", "")
+UB = ("user", "UB", "", "private", "")
 G1 = ("group", "G1", "", "group")
+# 同一个人在两个群里的群可见记忆：必须落进两个不同的桶
+UA_G1 = ("user", "UA", "", "group", "G1")
+UA_G2 = ("user", "UA", "", "group", "G2")
 
 
 def seed(db, n: int, owner: str = "u1") -> None:
@@ -317,6 +317,36 @@ async def case_deep_bucket_count(tmp: str) -> None:
     core.db.merge_memories(ids, "用户甲的偏好汇总", "fact")
     c4 = core._deep_pending_by_bucket()
     check("被合并的记忆不再撑高计数", c4.get(UA) == 40, str(c4.get(UA)))
+
+
+async def case_deep_bucket_cross_group(tmp: str) -> None:
+    """同一个人在两个群里的群可见记忆必须分开成两个桶。
+
+    v1.0.1 之前用户桶不带群号，A 群与 B 群的记忆落进同一个桶，整理时会被并成
+    一条、产物继承最早那条的群号——B 群的内容泄漏到 A 群，同时在 B 群消失。
+    """
+    core = cfg_core(new_core(tmp))
+    for i in range(5):
+        core.db.add_memory("fact", f"甲在G1第{i}条", owner_id="UA",
+                           group_id="G1", visibility="group")
+        core.db.add_memory("fact", f"甲在G2第{i}条", owner_id="UA",
+                           group_id="G2", visibility="group")
+    rows = core.db.active_memory_scope_rows(0)
+    b1 = m._scope_bucket(rows[0])
+    b2 = m._scope_bucket(rows[-1])
+    check("同一个人跨群的群可见记忆不同桶", b1 != b2, f"{b1} vs {b2}")
+    check("桶键带各自的群号", b1[-1] == "G1" and b2[-1] == "G2",
+          f"{b1} / {b2}")
+    c = core._deep_pending_by_bucket()
+    check("跨群分别计数", c.get(UA_G1) == 5 and c.get(UA_G2) == 5, str(c))
+    # 水位键的老格式（没有群号）仍要能回退命中，升级后不会把历史记忆重整一遍
+    old_key = m._bucket_key(("user", "UA", "", "group"))
+    check("老水位键可回退命中新桶",
+          m._wm_lookup({old_key: 3}, UA_G1) == 3,
+          str(m._wm_lookup({old_key: 3}, UA_G1)))
+    check("精确键优先于老键",
+          m._wm_lookup({old_key: 3, m._bucket_key(UA_G1): 9}, UA_G1) == 9,
+          str(m._wm_lookup({old_key: 3, m._bucket_key(UA_G1): 9}, UA_G1)))
 
 
 async def case_deep_plan(tmp: str) -> None:
@@ -605,7 +635,8 @@ async def case_job_log(tmp: str) -> None:
 async def main() -> int:
     for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
                case_merge, case_visibility, case_mutex, case_detach, case_footer,
-               case_deep_bucket_count, case_deep_plan, case_deep_schedule,
+               case_deep_bucket_count, case_deep_bucket_cross_group,
+               case_deep_plan, case_deep_schedule,
                case_skill_timeout, case_job_log):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:

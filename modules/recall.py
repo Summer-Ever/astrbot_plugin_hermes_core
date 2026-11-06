@@ -42,6 +42,22 @@ MIN_QUERY_CHARS = 2
 # 用全量 bigram 做分母时，一句正常问句会被「的/怎么/时候」这些虚词稀释到 0.3 以下，
 # 实测「部署的时候证书报错怎么办」正好 0.27 被误杀。
 MIN_COVERAGE = 0.30
+# 长 query 的覆盖率下限，比短档松一档。
+#
+# v1.0.1 之前长档的门槛是「命中 ≥2 个实词 且 覆盖率 ≥0.30」，短档是「命中 ≥1
+# 个且覆盖率 ≥0.30」。分档依据是 query 的实词总数，于是同一句问话加两个
+# 无所谓的前缀（「我喜欢简洁」→「记住我喜欢简洁」）实词数就从 3 变 4、跨过长档，
+# 命中数要求从 1 跳到 2，一条明明相关的记忆直接被砍掉——用户感受就是
+# 「明明存过却想不起来」。长档多出来的实词多半是「记住/帮我/请问/什么」这类
+# 框架词，不是检索实体，拿它们充数当分母本来就不合理。
+#
+# 0.25 这个数不是拍的：用生产规模的候选集（2600 条）离线评测了十一套门槛方案，
+# 短档完全不动、只放宽长档的这套，相关 query 的 Recall@5 从 15/16 提到 16/16，
+# 噪声 query 的 top5 平均无关条目只从 1.36 条涨到 1.79 条。同批评测里，
+# 「统一放宽全部档位」「按 IDF 加权」「覆盖率分母只算候选集出现过的词」
+# 几套要么噪声涨得更多、要么 Recall 掉得更多，见 .workbuddy/hermes-supertest/
+# d04_eval.py。
+MIN_COVERAGE_LONG = 0.25
 # MMR 去冗余阈值：两条记忆相似到这个程度就只留分高的那条
 DEDUP_SIM = 0.72
 
@@ -239,6 +255,7 @@ def rank(query: str, docs: list[dict[str, Any]], *, k: int = 5,
          text_key: str = "content", ts_key: str = "ts",
          kind_key: str = "kind", hits_key: str = "hits",
          half_life_days: float = 180.0, min_coverage: float = MIN_COVERAGE,
+         min_coverage_long: float = MIN_COVERAGE_LONG,
          dedup: bool = True, now: float | None = None) -> list[dict]:
     """按相关度返回前 k 条（每条原样附加 `_score` 字段）。
 
@@ -288,16 +305,22 @@ def rank(query: str, docs: list[dict[str, Any]], *, k: int = 5,
         cov = hit_n / len(qc)
         # 双档门槛：
         # - 短 query（≤3 个实词）命中一个强词即可，否则「这个报错怎么修」永远进不来；
-        # - 长 query 要求至少 2 个实词命中，防止一个烂大街的词把噪声拉进注入。
-        # 短档的覆盖率下限也走 min_coverage（默认 0.30）：原来硬编码 0.5，
+        # - 长 query 同样命中一个即可，但覆盖率下限松一档（MIN_COVERAGE_LONG）。
+        # 短档的覆盖率下限走 min_coverage（默认 0.30）：原来硬编码 0.5，
         # 3 个实词只命中 1 个时 cov=0.33 被拒——注释写着「命中一个强词即可」，
         # 实现却要求至少 2 个，实测「证书过期怎么办」↔「证书续期的处理办法」
         # 这种明明相关、只共享一个实词的记忆永远召不回。噪声由 IDF 加权分数
         # 和 MMR 兜住，门槛不该在这里把候选直接砍死。
+        #
+        # 长档原来要求「命中 ≥2 个实词」，那是为了挡「一个烂大街的词把噪声拉进
+        # 注入」。可它挡不住该挡的：实测真正决定放不放行的是覆盖率下限，
+        # 命中数从 2 改成 1 对噪声几乎没有影响（离线评测里噪声通过数一条没变），
+        # 却让「加两个字就丢召回」变成了常态。噪声交给排序和 MMR 兜，
+        # 门槛只保证「至少有一个实词真的出现了」。
         if len(qc) <= 3:
             ok = hit_n >= 1 and cov >= min_coverage
         else:
-            ok = hit_n >= 2 and cov >= min_coverage
+            ok = hit_n >= 1 and cov >= min_coverage_long
         if not ok:
             continue
         s = score(query, text, idf, qg=qg, ts=float(d.get(ts_key) or 0),

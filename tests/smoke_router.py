@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """模型路由冒烟测试：节流、限流退避、总预算。
 
     D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py
@@ -13,21 +12,16 @@ import sys
 import time
 import types
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-ASTROOT = r"D:\Local\AstrBot\backend\app"
-if os.path.isdir(ASTROOT) and ASTROOT not in sys.path:
-    sys.path.insert(0, ASTROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# import astrbot 会以当前工作目录为根生成 data/（cmd_config.json、t2i 模板），
-# 落在插件目录里会被审计脚本判成「运行时文件入库」。先切到临时目录再导入。
-import tempfile  # noqa: E402
+from _bootstrap import enable_astrbot_backend, router_module
 
-os.chdir(tempfile.mkdtemp(prefix="hermes-cwd-"))
+enable_astrbot_backend()
 
-from modules.router import (  # noqa: E402
-    ModelError, ModelRouter, retry_after_of,
-)
+_router = router_module()
+ModelError = _router.ModelError
+ModelRouter = _router.ModelRouter
+retry_after_of = _router.retry_after_of
 
 PASS, FAIL = [], []
 
