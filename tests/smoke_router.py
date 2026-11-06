@@ -191,6 +191,62 @@ async def case_rate_no_retry() -> None:
     check("429 不原地重试（主模型只打 1 次）", len(a.calls) == 1, str(len(a.calls)))
 
 
+async def case_timeout_switch_model() -> None:
+    """超时后必须立刻换模型，不能把 max_attempts 全耗在主模型上。
+
+    实测日志：整理技能 max_attempts=2、per_model=2，两次 60s 超时全打在
+    qwen3.7-flash 上（间隔 61.7s），配好的回退模型一次都没被调用。
+    """
+    a = FakeProvider("a", [TimeoutError("request timeout"),
+                           TimeoutError("request timeout")])
+    b = FakeProvider("b")
+    r = make_router({"llm_rpm": 0, "llm_min_interval": 0.0,
+                     "llm_max_retries": 1, "llm_total_attempts": 2},
+                    {"a": a, "b": b})
+    text = await r.chat("hi", purpose="整理技能", max_attempts=2)
+    check("超时后回退模型被调用", text == "ok from b", text)
+    check("超时不原地重试（主模型只打 1 次）", len(a.calls) == 1, str(len(a.calls)))
+
+
+async def case_timeout_single_model_retries() -> None:
+    """只有一个模型时没得换，仍保留原地重试来治瞬时抖动。"""
+    a = FakeProvider("a", [TimeoutError("request timeout"), "ok from a"])
+    r = make_router({"llm_rpm": 0, "llm_min_interval": 0.0,
+                     "llm_max_retries": 1, "llm_total_attempts": 4},
+                    {"a": a})
+    text = await r.chat("hi")
+    check("单模型超时仍原地重试", text == "ok from a", text)
+    check("单模型重试打了 2 次", len(a.calls) == 2, str(len(a.calls)))
+
+
+async def case_timeout_budget_exhausted() -> None:
+    """总预算已用完就不该再换模型白打一次。"""
+    a = FakeProvider("a", [TimeoutError("request timeout")])
+    b = FakeProvider("b")
+    r = make_router({"llm_rpm": 0, "llm_min_interval": 0.0,
+                     "llm_max_retries": 0, "llm_total_attempts": 1},
+                    {"a": a, "b": b})
+    try:
+        await r.chat("hi")
+        check("预算耗尽应失败", False, "竟然成功")
+    except ModelError:
+        check("预算耗尽应失败", True)
+    check("预算耗尽不再换模型", not b.calls, str(len(b.calls)))
+
+
+async def case_call_timeout() -> None:
+    """chat 未显式传 timeout 时，单次超时必须来自 llm_timeout 配置。"""
+    provs = {"a": FakeProvider("a")}
+    check("policy timeout 读取配置",
+          make_router({}, provs).policy()["timeout"] == 5.0)
+    check("policy timeout 跟随 95",
+          make_router({"llm_timeout": 95}, provs).policy()["timeout"] == 95.0)
+    check("policy timeout 上限 600",
+          make_router({"llm_timeout": 9999}, provs).policy()["timeout"] == 600.0)
+    check("policy timeout 下限 5",
+          make_router({"llm_timeout": 0.1}, provs).policy()["timeout"] == 5.0)
+
+
 async def case_rate_cooldown() -> None:
     a = FakeProvider("a", [RateLimited("90")])
     b = FakeProvider("b")
@@ -282,6 +338,8 @@ async def case_soft_deadline() -> None:
 
 async def main() -> int:
     for fn in (case_interval, case_rpm_deadline, case_rate_no_retry,
+               case_timeout_switch_model, case_timeout_single_model_retries,
+               case_timeout_budget_exhausted, case_call_timeout,
                case_rate_cooldown, case_retry_after_parse, case_deadline_stop,
                case_all_cooling, case_cooldown_floor, case_soft_deadline,
                case_decoupled):

@@ -701,6 +701,36 @@ webapi.py / 前端逐行读一遍，疑点全部写探针实测，确认了才�
 tools 22 全绿，合计 256 项；`ruff check --select=E9,F` 通过，全仓已无
 任何审查豁免字样或内置 logging 引用。
 
+## 整理技能超时与回退链（v0.12.24）
+
+日志里出现过「整理技能 失败 model=openai/qwen3.7-flash 第1次 / 第2次
+[请求超时]」，两次相隔 61.7 秒，而「模型」页测试同一个模型却是通的。
+读码 + 对照后端日志后的结论：
+
+**「测试」只测连通性。** `router.test()` 用 `只回复两个字母：OK`、25~30 秒
+超时、单次调用；整理技能是约 5.5k 字的技能全文 + 要求输出完整 JSON
+Markdown。启动探针（`llm_probe_on_start`）才有长提示实测：deepseek 约 9s、
+qwen3.7-flash 约 32.5s、nemotron 28~52s。测试通不代表长任务能在预算内跑完。
+
+**回退链被重试预算吃光（真 bug）。** 整理技能传 `max_attempts=2`，而
+`llm_max_retries=1` 让 `per_model=2`，两次 60 秒超时全打在**同一个**主模型
+上，配好的回退模型一次都没调用（日志两个 pid 相同，间隔正好是 60s 超时 +
+1.5s 退避）。现在 `timeout` 且链上还有后续模型、总预算未耗尽时**立即换模型**
+（与 429 的处理一致）；单模型链没得换，仍保留原地重试来治瞬时抖动；预算
+已耗尽也不再白打一次。总耗时不变，2 次预算正好覆盖「主模型 + 第一个回退」。
+
+**`llm_timeout` 对整理类不生效（真 bug）。** 整理技能 / 深度整理记忆写死
+`timeout=60.0`，整理记忆压死 60，用户在「模型」页调到 120 会被悄悄盖掉。
+现统一走 `_llm_call_timeout()`（直接读配置、与 router 同为 5~600 区间），
+总时长仍由各调用点的 `deadline` / 单片预算兜住。
+
+如果主模型换成思考型或更慢的模型，可把 `llm_timeout` 调到 90~120；不建议
+超过整理技能的 180 秒整批预算，否则第一次超时就会把预算用光。
+
+测试：smoke_router 29→**39**（超时换模型、单模型仍重试、预算耗尽不换、
+配置 clamp）、smoke_consolidate 59→**66**（整理技能 timeout 端到端跟随配置），
+db 146 / tools 22，合计 **273 项**全绿；`ruff check --select=E9,F` 通过。
+
 ## 清上下文 vs 清记忆：两套独立存储
 
 很容易混淆的一点：**上下文和记忆在物理上是分开存的**。
@@ -748,8 +778,8 @@ AstrBot 的环境里跑，由 `tests/_astrbot_stub.py` 在导入前注入一个 
 模型链、整理编排与 LLM 工具链另有两个冒烟脚本（不联网，用假 provider 模拟各种失败）：
 
 ```bash
-D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 29 项：节流、429 退避、冷却下限、两级预算
-D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 59 项：切片、断点、单片超时、连续失败止损、模型落款、水位与自动深度整理
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 39 项：节流、429 退避、冷却下限、两级预算、超时换模型、配置 clamp
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 66 项：切片、断点、单片超时、连续失败止损、模型落款、水位与自动深度整理、整理超时跟随配置
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_tools.py       # 22 项：工具链编号边界与越权、队列重建、WebUI 缓存失效、注入守卫窗口
 ```
 
@@ -867,7 +897,7 @@ python hot_reload.py --pull        # 拉代码 + 重载 + 核对是否真的生�
 - `skill_merge_threshold`：召回重叠技能的阈值（默认 0.2，是否合并仍由模型判断）
 - `skill_consolidate_max`：技能不超过此数时全量交给模型整理（默认 40）
 - `llm_primary_provider` / `llm_fallback_providers`：总结模型链（推荐用「模型」页维护）。与 AstrBot 主体的对话模型/降级链相互独立，留空则本插件不调用模型
-- `llm_max_retries` / `llm_timeout` / `llm_backoff` / `llm_total_attempts`：逐模型重试次数、单次超时、退避基数、整链尝试上限
+- `llm_max_retries` / `llm_timeout` / `llm_backoff` / `llm_total_attempts`：逐模型重试次数、单次超时、退避基数、整链尝试上限。`llm_timeout` 对总结 / 整理 / 深度整理 / 技能整理**统一生效**（默认 60 秒，范围 5~600）；总时长另由各整理任务的 `deadline` 与单片预算兜住
 - `llm_cooldown_seconds`：失败模型冷却秒数（鉴权错自动 4 倍）
 - `llm_max_prompt_chars`：单次送入模型的最大字符数
 - `llm_retry_on`：哪些错误类别重试同一模型（默认超时/连接/限流/服务端/空响应）

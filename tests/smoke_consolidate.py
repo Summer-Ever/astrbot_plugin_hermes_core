@@ -474,10 +474,56 @@ async def case_detach(tmp: str) -> None:
           str(core.config))
 
 
+async def case_skill_timeout(tmp: str) -> None:
+    """整理技能的单次超时必须取自 router.call_timeout()，不能写死 60。
+
+    以前 main.py 里 timeout=60.0 是常量，用户在「模型」页把 llm_timeout
+    调到 120 也会被悄悄盖掉；整理记忆 / 深度整理记忆同样如此。
+    """
+    core = new_core(tmp)
+    cfg_core(core, llm_timeout=95)
+    check("整理超时 helper 跟随配置", core._llm_call_timeout() == 95.0)
+    cfg_core(core, llm_timeout=9999)
+    check("整理超时 helper 上限 600", core._llm_call_timeout() == 600.0)
+    cfg_core(core, llm_timeout=0.1)
+    check("整理超时 helper 下限 5", core._llm_call_timeout() == 5.0)
+    cfg_core(core, llm_timeout=95)
+    for i in (1, 2):
+        core.db.upsert_skill(
+            f"skill_{i}", "触发词",
+            f"步骤{i}：这是一段用来走完整理流程的技能正文。" * 4,
+            owner_id="U1")
+
+    class FakeRouter:
+        def __init__(self):
+            self.kw = None
+
+        def call_timeout(self):
+            return 95.0
+
+        async def chat(self, **kw):
+            self.kw = kw
+            return "[]"
+
+    core.router = FakeRouter()
+    await core._consolidate_skill_group(
+        {"owner_id": "U1", "scope": "private", "group_id": ""}, dry_run=True)
+    kw = core.router.kw
+    check("整理技能走到模型调用", kw is not None, str(kw))
+    check("整理技能 timeout 跟随配置",
+          bool(kw) and kw.get("timeout") == 95.0,
+          str(kw and kw.get("timeout")))
+    check("整理技能仍保持 2 次预算",
+          bool(kw) and kw.get("max_attempts") == 2,
+          str(kw and kw.get("max_attempts")))
+    check("整理技能仍带 deadline", bool(kw) and kw.get("deadline") is not None)
+
+
 async def main() -> int:
     for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
                case_merge, case_visibility, case_mutex, case_detach, case_footer,
-               case_deep_bucket_count, case_deep_plan, case_deep_schedule):
+               case_deep_bucket_count, case_deep_plan, case_deep_schedule,
+               case_skill_timeout):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:
             await fn(tmp)

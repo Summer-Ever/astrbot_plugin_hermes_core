@@ -758,6 +758,18 @@ class ModelRouter:
                         # 立刻换模型，同时按 Retry-After 给它一段更长的冷却。
                         logger.warning(f"[hermes_core] {pid} 被限流，立即换模型并冷却")
                         break
+                    if (kind == "timeout" and fallback_index + 1 < len(chain)
+                            and attempts < total_cap):
+                        # 等满一次 timeout 已经花了几十秒，同一个模型再撞一次
+                        # 大概率还是超时；更糟的是像「整理技能」这种
+                        # max_attempts=2 的调用，两次会全耗在主模型上，
+                        # 配好的回退链一次都轮不到（实测日志两次都是同一个
+                        # pid、间隔 61.7s）。有下一个模型就立刻换过去。
+                        # 单模型链不在此列：没得换时原地重试仍是唯一容错。
+                        logger.info(
+                            f"[hermes_core] {purpose} {pid} 请求超时，"
+                            "还有备用模型，立即切换而非原地重试")
+                        break
                     if kind not in pol["retry_on"]:
                         break  # 鉴权/超长等，重试无意义，换模型
                     if i < per_model - 1 and attempts < total_cap:

@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.23"
+PLUGIN_VERSION = "0.12.24"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -520,6 +520,20 @@ class HermesCore(Star):
             return self.config.get(key, default)
         except Exception:
             return default
+
+    def _llm_call_timeout(self) -> float:
+        """后台整理的单次调用超时（秒），与 router.policy() 同口径。
+
+        以前「整理技能」「深度整理记忆」写死 60 秒、「整理记忆」压死 60 秒，
+        用户在「模型」页把 llm_timeout 调到 120 对这些路径完全不生效。
+        这里直接读配置并 clamp 到 router 允许的 5~600 区间；总时长仍由各
+        调用点的 deadline / unit 预算兜住。
+        """
+        try:
+            value = float(self._get_cfg("llm_timeout", 60))
+        except (TypeError, ValueError):
+            value = 60.0
+        return max(5.0, min(600.0, value))
 
     # WebUI 与 LLM 工具必须共用同一套写入侧净化/拦截，否则面板就成了
     # 绕过注入防线的后门（面板写进 public 记忆后每轮注入给所有人）。
@@ -2150,7 +2164,7 @@ class HermesCore(Star):
         _unit = max(30, int(self._get_cfg("consolidate_unit_seconds", 180)))
         text = await self.router.chat(
             builder=build, purpose="整理记忆",
-            timeout=min(60.0, float(_unit)),
+            timeout=min(self._llm_call_timeout(), float(_unit)),
             max_attempts=3,
             deadline=time.monotonic() + _unit,
         )
@@ -2310,9 +2324,9 @@ class HermesCore(Star):
                     # 单片硬顶：一片最多耗 unit_budget 秒，到点就放弃这片刻去写库。
                     # 实测（40 条记忆 ≈ 2.1k 字 prompt）：deepseek 9.5s、
                     # qwen3.7-flash 32.5s、nemotron free 51.9s、glm 直接不通。
-                    # 超时按 60 秒给，才能让前两个降级模型有机会跑完；
-                    # 3 次尝试 × 60 秒会被单片硬顶拦住，不会无限拖。
-                    timeout=60.0,
+                    # 单次超时跟随「模型」页的 llm_timeout（默认 60 秒），
+                    # 才能让降级模型有机会跑完；总时长仍由单片硬顶拦住。
+                    timeout=self._llm_call_timeout(),
                     max_attempts=3,
                     deadline=deadline,
                     soft_deadline=time.monotonic() + unit_budget,
@@ -2657,10 +2671,13 @@ class HermesCore(Star):
                 body += "\n（其余技能因当前模型上下文不足未列出）"
             return head + body
 
-        # 技能整理也要有硬上限：没有 deadline 时，一个域最坏 4 次尝试 × 60 秒，
-        # 默认 3 个域能把总结锁占满十几分钟，后面的会话一条都总结不了。
+        # 技能整理也要有硬上限：没有 deadline 时，一个域最坏 4 次尝试 × 单次
+        # 超时，默认 3 个域能把总结锁占满十几分钟，后面的会话一条都总结不了。
+        # 单次超时跟随 llm_timeout；2 次预算配「超时立即换模型」，正好覆盖
+        # 主模型 + 第一个回退模型，总耗时与写死 60 秒时相当。
         text = await self.router.chat(builder=build, purpose="整理技能",
-                                      timeout=60.0, max_attempts=2,
+                                      timeout=self._llm_call_timeout(),
+                                      max_attempts=2,
                                       deadline=time.monotonic() + 180)
         plan = self._extract_json_array(text)
 
