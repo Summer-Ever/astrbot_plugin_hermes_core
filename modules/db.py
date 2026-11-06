@@ -22,6 +22,7 @@ try:  # 正常情况（包内导入）
         jaccard as _jaccard,
         norm as _norm,
         rank as _rank,
+        rank_fused as _rank_fused,
         rank_messages as _rank_messages,
     )
 except ImportError:  # 插件被按文件路径加载时，退化为同名模块
@@ -31,6 +32,7 @@ except ImportError:  # 插件被按文件路径加载时，退化为同名模块
             jaccard as _jaccard,
             norm as _norm,
             rank as _rank,
+            rank_fused as _rank_fused,
             rank_messages as _rank_messages,
         )
     except ImportError:  # 最后兜底：按路径加载，不污染 sys.path
@@ -44,6 +46,7 @@ except ImportError:  # 插件被按文件路径加载时，退化为同名模块
         _jaccard = _rc_mod.jaccard
         _norm = _rc_mod.norm
         _rank = _rc_mod.rank
+        _rank_fused = _rc_mod.rank_fused
         _rank_messages = _rc_mod.rank_messages
 
 # 记忆类型白名单。模型偶尔会自创类型（历史上出现过 conclusion），
@@ -1454,7 +1457,10 @@ class HermesDB:
                         scan: int = 3000,
                         allow_private: bool = True,
                         viewer_owner: str = "",
-                        global_mode: bool = False) -> list[dict]:
+                        global_mode: bool = False,
+                        fusion: bool = True,
+                        rel_ratio: float = 0.70,
+                        gate: bool = True) -> list[dict]:
         """记忆检索：作用域分层 + 本地相关性排序（bigram/IDF/时间衰减/去冗余）。
 
         群公共记忆的键用 (platform, group_id) 而不是 session_id(umo)，
@@ -1470,6 +1476,14 @@ class HermesDB:
 
         viewer_owner 是「当前是谁在看」，用于 private 条目归属校验；
         group 模式（memory_scope=group）不传 owner_id 时也要传它。
+
+        fusion / rel_ratio / gate 是排序策略（v1.0.2）：
+        - fusion=True 走 recall.rank_fused（双路 + RRF + 加法精排），
+          False 退回旧的 recall.rank（单路 + 覆盖率硬门槛），留作回滚开关；
+        - rel_ratio 是相对截断比例，低于层内首条该分数的候选不再注入
+          （0 表示只要过闸门就注入，不额外截断）；
+        - gate=False 关掉注入闸门（只用于对照实验，生产别关）。
+        三者只影响「排序与取舍」，不改变分层、可见性和跨层去重。
         """
         tiers: list[tuple[str, list]] = []
         viewer = viewer_owner or (owner_id or "")
@@ -1515,6 +1529,11 @@ class HermesDB:
 
         out: list[dict] = []
         seen_ids: set[int] = set()
+        # 两个排序器的差别见 recall 模块「双路融合召回」整段说明：
+        # rank_fused 不靠覆盖率常数砍候选，rank 是改造前的实现（保留用于回滚）。
+        ranker = _rank_fused if fusion else _rank
+        rank_kw: dict = ({"rel_ratio": rel_ratio, "gate": gate}
+                         if fusion else {})
         for cond, args in tiers:
             if len(out) >= limit:
                 break
@@ -1532,7 +1551,7 @@ class HermesDB:
             # （比如 owner+group_id 都有的条目）。不去重的话它会被返回两次，
             # 白白占掉两个注入名额——实测「我电脑是什么系统」返回
             # [159, 177, 73, 159, 177]。MMR 只在单层内做，挡不住跨层重复。
-            for item in _rank(query, docs, k=limit - len(out)):
+            for item in ranker(query, docs, k=limit - len(out), **rank_kw):
                 mid = int(item["id"])
                 if mid in seen_ids:
                     continue

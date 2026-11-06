@@ -138,7 +138,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "1.0.1"
+PLUGIN_VERSION = "1.0.2"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -366,6 +366,34 @@ def _wm_lookup(wm: dict[str, int], bucket: tuple) -> int:
     if len(bucket) == 5 and bucket[0] == "user":
         return int(wm.get(_bucket_key(bucket[:4]), 0))
     return 0
+
+
+def _recall_rank_kw(get_cfg) -> dict:
+    """记忆检索的排序参数，注入路径与工具检索共用一份口径。
+
+    三个配置项对应 recall.rank_fused 的三个开关：fusion 决定走双路融合
+    还是旧单路排序（留作回滚），rel_ratio 是相对截断比例，gate 是注入闸门。
+    任何一项读失败都回落到默认值，避免一次配置异常让整段注入消失。
+
+    做成模块级函数而不是方法：调用方只需要一个 `get_cfg(key, default)`
+    可调用对象。工具链的测试替身是 SimpleNamespace，只挂了 _get_cfg，
+    写成方法会让「按方法名白名单挂载」的替身直接 AttributeError。
+    """
+    try:
+        fusion = bool(get_cfg("recall_fusion", True))
+    except Exception:
+        fusion = True
+    try:
+        rel_ratio = float(get_cfg("recall_rel_ratio", 0.70))
+    except (TypeError, ValueError):
+        rel_ratio = 0.70
+    try:
+        gate = bool(get_cfg("recall_gate", True))
+    except Exception:
+        gate = True
+    if not (0.0 <= rel_ratio <= 1.0):
+        rel_ratio = 0.70
+    return {"fusion": fusion, "rel_ratio": rel_ratio, "gate": gate}
 
 
 @register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", PLUGIN_VERSION)
@@ -1134,21 +1162,24 @@ class HermesCore(Star):
 
         # 第二层：按当前这句话检索相关记忆（用户 > 群 > 全局逐级补）
         scan = max(200, int(self._get_cfg("recall_scan_limit", 3000)))
+        # 排序策略（v1.0.2，见 recall.rank_fused 的说明）
+        rank_kw = _recall_rank_kw(self._get_cfg)
         if scope == "user":
             memories = self.db.search_memories(
                 search_q, limit=mem_k, owner_id=owner_id, allow_private=allow_private,
                 session_id=sid, platform=sc["platform"], group_id=sc["group_id"] or None,
-                scan=scan, viewer_owner=owner_id)
+                scan=scan, viewer_owner=owner_id, **rank_kw)
         elif scope == "group":
             memories = self.db.search_memories(
                 search_q, limit=mem_k, session_id=sid, allow_private=allow_private,
                 platform=sc["platform"], group_id=sc["group_id"] or None,
-                scan=scan, viewer_owner=owner_id)
+                scan=scan, viewer_owner=owner_id, **rank_kw)
         else:
             memories = self.db.search_memories(
                 search_q, limit=mem_k, allow_private=allow_private, scan=scan,
                 group_id=sc["group_id"] or None, session_id=sid,
-                platform=sc["platform"], viewer_owner=owner_id, global_mode=True)
+                platform=sc["platform"], viewer_owner=owner_id, global_mode=True,
+                **rank_kw)
         raw_mem = len(memories)
         memories = suppress_repeats(memories, state["seen"], state["turn"])
         if raw_mem > len(memories):
@@ -1341,7 +1372,8 @@ class HermesCore(Star):
             query, limit=5, owner_id=sc["owner_id"], session_id=sc["sid"],
             platform=sc["platform"], group_id=sc["group_id"] or None,
             allow_private=bool(sc["allow_private"]), viewer_owner=sc["owner_id"],
-            scan=max(200, int(self._get_cfg("recall_scan_limit", 3000))))
+            scan=max(200, int(self._get_cfg("recall_scan_limit", 3000))),
+            **_recall_rank_kw(self._get_cfg))
         if mems:
             try:
                 self.db.bump_hits([int(m["id"]) for m in mems])
