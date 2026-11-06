@@ -137,7 +137,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.21"
+PLUGIN_VERSION = "0.12.22"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -291,6 +291,15 @@ def _scope_bucket(m: dict) -> tuple:
     return ("global", vis)
 
 
+def _bucket_key(bucket: tuple) -> str:
+    """作用域桶 -> 稳定的 meta 键。json 数组比 str(tuple) 好解析，也不怕中文/引号。"""
+    return json.dumps(list(bucket), ensure_ascii=False, separators=(",", ":"))
+
+
+def _bucket_from_key(key: str) -> tuple:
+    return tuple(json.loads(key))
+
+
 @register("astrbot_plugin_hermes_core", "workbuddy", "Hermes 风格记忆与技能学习闭环", PLUGIN_VERSION)
 class HermesCore(Star):
     def __init__(self, context: Context, config=None):
@@ -307,6 +316,11 @@ class HermesCore(Star):
         # 手动整理是长任务（逐作用域调用模型），不能占着事件处理等平台回话：
         # QQ 官方被动回复只有 5 分钟有效期，超时后结果只能靠主动消息补发。
         self._consolidate_task: asyncio.Task | None = None
+        # 自动深度整理是独立的后台任务：它跑几分钟，不能 await 在总结循环里，
+        # 也不该覆盖手动整理的报告或推动普通整理队列。调度标志在 create_task
+        # 之前就置位，防止「任务还没开始、_consolidating 仍是 False」时重复调度。
+        self._deep_task: asyncio.Task | None = None
+        self._deep_scheduled = False
         # 整理互斥：自动总结、手动命令、WebUI 三条路径都会快照全库再花几分钟写回，
         # 同时跑会把同一批 id 从对方的合并结果里抢走。见 _consolidate_memories。
         self._consolidating = False
@@ -1290,6 +1304,14 @@ class HermesCore(Star):
                 await self._summarize()
             except Exception:
                 logger.error(f"[hermes_core] 总结循环异常:\n{traceback.format_exc()}")
+            # 自动深度整理：这里只做一次分桶检查（几千条约 9ms），真正整理交给
+            # 后台任务。绝不能在本循环里 await——逐片调模型能跑十几分钟，
+            # 会把下一轮总结和下面的例行维护一起堵死。
+            try:
+                self._schedule_auto_deep()
+            except Exception:
+                logger.warning("[hermes_core] 自动深度整理检查失败:\n"
+                               f"{traceback.format_exc(limit=2)}")
             # 每轮顺带做维护（内部有 24h 节流，实际每天至多跑一次）
             try:
                 note = await asyncio.to_thread(self._sweep)
@@ -1697,6 +1719,17 @@ class HermesCore(Star):
 
     MAX_QUEUE = 200
 
+    # ---- 自动深度整理（按作用域水位，独立于上面的普通整理队列）----
+    # 每桶记「上次整理时的全局 max memory id」，统计该桶此后新增且仍活跃的
+    # 记忆数。用「仍活跃」而不是累计新增：普通整理合并掉的记忆不该把水位撑高，
+    # 手动深度整理压缩后计数也会自然回落，不需要它来改水位。
+    DEEP_WM_KEY = "deep_consolidate_watermarks"
+    # 所有桶都不到阈值、但全局累计够多时兜底，防止碎片化场景永远不整理。
+    DEEP_FALLBACK_RATIO = 4
+    # 单次最多整理几个作用域。升级后首次检查可能所有桶都「没水位 = 从 0 起算」
+    # 而全部达标，不限量的话一轮就要跑几十个桶 × 每桶若干片，直接打爆预算。
+    DEEP_MAX_BUCKETS = 3
+
     def _pending_memory_ids(self) -> list[int]:
         raw = self.db.get_meta("consolidate_pending_memories", "")
         if not raw:
@@ -1819,19 +1852,152 @@ class HermesCore(Star):
                     f"自动整理暂停 {blocked // 60} 分钟（可手动 /hermes 整理）")
         return f"{mem_txt}、{sk_txt} 触发一次（每次约 1 次模型调用）"
 
+    # ============ 自动深度整理：按作用域水位触发 ============
+
+    def _deep_watermarks(self) -> dict[str, int]:
+        """桶键 -> 上次深度整理时的全局 max memory id。
+
+        水位 meta 是可读 JSON，排查时需要把键反解回作用域；这里顺手用
+        _bucket_from_key 校验一次，手改坏的/旧格式的键直接跳过，不让后面的
+        分桶计数炸掉整个总结循环。
+        """
+        try:
+            raw = json.loads(self.db.get_meta(self.DEEP_WM_KEY, "{}") or "{}")
+            out: dict[str, int] = {}
+            for k, v in raw.items():
+                key = str(k)
+                try:
+                    _bucket_from_key(key)
+                except (ValueError, TypeError):
+                    continue
+                out[key] = int(v)
+            return out
+        except (ValueError, TypeError, AttributeError):
+            return {}
+
+    def _set_deep_watermarks(self, wm: dict[str, int]) -> None:
+        self.db.set_meta(self.DEEP_WM_KEY,
+                         json.dumps(wm, ensure_ascii=False, separators=(",", ":")))
+
+    def _deep_pending_by_bucket(self) -> dict[tuple, int]:
+        """每个作用域自其水位以来「新增且仍活跃」的记忆数（排除钉住条目）。
+
+        用「仍活跃」而不是累计新增：普通整理合并掉的记忆不该把计数撑高，
+        手动深度整理压缩后计数也会自然回落，不需要它反过来改水位。
+        一条 SQL 取所有水位的最小值做下界，再按各桶自己的水位过滤；
+        几千条记忆实测约 9ms，不必为每个桶各查一次库。
+        """
+        wm = self._deep_watermarks()
+        floor = min(wm.values()) if wm else 0
+        counts: dict[tuple, int] = {}
+        for d in self.db.active_memory_scope_rows(floor):
+            if int(d.get("pinned") or 0):
+                continue
+            b = _scope_bucket(d)
+            # 没水位的桶从 0 起算：升级后第一次见到它，历史记忆也该纳入整理
+            if int(d["id"]) <= int(wm.get(_bucket_key(b), 0)):
+                continue
+            counts[b] = counts.get(b, 0) + 1
+        return counts
+
+    def _plan_auto_deep(self) -> set[tuple] | None:
+        """本轮该整理哪些作用域；None = 不触发。按 _scope_bucket 分桶，
+        与 memory_scope 无关（后者只是读取侧的召回策略，不改变记忆归属）。"""
+        every = max(0, int(self._get_cfg("consolidate_deep_every_n_memories", 200)))
+        if every <= 0 or not bool(self._get_cfg("auto_consolidate", True)):
+            return None
+        if self._auto_consolidate_blocked() > 0 or self._consolidating \
+                or self._deep_scheduled:
+            return None
+        has_model = getattr(self.router, "has_model", None)
+        if has_model is not None and not has_model():
+            return None
+        counts = self._deep_pending_by_bucket()
+        if not counts:
+            return None
+        due = [b for b, n in counts.items() if n >= every]
+        if not due and sum(counts.values()) < every * self.DEEP_FALLBACK_RATIO:
+            return None
+        # 有限量：升级首轮所有桶都可能「没水位 = 达标」，不限量会一轮打爆预算
+        ranked = sorted(due or list(counts), key=lambda b: -counts[b])
+        return set(ranked[:self.DEEP_MAX_BUCKETS])
+
+    def _schedule_auto_deep(self) -> None:
+        """总结循环每轮只做一次检查，真正整理丢到后台，不 await、不堵循环。"""
+        buckets = self._plan_auto_deep()
+        if not buckets:
+            return
+        # 快照水位：整理期间新写入的记忆 id 更大，下轮仍能统计到，不会被吞掉
+        snapshot_max = self.db.max_memory_id()
+        self._deep_scheduled = True
+        task = asyncio.create_task(self._auto_deep_job(buckets, snapshot_max))
+        self._deep_task = task
+        task.add_done_callback(self._on_auto_deep_done)
+        logger.info(f"[hermes_core] 自动深度整理入队：{len(buckets)} 个作用域")
+
+    def _on_auto_deep_done(self, task: asyncio.Task) -> None:
+        """无论成功/失败/被 cancel 都要放行，否则自动深度整理会永久停摆。"""
+        self._deep_scheduled = False
+        self._deep_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error(f"[hermes_core] 自动深度整理异常: {exc!r}")
+
+    async def _auto_deep_job(self, buckets: set[tuple], snapshot_max: int) -> None:
+        """后台跑一次按作用域限定的深度整理。
+
+        刻意不复用 _run_consolidate_job：那个会覆盖手动整理的 consolidate_report、
+        推动普通整理队列、还会向发起会话推消息，自动任务三者都不该做。
+        """
+        self._bump_metric("deep_consolidate_runs")
+        try:
+            # force=True：忽略手动整理可能留下的分片断点，否则本轮整批被跳过
+            # 却推进了水位，等于这 200 条永远没整理过。
+            out = await self._consolidate_memories(
+                deep=True, buckets=buckets, force=True)
+            # 撞车不是模型故障：手动整理刚 create_task、还没置 _consolidating
+            # 的那一瞬间，本任务也会被互斥挡回来。这种情况水位照旧保留，
+            # 但不能记失败退避，否则连普通整理都被无辜停掉一刻钟。
+            busy = out.startswith("整理正在进行中")
+            incomplete = any(s in out for s in (
+                "未跑完", "片因模型失败跳过", "片调用失败"))
+            if busy:
+                logger.info("[hermes_core] 自动深度整理与另一条整理撞车，"
+                            "水位保留下轮重试")
+            elif incomplete:
+                self._mark_auto_consolidate_failed()
+                logger.warning("[hermes_core] 自动深度整理未跑完，"
+                               f"水位保留下轮重试：{out[:160]}")
+            else:
+                wm = self._deep_watermarks()
+                for b in buckets:
+                    k = _bucket_key(b)
+                    wm[k] = max(int(wm.get(k, 0)), int(snapshot_max))
+                self._set_deep_watermarks(wm)
+                self._clear_auto_consolidate_backoff()
+                logger.info("[hermes_core] 自动深度整理完成："
+                            f"{len(buckets)} 个作用域，{out[:160]}")
+        except Exception:
+            self._mark_auto_consolidate_failed()
+            logger.error("[hermes_core] 自动深度整理失败:\n"
+                         f"{traceback.format_exc(limit=3)}")
+
     # ============ 记忆巩固（consolidation）============
 
     async def _consolidate_memories(self, dry_run: bool = False,
                                     focus_ids: set[int] | None = None,
                                     deep: bool = False,
+                                    buckets: set[tuple] | None = None,
                                     force: bool = False) -> str:
         """整理入口：进程内全局互斥，跑完才放行。
 
-        三条路径都会进来——自动总结（main.py 里攒够阈值时）、/hermes 整理、
-        WebUI 的 actions/consolidate。它们各自开头都只是快照 all_active_memories，
-        然后花几分钟调模型，最后按快照里的 id 写库。两边同时跑时，后写的那条
-        会把同一批 id 从对方的合并结果里抢走：回滚链断掉，还多出一条内容重叠的
-        活跃记忆（同一件事注入两遍）。
+        四条路径都会进来——自动总结（攒够阈值）、自动深度整理（按作用域水位）、
+        /hermes 整理、WebUI 的 actions/consolidate。它们各自开头都只是快照
+        all_active_memories，然后花几分钟调模型，最后按快照里的 id 写库。
+        两边同时跑时，后写的那条会把同一批 id 从对方的合并结果里抢走：
+        回滚链断掉，还多出一条内容重叠的活跃记忆（同一件事注入两遍）。
 
         拿不到就直接返回、不排队：整理不是必须此刻完成的事，排队只会把
         总结流程也一起堵住。
@@ -1844,13 +2010,15 @@ class HermesCore(Star):
         self._last_evaluated = set()
         try:
             return await self._consolidate_inner(
-                dry_run=dry_run, focus_ids=focus_ids, deep=deep, force=force)
+                dry_run=dry_run, focus_ids=focus_ids, deep=deep,
+                buckets=buckets, force=force)
         finally:
             self._consolidating = False
 
     async def _consolidate_inner(self, dry_run: bool = False,
                                  focus_ids: set[int] | None = None,
                                  deep: bool = False,
+                                 buckets: set[tuple] | None = None,
                                  force: bool = False) -> str:
         """把碎片化的记忆合并成更完整的条目。
 
@@ -1860,11 +2028,17 @@ class HermesCore(Star):
         - deep=True：全量直接交给模型归纳（/hermes 整理 深度），能处理字面
           相似度召回不到的同义改写，并丢弃不属于长期记忆的条目
 
+        buckets 只给自动深度整理用：按 _scope_bucket 限定本轮处理哪些作用域，
+        某个用户/群攒够阈值时不必把全库其它桶都拖着跑一遍模型。传 None =
+        全库（手动整理的原有行为），传空集 = 没有作用域要整理。
+
         字面相似度只用来「召回候选」，不直接决定合并——「喜欢吃香蕉 / 喜欢吃苹果」
         只有 0.33，而「养了只猫叫咪咪 / 养了只狗叫旺财」有 0.38，字面分不出该不该合。
         真正判断交给一次 LLM 调用。
         """
         rows = self.db.all_active_memories()
+        if buckets is not None:
+            rows = [r for r in rows if _scope_bucket(r) in buckets]
         if not rows:
             return "还没有任何记忆。"
         # 钉住的条目是用户明确要求保护的重要信息：不参与任何合并/丢弃归纳
@@ -2062,6 +2236,11 @@ class HermesCore(Star):
             "（如「把人格里的某部分删掉」）、纯闲聊反馈（如「你最近好快」）、"
             "技能/插件清单、随时可查的易变状态；\n"
             "5. 不要编造，不要丢关键细节；所有 ids 只能是上面列出的编号。\n"
+            "6. 合并时必须在表述里保留各条原文用于指代同一事物的不同说法：把次要说法"
+            "用括号附在主要说法之后，例如「客厅角落那台机器」与「用户有一台群晖 NAS」"
+            "合并成「用户有一台群晖 NAS（客厅角落那台存照片的机器）」。这些说法是日后"
+            "检索这条记忆的唯一线索，只留一种会让另一种问法永远搜不到；合并后整条"
+            "尽量不超过 200 字。\n"
             "输出 JSON 数组，不要解释：\n"
             '合并/改写输出 {"ids":[编号...],"kind":"preference|profile|fact","content":"整理后的一条"}\n'
             '丢弃输出 {"ids":[编号...],"discard":true}\n'
@@ -3033,7 +3212,8 @@ class HermesCore(Star):
         # 先让 to_thread 里的修剪循环停手：cancel 只能取消 await，取消不了线程。
         # 不等它就直接 close()，线程会在已关闭的连接上继续 DELETE。
         self.db.request_stop()
-        tasks = [t for t in (self._bg_task, self._consolidate_task, self._probe_task)
+        tasks = [t for t in (self._bg_task, self._consolidate_task,
+                             self._deep_task, self._probe_task)
                  if t is not None and not t.done()]
         for t in tasks:
             t.cancel()

@@ -42,6 +42,7 @@ CONFIG_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("自动总结", ("auto_summarize", "summarize_interval_minutes",
                   "min_new_messages", "summarize_grace_hours")),
     ("记忆整理", ("auto_consolidate", "consolidate_every_n_memories",
+                  "consolidate_deep_every_n_memories",
                   "consolidate_threshold", "consolidate_min_memories",
                   "consolidate_max_clusters")),
     ("技能", ("auto_skill", "skill_notify_admin", "skill_merge_same_name",

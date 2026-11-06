@@ -1171,6 +1171,20 @@ class HermesDB:
         ).fetchall()
         return {int(r["id"]) for r in rows}
 
+    def active_memory_scope_rows(self, since_id: int) -> list[dict]:
+        """按水位取活跃记忆的作用域字段，供自动深度整理分桶计数。
+
+        只取分桶要用的几列，不把正文读进内存；调用方按自己的桶水位再过滤一次
+        （每个桶的水位不同，一条 SQL 只能用全局最小水位做下界）。
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, owner_id, group_id, platform, visibility, pinned "
+                "FROM memories WHERE id > ? AND merged_into = 0",
+                (int(since_id),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def max_memory_id(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) m FROM memories").fetchone()
         return int(row["m"] or 0)

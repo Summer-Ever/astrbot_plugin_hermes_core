@@ -59,8 +59,35 @@ def new_core(tmp: str):
     obj.db = m.HermesDB(tmp)
     obj._resident_cache = {}
     obj._consolidate_task = None
+    obj._deep_task = None
+    obj._deep_scheduled = False
     obj._consolidating = False
+    obj._metrics = {}
+    obj._metrics_dirty = 0
     return obj
+
+
+def cfg_core(core, **cfg):
+    """覆盖若干配置项，其余走默认值。"""
+    core.config = types.SimpleNamespace(get=lambda k, d=None: cfg.get(k, d))
+    return core
+
+
+def seed_buckets(db) -> None:
+    for i in range(60):
+        db.add_memory("fact", f"用户甲第{i}条偏好记录", owner_id="UA",
+                      visibility="private")
+    for i in range(30):
+        db.add_memory("fact", f"用户乙第{i}条偏好记录", owner_id="UB",
+                      visibility="private")
+    for i in range(20):
+        db.add_memory("fact", f"群G1第{i}条公共事项", group_id="G1",
+                      visibility="group")
+
+
+UA = ("user", "UA", "", "private")
+UB = ("user", "UB", "", "private")
+G1 = ("group", "G1", "", "group")
 
 
 def seed(db, n: int, owner: str = "u1") -> None:
@@ -260,6 +287,122 @@ async def case_footer(tmp: str) -> None:
     check("多模型落款以 > 开头", txt.startswith("> "))
 
 
+async def case_deep_bucket_count(tmp: str) -> None:
+    """按作用域水位计数：只数「自该桶水位以来新增、且仍活跃」的记忆。"""
+    core = cfg_core(new_core(tmp))
+    seed_buckets(core.db)
+    c = core._deep_pending_by_bucket()
+    check("按 _scope_bucket 分桶计数", c.get(UA) == 60 and c.get(UB) == 30
+          and c.get(G1) == 20, str(c))
+    check("桶键可往返解析", m._bucket_from_key(m._bucket_key(G1)) == G1)
+
+    core._set_deep_watermarks({m._bucket_key(UA): 60})
+    c2 = core._deep_pending_by_bucket()
+    check("水位只过滤本桶", c2.get(UA, 0) == 0
+          and c2.get(UB) == 30 and c2.get(G1) == 20, str(c2))
+
+    core._set_deep_watermarks({})
+    with core.db._lock:
+        core.db.conn.execute("UPDATE memories SET pinned = 1 WHERE id = 1")
+        core.db.conn.commit()
+    c3 = core._deep_pending_by_bucket()
+    check("钉住条目不计入待整理", c3.get(UA) == 59, str(c3.get(UA)))
+
+    ids = [r["id"] for r in core.db.all_active_memories()
+           if (r["owner_id"] or "") == "UA" and not int(r["pinned"] or 0)][:20]
+    core.db.merge_memories(ids, "用户甲的偏好汇总", "fact")
+    c4 = core._deep_pending_by_bucket()
+    check("被合并的记忆不再撑高计数", c4.get(UA) == 40, str(c4.get(UA)))
+
+
+async def case_deep_plan(tmp: str) -> None:
+    """触发判据：单桶达标、限量、关闭、互斥、碎片化兜底。"""
+    core = cfg_core(new_core(tmp), consolidate_deep_every_n_memories=50)
+    core.router = FakeRouter(lambda i, p: "[]")
+    seed_buckets(core.db)
+    check("只有达标的桶入选", core._plan_auto_deep() == {UA},
+          str(core._plan_auto_deep()))
+    cfg_core(core, consolidate_deep_every_n_memories=0)
+    check("阈值设 0 关闭自动深度整理", core._plan_auto_deep() is None)
+
+    core2 = cfg_core(new_core(tmp + "-x"), consolidate_deep_every_n_memories=10)
+    core2.router = FakeRouter(lambda i, p: "[]")
+    seed_buckets(core2.db)
+    core2.DEEP_MAX_BUCKETS = 2
+    check("单次调度限量", len(core2._plan_auto_deep() or ()) == 2)
+    core2._deep_scheduled = True
+    check("已调度时不重复触发", core2._plan_auto_deep() is None)
+    core2._deep_scheduled = False
+    core2._consolidating = True
+    check("已有整理在跑时不触发", core2._plan_auto_deep() is None)
+    core2._consolidating = False
+
+    core3 = cfg_core(new_core(tmp + "-y"), consolidate_deep_every_n_memories=61)
+    core3.router = FakeRouter(lambda i, p: "[]")
+    seed_buckets(core3.db)
+    core3.DEEP_FALLBACK_RATIO = 1
+    check("碎片化兜底：无单桶达标但全局够多",
+          len(core3._plan_auto_deep() or ()) == 3)
+    core3.DEEP_FALLBACK_RATIO = 100
+    check("全局累计也不够时不触发", core3._plan_auto_deep() is None)
+
+
+async def case_deep_schedule(tmp: str) -> None:
+    """后台任务：buckets 过滤、快照水位、调度标志复位、prompt 别名约束。"""
+    core = cfg_core(new_core(tmp), consolidate_deep_every_n_memories=50,
+                    consolidate_chunk_size=40)
+    router = FakeRouter(lambda i, p: "[]")
+    core.router = router
+    seed_buckets(core.db)
+    snapshot = core.db.max_memory_id()
+    core.db.add_memory("fact", "整理期间新写的记忆", owner_id="UA",
+                       visibility="private")
+
+    core._deep_scheduled = True
+    task = asyncio.create_task(core._auto_deep_job({UA}, snapshot))
+    core._deep_task = task
+    task.add_done_callback(core._on_auto_deep_done)
+    await task
+    await asyncio.sleep(0.01)
+    check("任务结束放行 scheduled", core._deep_scheduled is False)
+    check("prompt 要求合并产物保留原始指称",
+          any("保留各条原文用于指代同一事物的不同说法" in c["prompt"]
+              for c in router.calls))
+    check("buckets 只让达标桶进入模型",
+          bool(router.calls) and all(
+              "用户乙" not in c["prompt"] and "群G1" not in c["prompt"]
+              for c in router.calls))
+    wm = core._deep_watermarks()
+    check("水位推进到整理开始时的快照 id",
+          wm.get(m._bucket_key(UA)) == snapshot, str(wm))
+    c = core._deep_pending_by_bucket()
+    check("整理期间新增的记忆没被水位吞掉", c.get(UA, 0) >= 1, str(c))
+
+    core._deep_scheduled = True
+    cancelled = asyncio.create_task(asyncio.sleep(10))
+    cancelled.cancel()
+    try:
+        await cancelled
+    except asyncio.CancelledError:
+        pass
+    core._on_auto_deep_done(cancelled)
+    check("被 cancel 的任务也放行 scheduled", core._deep_scheduled is False)
+
+    core.db.set_meta(core.DEEP_WM_KEY, '{"not-json-array": 5, "bad": "x"}')
+    check("损坏的水位键被容错跳过", core._deep_watermarks() == {})
+
+    core2 = cfg_core(new_core(tmp + "-busy"), consolidate_deep_every_n_memories=50)
+    core2.router = FakeRouter(lambda i, p: "[]")
+    seed_buckets(core2.db)
+    core2._consolidating = True
+    snap = core2.db.max_memory_id()
+    await core2._auto_deep_job({UA}, snap)
+    check("与另一条整理撞车时不推进水位", core2._deep_watermarks() == {})
+    check("撞车不算模型失败、不触发退避",
+          core2.db.get_meta("auto_consolidate_fail_streak", "0") in ("", "0"),
+          core2.db.get_meta("auto_consolidate_fail_streak", "0"))
+
+
 class FakeConfig(dict):
     """够用的配置对象：dict 语义 + 异步保存。"""
 
@@ -333,7 +476,8 @@ async def case_detach(tmp: str) -> None:
 
 async def main() -> int:
     for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
-               case_merge, case_visibility, case_mutex, case_detach, case_footer):
+               case_merge, case_visibility, case_mutex, case_detach, case_footer,
+               case_deep_bucket_count, case_deep_plan, case_deep_schedule):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:
             await fn(tmp)
