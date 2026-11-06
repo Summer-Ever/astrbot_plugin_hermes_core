@@ -794,6 +794,38 @@ v0.12.25 修掉的「状态消失」是同一类残留。现在：
 测试：`node --check views/hermes/app.js` 通过；db 146 / consolidate 90 /
 router 39 / tools 22，合计 **297 项**全绿；`ruff --select=E9,F` 通过。
 
+## 两套整理阈值在页面上分开显示（v0.12.27）
+
+「自动整理队列」卡片原来只有「记忆 0/10」「技能 0/5」两条进度条，而
+`consolidate_deep_every_n_memories=200` 的进度**完全没有出口**，很容易让人以为
+「阈值不是 200 吗，怎么显示 10」。其实这是两套互不相干的机制：
+
+| 机制 | 配置 / 默认 | 计数对象 | 触发后做什么 |
+| --- | --- | --- | --- |
+| 增量整理 · 记忆 | `consolidate_every_n_memories` / 10 | `meta.consolidate_pending_memories` 里的**新记忆 id 队列** | 调一次模型，合并队列中相似的记忆 |
+| 增量整理 · 技能 | `skill_consolidate_every_n` / 5 | `meta.skill_consolidate_pending` 累计计数 | 合并技能 |
+| 深度整理 | `consolidate_deep_every_n_memories` / 200 | **每个 `_scope_bucket` 作用域**自其水位以来新增且仍活跃的长期记忆数（排除钉住） | 后台逐片全量归纳，只整理达标的作用域 |
+
+深度整理的判据是 `_deep_pending_by_bucket()`，它读的是 `memories` 表和
+`meta.deep_consolidate_watermarks`，**根本不读上面那条待整理队列**；全局累计达
+`200 × DEEP_FALLBACK_RATIO(4)` 有兜底，单次最多 3 个桶。所以 10 和 200 不会互相
+"推进"，把 10 改成 200 也不会让深度整理提前。数的是记忆条数，不是聊天消息数。
+
+现在补上显示：`overview` 新增 `deep` 字段（`every / enabled / max / buckets /
+total`），复用已有的 `_deep_pending_by_bucket()`，不新增计数逻辑；卡片第三行显示
+**最接近达标的作用域**进度条，运行状态区加一行「深度整理：每作用域 N 条；
+当前最高 X 条 / Y 个作用域」；三条标签改成「记忆（增量）」「技能（增量）」
+「深度整理（按作用域）」，卡片说明与 hover 提示写清两套计数互不相干。
+
+后端只多一条只读 SQL（`active_memory_scope_rows`，只取分桶用的 6 列，几千条
+实测约 9ms），在 20 秒概览轮询里执行；不进 LLM prompt，零 token 增量。
+
+生产库实测：40 条活跃记忆、2 条钉住、38 条参与计数、6 个作用域，最接近达标的
+私聊桶 25/200，全局累计 38（兜底阈值 800）——离自动深度整理还远，属正常。
+
+测试：`node --check views/hermes/app.js` 通过；db 146 / consolidate 90 /
+router 39 / tools 22，合计 **297 项**全绿；`ruff --select=E9,F` 通过。
+
 ## 清上下文 vs 清记忆：两套独立存储
 
 很容易混淆的一点：**上下文和记忆在物理上是分开存的**。

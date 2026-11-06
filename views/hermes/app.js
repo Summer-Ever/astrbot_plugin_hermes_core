@@ -256,6 +256,7 @@
 
   function renderOverview(d) {
     const s = d.stats || {};
+    const deep = d.deep || {};
     $("#side-version").textContent = d.version ? `v${d.version}` : "—";
 
     $("#stat-messages").textContent = fmtNum(s.messages);
@@ -299,6 +300,9 @@
         ? `每 ${sm.interval} 分钟检查；单会话满 ${sm.min_new} 条或超 ${sm.grace_hours} 小时兜底`
         : '<span class="chip warn">已关闭</span>'],
       ["待总结", `${fmtNum(sm.pending_sessions)} 个会话 / ${fmtNum(sm.pending_messages)} 条消息`],
+      ["深度整理", deep.enabled
+        ? `每作用域 ${fmtNum(deep.every)} 条；当前最高 ${fmtNum(deep.max)} 条 / ${fmtNum(deep.buckets)} 个作用域`
+        : '<span class="chip warn">已关闭</span>'],
       ["身份别名", `${fmtNum(d.aliases)} 条`],
       ["总结模型", (() => {
         const m = d.models || {};
@@ -312,10 +316,12 @@
 
     const memPct = q.memories_every > 0 ? Math.min(100, (q.memories / q.memories_every) * 100) : 0;
     const skPct = q.skills_every > 0 ? Math.min(100, (q.skills / q.skills_every) * 100) : 0;
+    const deepPct = deep.enabled && deep.every > 0
+      ? Math.min(100, (deep.max / deep.every) * 100) : 0;
     $("#queue-box").innerHTML = `
       <div class="queue-row">
         <div class="row-between">
-          <span>记忆</span>
+          <span title="累计新增、还没被整理评估过的长期记忆；攒够阈值就调一次模型合并相似记忆">记忆（增量）</span>
           <span class="${q.auto_memories && q.memories_every > 0 ? "muted" : "faint"}">
             ${q.memories_every > 0 && q.auto_memories
               ? `${q.memories} / ${q.memories_every} 条`
@@ -326,12 +332,23 @@
       </div>
       <div class="queue-row">
         <div class="row-between">
-          <span>技能</span>
+          <span title="累计新增/更新的技能数；攒够阈值就合并一次">技能（增量）</span>
           <span class="${q.skills_every > 0 ? "muted" : "faint"}">
             ${q.skills_every > 0 ? `${q.skills} / ${q.skills_every} 个` : "自动技能整理已关闭"}
           </span>
         </div>
         <div class="bar"><i style="width:${skPct}%"></i></div>
+      </div>
+      <div class="queue-row">
+        <div class="row-between">
+          <span title="每个作用域各记一个水位，数的是自上次深度整理以来新增且仍活跃的长期记忆；这里显示最接近达标的那个作用域，达标才在后台全量归纳">深度整理（按作用域）</span>
+          <span class="${deep.enabled ? "muted" : "faint"}">
+            ${deep.enabled
+              ? `${fmtNum(deep.max)} / ${fmtNum(deep.every)} 条`
+              : "自动深度整理已关闭"}
+          </span>
+        </div>
+        <div class="bar"><i style="width:${deepPct}%"></i></div>
       </div>`;
 
     const recent = d.recent_memories || [];

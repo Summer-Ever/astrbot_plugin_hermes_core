@@ -208,6 +208,25 @@ class HermesWebAPI:
         pending_mem = self.plugin._queued_memory_count()
         pending_skill = int(db.get_meta("skill_consolidate_pending", "0") or 0)
         skills = db.all_skills()
+        # 深度整理是独立于上面队列的第二套阈值：按作用域各记水位，数的是
+        # 「自上次深度整理以来新增且仍活跃的长期记忆」，不是队列里的新 id。
+        # 页面以前只画增量整理两条进度条，200 这条完全不可见，容易被误读成
+        # 「阈值就是 10」。这里把最接近达标的作用域进度一并带出去。
+        try:
+            deep_every = max(0, int(self._cfg("consolidate_deep_every_n_memories", 200)))
+        except (TypeError, ValueError):
+            deep_every = 200
+        try:
+            deep_counts = self.plugin._deep_pending_by_bucket()
+        except Exception:
+            deep_counts = {}
+        deep_info = {
+            "every": deep_every,
+            "enabled": deep_every > 0 and bool(self._cfg("auto_consolidate", True)),
+            "max": max(deep_counts.values(), default=0),
+            "buckets": len(deep_counts),
+            "total": sum(deep_counts.values()),
+        }
         try:
             aliases = db.list_aliases()
         except Exception:
@@ -225,6 +244,7 @@ class HermesWebAPI:
                 "skills_every": sk_every,
                 "auto_memories": bool(self._cfg("auto_consolidate", True)),
             },
+            "deep": deep_info,
             "summarize": {
                 "auto": bool(self._cfg("auto_summarize", True)),
                 "interval": self._cfg("summarize_interval_minutes", 30),
