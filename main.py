@@ -1182,7 +1182,8 @@ class HermesCore(Star):
                 parts.append(f"我的技能：{'、'.join(names)}{more}")
             if system:
                 parts.append(f"系统技能（本体安装，只读）：{len(system)} 个")
-            lines.append(f"[已掌握技能] {'；'.join(parts)}（list_skills 查看全文）")
+            lines.append(f"[已掌握技能] {'；'.join(parts)}"
+                         "（read_skill 看正文；被用户纠正步骤时用 update_skill 就地修正）")
 
         if not lines and not maint:
             return ""
@@ -1589,6 +1590,9 @@ class HermesCore(Star):
                                 old_text: str, new_text: str) -> str:
         """局部修改技能：把技能正文里的 old_text 换成 new_text，其余内容原样保留。
         用户让你改某个技能的某几步、某个命令、某段说明时用这个，不要整份重写。
+        用户纠正你按技能执行的某一步（换工具/换路径/换参数）且听起来是长期有效的
+        （"以后都用X""别再Y"）：不必等用户说"改技能"，纠正本身就是指令——先
+        read_skill 拿原文，再用本工具就地替换被纠正的步骤。一次性绕行不要改技能。
         Args:
             name (string): 技能名称
             old_text (string): 要替换的原文，必须从 read_skill 结果里精确复制，且在正文中只出现一次；留空表示把 new_text 追加到技能末尾
@@ -2026,7 +2030,8 @@ class HermesCore(Star):
             )
             skill_hint = (
                 "\n\n[已有技能] 若本次流程属于下列某个技能的范畴，name 必须原样沿用该技能名"
-                "（不要造近义新名），content 写该技能合并后的完整版本：\n" + lines_s
+                "（不要造近义新名），content 写本次对话里实际走通的完整流程"
+                "（系统会自动与旧版合并，冲突步骤以你的新版为准）：\n" + lines_s
             )
 
         # 后台总结不注入常驻内容、也绝不写常驻：常驻六个词条只由用户在对话里
@@ -2926,11 +2931,13 @@ class HermesCore(Star):
     async def _merge_skill_content(self, name: str, old_trigger: str,
                                    old_content: str, new_trigger: str,
                                    new_content: str) -> str:
-        """技能同名的 read-modify-write：保留旧版仍有效的步骤，吸收新版内容。"""
+        """技能同名的 read-modify-write：新版（刚实际执行过）优先，旧版只补仍有效的细节。"""
         head = (
             "你是技能库管理员。下面是同一个技能的两个版本（旧版是之前总结的，新版是刚总结的）。"
             "请合并成一份完整、不重复、可直接照着执行的 Markdown 步骤文档："
-            "保留旧版里仍然有效的步骤，吸收新版新增的内容，去掉重复描述。"
+            "新版来自刚刚实际执行过的对话，反映用户最新认可的路径，"
+            "与旧版步骤冲突时一律以新版为准，被新版推翻的旧步骤不要保留；"
+            "旧版只贡献新版没有且仍然有效的背景细节，去掉重复描述。"
             "只输出合并后的 Markdown 正文，不要解释，不要加代码块围栏。\n\n"
             f"[技能名] {name}\n"
         )
