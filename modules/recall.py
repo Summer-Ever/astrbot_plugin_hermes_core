@@ -521,7 +521,34 @@ def _hit_units(query: str, doc_grams: set[str], doc_norm: str) -> int:
     return total
 
 
-def gate_ok(qc_len: int, hit_n: int, cov: float) -> bool:
+def _query_unit_count(query: str, qc_set: set[str]) -> int:
+    """query 的检索单元总数，用于闸门分档（短查询 / 长查询）。
+
+    两个坑都必须避开：
+
+    1. **不能拿全量 bigram 数分档**。`记忆是怎么存储的` 全量 bigram 有 7 个，
+       但过滤掉虚词后只有 3 个实词单元——按 7 分档会把它判成「长问句」，
+       于是要求命中 2 个单元，一条只命中「存储」的真相关记忆就被挡了。
+       实测这样 Recall 会从 0.850 掉到 0.800。
+    2. **一 个英文词不能被算成多个单元**。`ffmpeg` 有 6 个 bigram，
+       按 bigram 数判成长问句后要求命中 2 个单元——而它本身只有一个单元，
+       永远过不了。实测模型用 search_memory 只查 `ffmpeg` / `Graphviz`
+       这类关键词时，新排序返回空，比旧排序还差。
+
+    所以：中文段按「与覆盖率同口径的实词 bigram 数」计，拉丁段整词计 1。
+    """
+    total = 0
+    for seg in _SPLIT_RE.split(str(query or "").lower()):
+        if len(seg) <= 1:
+            continue
+        if _LATIN_SEG_RE.match(seg):
+            total += 1
+            continue
+        total += len(gram_set(seg, normalized=True) & qc_set)
+    return max(1, total)
+
+
+def gate_ok(units: int, hit_n: int, cov: float) -> bool:
     """注入闸门：判断「这次要不要把这条注入给模型」。
 
     与 rank() 里的硬门槛有两点本质差别：
@@ -529,8 +556,12 @@ def gate_ok(qc_len: int, hit_n: int, cov: float) -> bool:
     1. 只在**注入决定**上生效。候选池的构造和排序结果都完整保留，被拦下的
        条目下一轮换个问法还能出来；而 rank() 是在排序前就把候选删掉。
     2. 分档口径反过来。长问句不再要求高覆盖率（分母被话题词撑大，要求高
-       必然误杀 #73 这种短记忆），改成要求**命中 ≥2 个实词**；覆盖率下限
-       反而降到 0.10，只用来挡「一个实词都没沾上」的纯噪声。
+       必然误杀 #73 这种短记忆），改成要求**命中 ≥2 个检索单元**；覆盖率
+       下限反而降到 0.10，只用来挡「一个实词都没沾上」的纯噪声。
+
+    units 是 query 的检索单元总数（见 _query_unit_count），不是 bigram 个数：
+    短查询（≤3 个单元，含只打一个关键词的情况）只要命中就能注入，
+    否则「只查一个词」会被自己的长度判据挡死。
 
     为什么必须有绝对判据：双路融合能解决长问句稀释，但挡不住「短查询 +
     罕见 token 巧合」。实测「1+1 等于几」会把 #177 里的「Windows 11」当成
@@ -540,7 +571,7 @@ def gate_ok(qc_len: int, hit_n: int, cov: float) -> bool:
     """
     if hit_n <= 0:
         return False
-    if qc_len <= 3:
+    if units <= 3:
         return cov >= GATE_COV_SHORT
     return hit_n >= 2 and cov >= GATE_COV_LONG
 
@@ -663,11 +694,14 @@ def rank_fused(query: str, docs: list[dict[str, Any]], *, k: int = 5,
     scored.sort(key=lambda x: -x["total"])
 
     # ---- 第三段：闸门 → 相对截断 → MMR ----
+    # 单元总数与候选无关，循环外算一次（分档口径见 _query_unit_count：
+    # 按全量 bigram 数会把 `ffmpeg` 判成长问句、把 3 个实词的短问句也判成长问句）
+    unit_total = _query_unit_count(query, qc_set)
     out: list[dict] = []
     kept_grams: list[set[str]] = []
     base = 0.0
     for x in scored:
-        if gate and not gate_ok(len(qc), x["seg_n"], x["cov"]):
+        if gate and not gate_ok(unit_total, x["seg_n"], x["cov"]):
             continue
         if not out:
             # 首条通过闸门的条目即「满分基准」：若以被闸门拦下的 top1 为基准，
