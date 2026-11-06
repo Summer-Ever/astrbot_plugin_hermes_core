@@ -31,6 +31,7 @@
   const state = {
     tab: "overview",
     overview: null,
+    overviewBusy: false,
     mem: { q: "", scope: "", kind: "", merged: false, limit: 50, offset: 0, total: 0, rows: [], selected: new Set() },
     skills: { rows: [], system: [], owners: [], filter: "", current: null, currentId: null, preview: false },
     settings: { groups: [], dirty: false },
@@ -230,14 +231,27 @@
 
   /* ---------------- 概览 ---------------- */
 
-  async function loadOverview() {
+  async function loadOverview(silent = false) {
+    // 手动切页/点刷新与下面的定时轮询可能撞在一起，别叠请求。
+    if (state.overviewBusy) return;
+    state.overviewBusy = true;
     try {
       const data = await apiGet("overview");
       state.overview = data;
       renderOverview(data);
     } catch (err) {
-      toast(`读取概览失败：${errMsg(err)}`, "err");
+      if (!silent) toast(`读取概览失败：${errMsg(err)}`, "err");
+    } finally {
+      state.overviewBusy = false;
     }
+  }
+
+  // 概览数字原先只在切页、点刷新、整理任务完成时才更新。一直停在概览页时，
+  // 数字会保持打开页面那一刻的旧值，看起来像「整理没在跑」。这里做低频补拉：
+  // 只在概览页可见时发请求，页面切到后台或停在其他标签页时一次都不发。
+  async function pollOverview() {
+    if (document.hidden || !getBridge() || state.tab !== "overview") return;
+    await loadOverview(true);
   }
 
   function renderOverview(d) {
@@ -261,7 +275,7 @@
       ? `${q.memories}/${q.memories_every}`
       : "关闭";
     const sm = d.summarize || {};
-    $("#stat-pending").textContent = `待总结 ${fmtNum(sm.pending_messages)} 条`;
+    $("#stat-pending").textContent = `消息待总结 ${fmtNum(sm.pending_messages)} 条`;
     $("#side-queue-mem").textContent = q.memories_every > 0 ? `${q.memories}/${q.memories_every}` : "关闭";
     $("#side-queue-skill").textContent = q.skills_every > 0 ? `${q.skills}/${q.skills_every}` : "关闭";
     $("#run-version").textContent = `v${d.version || "?"} · code ${d.code_hash || "?"}`;
@@ -1655,8 +1669,12 @@
     // 整理日志在服务端，首次拉取全量、之后按 seq 拉增量；页面重新可见时立刻补一次。
     pollJobStatus();
     setInterval(pollJobStatus, 2500);
+    // 概览状态卡片低频自动刷新（20s，仅概览页且页面可见时）。
+    setInterval(pollOverview, 20000);
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) pollJobStatus();
+      if (document.hidden) return;
+      pollJobStatus();
+      pollOverview();
     });
   }
 
