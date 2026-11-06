@@ -3517,7 +3517,7 @@ class HermesCore(Star):
                 f"（AstrBot 的原生会话是全群共享的，未改动；长期记忆完整保留）")
             return
 
-        # 这里原来是 `except: is_admin = True`——权限检查失败时放行。
+        # 这里原来是 `except: is_admin = True`——权限校验异常时默认通过。
         # 适配器换个版本就可能永远抛异常，等于人人可清全场。改成 fail-closed。
         if not self._is_admin(event):
             yield event.plain_result(
