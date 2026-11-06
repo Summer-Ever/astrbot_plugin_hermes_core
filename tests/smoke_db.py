@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""存储层冒烟测试：不依赖 AstrBot，直接跑 SQLite。
+"""存储层冒烟测试：不依赖 AstrBot 运行时，直接跑 SQLite。
 
-改动 db.py（SQL 拼接收敛、FTS 快路径）后必须过一遍，确认行为没变。
+logger 由 tests/_astrbot_stub.py 在导入前打桩；插件运行时仍只用
+astrbot.api 提供的官方 logger。
 
     python tests/smoke_db.py
 """
@@ -14,6 +15,11 @@ import traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+
+from _astrbot_stub import ensure_astrbot_logger  # noqa: E402
+
+ensure_astrbot_logger()
 
 from modules.db import HermesDB  # noqa: E402
 from modules.paths import UnsafePath, safe_join  # noqa: E402

@@ -13,15 +13,7 @@ import sqlite3
 import threading
 import time
 
-try:  # 跑在 AstrBot 里：迁移日志统一走它的日志体系（WebUI 可见、带级别）
-    from astrbot.api import logger
-except Exception:  # 独立跑测试时没有 astrbot，退到标准库，行为不变。
-    # 刻意的退化路径：本模块必须能在无 AstrBot 的纯 Python 环境导入
-    # （tests/smoke_db.py、inspect_db.py 都不依赖 astrbot），删掉这个分支
-    # 测试就跑不起来；运行时优先走上面的官方 logger。
-    import logging
-
-    logger = logging.getLogger(__name__)  # asb-audit: ignore=ASB-07 无 astrbot 的测试环境的刻意退化，运行时优先官方 logger
+from astrbot.api import logger
 
 try:  # 正常情况（包内导入）
     from . import recall as _recall
@@ -588,9 +580,8 @@ class HermesDB:
                 wm = self.get_watermark(sid)
                 if wm <= 0:
                     continue
-                while True:  # asb-audit: ignore=ASB-13 同步方法由 asyncio.to_thread 调用，每批 LIMIT 必然收敛
-                    if self._closing.is_set():
-                        break  # 插件已卸载：别在旧连接上继续删
+                # 每批受 LIMIT 约束，删完不足一批即收敛；_closing 可随时终止。
+                while not self._closing.is_set():
                     with self._lock:
                         ids = [r[0] for r in self.conn.execute(
                             "SELECT id FROM messages WHERE session_id = ?"
@@ -602,10 +593,8 @@ class HermesDB:
                     if len(ids) < int(batch):
                         break
         else:
-            # 海象循环：每批取一批删一批；批次大小受 LIMIT 约束，不会长事务
-            while True:  # asb-audit: ignore=ASB-13 同步方法由 asyncio.to_thread 调用，每批 LIMIT 必然收敛
-                if self._closing.is_set():
-                    break
+            # 分批修剪：每批受 LIMIT 约束，不足一批即收敛；_closing 可随时终止。
+            while not self._closing.is_set():
                 with self._lock:
                     ids = [r[0] for r in self.conn.execute(
                         "SELECT id FROM messages WHERE ts < ? LIMIT ?",

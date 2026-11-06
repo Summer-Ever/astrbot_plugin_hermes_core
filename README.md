@@ -676,6 +676,31 @@ webapi.py / 前端逐行读一遍，疑点全部写探针实测，确认了才�
 测试：smoke_db 146、router 29、consolidate 38→**59**、tools 22，合计 256 项
 全绿；`ruff check --select=E9,F` 通过。
 
+## 上架审核整改：日志来源与审查豁免注释（v0.12.23）
+
+审核提出两项必须整改的问题，本次按「运行时不退化、测试侧自己打桩」的口径处理：
+
+1. **日志来源唯一化**：`modules/db.py` 原先带一条「没有 AstrBot 就退回
+   Python 内置 logging」的退化分支。现已删除，存储层与 `main.py` /
+   `webapi.py` / `modules/router.py` 一样，运行时只从 `astrbot.api` 导入
+   `logger`，WebUI 可见、级别统一。
+2. **测试环境自行打桩**：新增 `tests/_astrbot_stub.py`，在导入插件模块前
+   往 `sys.modules` 注入一个纯 no-op 的 `astrbot.api.logger` 替身（不引入
+   内置 logging 模块）。`smoke_db.py` 与 `inspect_db.py` 因此仍能在**普通
+   Python** 下跑，不需要装 AstrBot；插件代码里不再有任何为测试准备的
+   导入兜底。
+3. **删除全部针对扫描工具的豁免注释**：此前留在存储层里的三处「让审查
+   跳过某条规则」的行尾注释已全部移除。其中两处原本是为 `prune_messages`
+   的 `while True` 分批删除做说明，现把循环条件直接改成
+   `while not self._closing.is_set()`——终止条件写在循环头里，每批受
+   `LIMIT` 约束、不足一批即退出，从代码本身就能看出收敛，不需要任何豁免。
+
+`smoke_db.py` 中 `prune_messages` 的两个分支（默认 / `require_summarized=True`）
+都有断言覆盖，本次循环改写后 146 项全绿；`smoke_db` 已额外用**无 AstrBot
+的普通 Python 3.13** 验证打桩路径生效。其余 router 29、consolidate 59、
+tools 22 全绿，合计 256 项；`ruff check --select=E9,F` 通过，全仓已无
+任何审查豁免字样或内置 logging 引用。
+
 ## 清上下文 vs 清记忆：两套独立存储
 
 很容易混淆的一点：**上下文和记忆在物理上是分开存的**。
@@ -702,8 +727,12 @@ webapi.py / 前端逐行读一遍，疑点全部写探针实测，确认了才�
 ### 存储层自检
 
 ```bash
-python tests/smoke_db.py
+python tests/smoke_db.py        # 普通 Python 即可，无需安装 AstrBot
 ```
+
+插件运行时只用 `astrbot.api` 的官方 logger；存储层脚本为了能在没有
+AstrBot 的环境里跑，由 `tests/_astrbot_stub.py` 在导入前注入一个 no-op
+替身，插件代码本身不带任何导入退化分支。
 
 146 项断言：消息写入与检索、FTS trigram 三字窗口（含非连续短语、超出最近窗口的旧消息）、
 记忆去重、常驻区块按身份隔离、
@@ -720,7 +749,7 @@ python tests/smoke_db.py
 
 ```bash
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 29 项：节流、429 退避、冷却下限、两级预算
-D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 38 项：切片、断点、单片超时、连续失败止损、模型落款
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 59 项：切片、断点、单片超时、连续失败止损、模型落款、水位与自动深度整理
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_tools.py       # 22 项：工具链编号边界与越权、队列重建、WebUI 缓存失效、注入守卫窗口
 ```
 
@@ -758,6 +787,10 @@ python tests/smoke_db.py
 
 改动涉及异步链路时要额外确认：`async` 函数体内不出现同步网络 IO、同步子进程
 和长耗时文件操作，一律交给 `asyncio.to_thread` 或 `create_subprocess_exec`。
+
+提交前再确认两件事：插件模块里 logger 只能从 `astrbot.api` 导入；全仓不得
+出现任何「请求扫描工具跳过某条规则」的注释或标记。遇到静态告警应改代码
+本身（例如把循环终止条件写进 `while` 条件），而不是给扫描器留例外。
 
 ### 检索：FTS 索引真正接上了
 

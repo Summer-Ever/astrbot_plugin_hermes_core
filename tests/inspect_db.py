@@ -5,7 +5,8 @@
     python tests/inspect_db.py --db D:/path/to/hermes.db
     python tests/inspect_db.py --db D:/path/to/hermes.db --repair   # 在副本上跑启动修复，看效果
 
-不依赖 astrbot 运行时，任意 Python 3.9+ 可跑。检查项：
+不依赖 astrbot 运行时（logger 由 tests/_astrbot_stub.py 打桩），
+任意 Python 3.9+ 可跑。检查项：
 
 1. 孤儿私聊记忆   owner_id='' + private + 无群 → 按人检索和常驻都读不到，永久沉底
 2. 分层错位       private + 无群 + scope='group' → 群层按可见性过滤、按人层 scope 不匹配，两边都空
@@ -25,6 +26,13 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)
+
+# 插件运行时只用 astrbot.api 的官方 logger；纯 Python 体检脚本没有 AstrBot，
+# 在下面延迟导入 modules.db 之前先由测试侧注入替身。
+from _astrbot_stub import ensure_astrbot_logger  # noqa: E402
+
+ensure_astrbot_logger()
 
 ORPHAN_SQL = (
     "SELECT id, session_id FROM memories WHERE merged_into = 0"
