@@ -1245,6 +1245,45 @@ class HermesDB:
             self.conn.commit()
         return cur.rowcount > 0
 
+    def find_memory_by_text(self, text: str, owner_id: str, block: str = "",
+                            allow_private: bool = True,
+                            group_id: str = "") -> dict | None:
+        """按「旧说法的原文片段」定位一条记忆，用来替代按编号定位。
+
+        匹配只有一档：片段**原样出现**在条目正文里。模型看得到常驻原文，
+        照抄几个连续的字就能指认，不需要任何模糊匹配去猜它的意思——
+        猜错了改的是另一条，比不改更糟。多条命中时取最新（改口针对最近
+        那条表述）。
+
+        只在**同一层内**找：给了 block 就只在该词条里找，没给就只在常驻层里
+        找。跨层定位会把归档里的一句旧话顶掉常驻里的另一句话。
+
+        找不到返回 None。调用方据此如实回执「没找到」，而不是猜一条改掉。
+        """
+        t = str(text or "").strip()
+        if not t or not owner_id:
+            return None
+        b = _norm_block(block)
+        vis, vis_args = _visible_clause(allow_private, group_id, owner_id)
+        if b:
+            rows = self.conn.execute(
+                "SELECT * FROM memories WHERE merged_into = 0 AND owner_id = ?"
+                " AND COALESCE(block, '') = ?" + vis +
+                " ORDER BY id DESC LIMIT 300",
+                (owner_id, b, *vis_args),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM memories WHERE merged_into = 0 AND owner_id = ?"
+                " AND COALESCE(block, '') != ''" + vis +
+                " ORDER BY id DESC LIMIT 300",
+                (owner_id, *vis_args),
+            ).fetchall()
+        for r in rows:                      # ORDER BY id DESC，返回最新命中
+            if t in str(r["content"] or ""):
+                return dict(r)
+        return None
+
     def supersede_memories(self, ids: list[int], new_id: int) -> int:
         """旧记忆被新版本取代：退出活跃池（merged_into=new_id）。
 

@@ -814,11 +814,12 @@ KIND_TITLES = (("profile", "画像"), ("preference", "偏好"),
 
 def format_memory_lines(items: list[dict[str, Any]], *,
                         note_key: str = "note") -> list[str]:
-    """把记忆条目渲染成注入用的几行：类型分组 + 编号后置。
+    """把记忆条目渲染成注入用的几行：类型分组，纯正文。
 
-    - 编号必须保留：save_memory(replaces=) 全靠它定位条目。
-    - 编号放行尾而不是行首：正文优先，行首不再出现 #，客户端按 markdown
-      渲染时也不会把 # 当成标记吃掉（截图里 `#127` 就变成了 `127`）。
+    - 不注入编号。记忆是给模型「记住一个人」用的，不是一张可寻址的记录表；
+      编号属于存储层，写进上下文会被当成话讲出来，也会让模型把记忆当成
+      数据库去操作。改口靠原文定位（save_memory 的 replace_text），
+      不需要模型知道任何 id。
     - kind 提到分组标题：6 条平铺时逐条 `(profile)` 是纯开销（实测省 52 字）。
     - note 用于「钉于 2026-08」这类附注，由调用方按需填。
     """
@@ -844,8 +845,7 @@ def format_memory_lines(items: list[dict[str, Any]], *,
             if not text:
                 continue
             note = str(it.get(note_key) or "").strip()
-            tail = f"（#{it['id']}" + (f"，{note}" if note else "") + "）"
-            out.append(f"- {text}{tail}")
+            out.append(f"- {text}" + (f"（{note}）" if note else ""))
     return out
 
 

@@ -78,7 +78,7 @@ def make_plugin(db: HermesDB):
     for k, v in vars(m.HermesCore).items():
         if not k.startswith("__") and not callable(v) and not hasattr(fake, k):
             setattr(fake, k, v)
-    for name in ("_scope_keys", "_is_admin", "_id_seen", "_clear_resident",
+    for name in ("_scope_keys", "_is_admin", "_clear_resident",
                  "_queue_memories", "_pending_memory_ids",
                  "_requeue_after_consolidate",
                  "_resident_block", "_resident_limits",
@@ -101,57 +101,66 @@ def main() -> int:
     db = HermesDB(tempfile.mkdtemp(prefix="hermes-tools-db-"))
     p = make_plugin(db)
     ev = FakeEvent()
-    SID = ev.unified_msg_origin
 
-    def mark_seen(mid: int, turn: int = 5) -> None:
-        p._inj_state.setdefault(SID, {"turn": turn, "seen": {}})
-        p._inj_state[SID]["seen"][mid] = turn
+    # ---- save_memory：改口靠原文定位，编号不出现在任何模型可见处 ----
+    print("== save_memory 的改口定位 ==")
+    r = asyncio.run(p.tool_save_memory(ev, content="测试内容甲",
+                                       replace_text="从来没说过的旧话"))
+    check("旧说法找不到：如实回话而非崩溃",
+          "没有找到含有" in r and "已保存" in r, r)
+    check("回执里不出现编号", "#" not in r, r)
 
-    # ---- save_memory：replaces 的四种拒绝路径都必须如实回话，不能静默 ----
-    print("== save_memory 的 replaces 边界 ==")
-    try:
-        r = asyncio.run(p.tool_save_memory(ev, content="测试内容甲", replaces=99999))
-        check("replaces 不存在：返回提示而非崩溃",
-              "不存在" in r and "#99999" not in r.split("；")[0].replace("旧记忆 #99999", ""),
-              r)
-    except Exception as e:
-        check("replaces 不存在：返回提示而非崩溃", False, f"{type(e).__name__}: {e}")
-
-    other = db.add_memory("fact", "别人的记忆内容", owner_id="OTHER_USER",
-                          visibility="private")
-    mark_seen(other)
-    r = asyncio.run(p.tool_save_memory(ev, content="我的新内容乙", replaces=other))
-    check("replaces 别人的记忆：拒绝且明确告知",
-          "不属于你" in r and "已保存" in r, r)
-    check("被拒后旧记忆仍然活跃", db.memory_by_id(other) is not None)
+    db.add_memory("preference", "叫我兄弟", owner_id="OTHER_USER",
+                  visibility="private", block="address")
+    r = asyncio.run(p.tool_save_memory(ev, content="我的新内容乙",
+                                       block="address", replace_text="叫我兄弟"))
+    check("只认自己的记忆：别人的同文条目不被顶掉",
+          "没有找到" in r, r)
+    check("别人的记忆仍然活跃",
+          any(row["content"] == "叫我兄弟"
+              for row in db.all_memories(owner_id="OTHER_USER")))
 
     old_a = db.add_memory("fact", "待合并的旧内容", owner_id="u1", visibility="private")
     old_b = db.add_memory("fact", "另一条碎片", owner_id="u1", visibility="private")
     db.merge_memories([old_a, old_b], "合并后的内容", "fact")
-    mark_seen(old_a)
-    r = asyncio.run(p.tool_save_memory(ev, content="替换已合并条目", replaces=old_a))
-    check("replaces 已合并条目：拒绝且明确告知", "已失效" in r, r)
+    r = asyncio.run(p.tool_save_memory(ev, content="替换已合并条目",
+                                       replace_text="待合并的旧内容"))
+    check("已合并条目不算活跃：如实说没找到", "没有找到" in r, r)
 
-    unseen = db.add_memory("fact", "从没在本会话出现过的记忆", owner_id="u1",
-                           visibility="private")
-    r = asyncio.run(p.tool_save_memory(ev, content="替换不可见条目", replaces=unseen))
-    check("replaces 不可见编号：拒绝且明确告知", "不在本会话" in r, r)
-
-    # ---- save_memory：正常 replaces 必须真的顶掉旧条，并继承词条 ----
-    print("== save_memory 的 replaces 正常路径 ==")
+    # 改口正常路径：片段定位 → 旧条退场 → 新条继承同一词条
     old_c = db.add_memory("preference", "叫我兄弟", owner_id="u1", visibility="private",
                           block="address")
-    mark_seen(old_c)
     r = asyncio.run(p.tool_save_memory(ev, content="叫我老爹", kind="preference",
-                                       replaces=old_c))
-    check("正常 replaces：提示已替换", "已替换" in r and f"#{old_c}" in r, r)
-    check("正常 replaces：旧条退出活跃池",
+                                       replace_text="叫我兄弟"))
+    check("片段定位：回执写明顶掉了旧说法",
+          "已顶掉旧说法" in r and "叫我兄弟" in r, r)
+    check("片段定位：旧条退出活跃池",
           int(db.memory_by_id(old_c)["merged_into"] or 0) != 0)
     rows_new = [row for row in db.all_memories(owner_id="u1")
                 if row["content"] == "叫我老爹"]
-    check("正常 replaces：新条留在同一词条",
+    check("片段定位：新条继承旧条的词条",
           bool(rows_new) and rows_new[0]["block"] == "address",
           str(rows_new[0]["block"]) if rows_new else "没找到新条")
+
+    # 改口但给了新说法而非旧说法：认不出就不动，绝不猜一条改掉
+    old_e = db.add_memory("preference", "用户以前每天走路上班", owner_id="u1",
+                          visibility="private", block="preference")
+    r = asyncio.run(p.tool_save_memory(ev, content="用户改喝手冲了",
+                                       kind="preference", replace_text="手冲"))
+    check("认不出旧说法：不误伤任何条目，回执说明没找到",
+          "没有找到" in r and int(db.memory_by_id(old_e)["merged_into"] or 0) == 0, r)
+
+    # 同一片段命中多条时取最新（改口针对最近的表述）
+    e1 = db.add_memory("preference", "喜欢看科幻小说", owner_id="u1",
+                       visibility="private", block="preference")
+    e2 = db.add_memory("preference", "喜欢看科幻小说和电影", owner_id="u1",
+                       visibility="private", block="preference")
+    r = asyncio.run(p.tool_save_memory(ev, content="现在只看纪录片了",
+                                       kind="preference",
+                                       replace_text="喜欢看科幻小说"))
+    check("同片段多条：取最新那条退场",
+          int(db.memory_by_id(e2)["merged_into"] or 0) != 0
+          and int(db.memory_by_id(e1)["merged_into"] or 0) == 0, r)
 
     # ---- save_memory 的词条参数 ----
     print("== save_memory 的词条参数 ==")
@@ -181,8 +190,8 @@ def main() -> int:
     lines = m.HermesCore._render_resident(blocks)
     check("渲染成一行一个词条",
           any(x.startswith("- 用户偏好：") for x in lines), str(lines[:2]))
-    check("渲染带编号（改口要靠它定位）",
-          bool(lines) and all("（#" in x for x in lines), str(lines[:1]))
+    check("渲染不带任何编号（模型不该看到存储层 id）",
+          bool(lines) and not any("#" in x or "（#" in x for x in lines), str(lines[:1]))
     check("空词条不产生空行", all(not x.endswith("：") for x in lines), str(lines))
     check("别的用户读不到这份常驻",
           p._resident_block("u_other", allow_private=True) == {})
@@ -203,10 +212,9 @@ def main() -> int:
     check("首条不提醒替换", "该词条还有" not in r, r)
     r = asyncio.run(p.tool_save_memory(ev, content="用户偏好英文回复",
                                        kind="preference", block="style"))
-    check("第二条起提醒可替换旧说法", "该词条还有" in r and "replaces" in r, r)
-    check("提醒里带上旧条编号",
-          any(f"#{row['id']}" in r for row in db.all_memories(owner_id="u1")
-              if row["content"] == "用户偏好中文简短回复"), r)
+    check("第二条起提醒可替换旧说法", "该词条还有" in r and "replace_text" in r, r)
+    check("提醒里带出旧条原文而非编号",
+          "用户偏好中文简短回复" in r and "#" not in r, r)
 
     # ---- 注入块：常驻由对话里的模型维护，这一授权必须每轮送达 ----
     print("== 注入块 ==")

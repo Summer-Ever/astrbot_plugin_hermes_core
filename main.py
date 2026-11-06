@@ -139,7 +139,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "1.1.2"
+PLUGIN_VERSION = "1.1.3"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、"
@@ -149,7 +149,7 @@ SYSTEM_MEMORY_HINT = (
     "遇到值得长期记住的信息请主动 save_memory：每轮都用得上的（称呼、身份、偏好、"
     "回复要求、规则）要填 block 写进对应词条，具体事件不要填；"
     "用户改主意、或说明自身情况变了（毕业、换工作、搬家、换设备），"
-    "要用 save_memory(replaces=旧编号) 顶掉旧说法，不要两种并存——"
+    "要用 save_memory(replace_text=旧说法) 顶掉旧说法，不要两种并存——"
     "常驻只有你在对话里能改，后台总结碰不到它。"
     "完成复杂流程后可用 save_skill 沉淀方法。"
     "改技能一律走 update_skill 做局部替换，不要整份重写；"
@@ -1204,7 +1204,8 @@ class HermesCore(Star):
             # 指令」，而这段是系统规则，混在条目里会让模型两头为难。
             maint.append("[维护约定] 上述条目由你维护：本轮对话若表明其中某条已过时"
                          "（毕业/换工作/搬家/改称呼/改偏好），立刻 "
-                         "save_memory(replaces=编号, block=词条) 更新；说法不同别动。")
+                         'save_memory(replace_text="那条旧说法", block=词条) 更新；'
+                         "说法不同别动。")
             sig = _state_change_signal(query)
             if sig:
                 # 只在用户明确陈述自身变化时追加，平时不占 token
@@ -1384,14 +1385,16 @@ class HermesCore(Star):
 
     @staticmethod
     def _render_resident(blocks: dict[str, dict]) -> list[str]:
-        """把常驻词条渲染成注入行：一句一个词条，编号跟在每条后面。
+        """把常驻词条渲染成注入行：一行一个词条，只有正文。
 
-        编号必须保留——模型要改口时靠 save_memory(replaces=编号) 定位到
-        具体那一条。不保留的话它只能新写一条，旧说法会继续念下去。
+        这里**不放编号**。编号是存储层的自增主键，不是记忆的一部分：它进了
+        上下文，模型会把这些条目当成一张可寻址的记录表去操作，也可能在回复里
+        把编号念出来。改口靠原文定位（save_memory 的 replace_text 填旧说法），
+        模型不需要知道任何 id。
         """
         out: list[str] = []
         for info in blocks.values():
-            parts = [f"{_clean_memory_text(it['content'])}（#{it['id']}）"
+            parts = [_clean_memory_text(it["content"])
                      for it in info.get("items") or []]
             if parts:
                 out.append(f"- {info['title']}：" + "；".join(parts))
@@ -1471,8 +1474,8 @@ class HermesCore(Star):
                 self.db.bump_hits([int(m["id"]) for m in mems])
             except Exception:
                 pass
-            # 把检索结果并入「本会话已见编号」：pin/save 的编号校验依赖它，
-            # 否则模型刚搜到一条却因为没进过注入块而被拒绝改。
+            # seen 集合仍要维护：它给「重复抑制」用（近几轮注入过的降权），
+            # 与改口定位无关——定位现在走原文匹配。
             state = self._inj_state.setdefault(sc["sid"], {"turn": 0, "seen": {}})
             for m in mems:
                 state["seen"].setdefault(int(m["id"]), state["turn"])
@@ -1480,20 +1483,16 @@ class HermesCore(Star):
         out = []
         if mems:
             out.append("[记忆] " + " | ".join(
-                f"#{m['id']} {_clean_memory_text(m['content'])}" for m in mems))
+                _clean_memory_text(m["content"]) for m in mems))
         if msgs:
             out.append("[历史] " + " | ".join(f"{m['role']}:{m['content'][:80]}" for m in reversed(msgs)))
         return "\n".join(out) or "没有找到相关内容。"
 
-    def _id_seen(self, sid: str, memory_id: int) -> bool:
-        """这个编号是否在本会话出现过（注入块或 search_memory 结果里）。"""
-        st = self._inj_state.get(sid) or {}
-        return int(memory_id) in (st.get("seen") or {})
-
     @filter.llm_tool(name="save_memory")
     async def tool_save_memory(self, event: AstrMessageEvent, content: str,
                                kind: str = "fact", block: str = "",
-                               replaces: int = 0, shareable: bool = False) -> str:
+                               replace_text: str = "",
+                               shareable: bool = False) -> str:
         """把值得长期记住的信息保存为记忆（自动归属到当前发言用户）。
 
         记忆分两种去处，写之前先想清楚这条属于哪一种：
@@ -1502,15 +1501,18 @@ class HermesCore(Star):
            信息——怎么称呼他、他是谁、喜欢什么、要求怎么回复、你要扮演什么角色、
            必须遵守什么规则。常驻有字数上限，**同一个词条里不要放两条意思相同的
            东西**：往下发的 [长期稳定信息] 已经列出全部现有条目，写之前先对照，
-           已有的内容不要重复保存，改主意就用 replaces。
+           已有的内容不要重复保存，改主意就用 replace_text。
         2. **归档记忆**（block 留空）：具体事件、一次性事实、项目细节。这类不进
            常驻，需要时按关键词检索出来。
 
         **用户说明自己的情况变了，必须当场更新常驻，不要等后台。** 例如常驻的
-        用户信息里写着「在校生」，用户说「我毕业了」——这时应当新增/替换成
-        「已毕业」，并用 replaces 顶掉那条「在校生」。判断依据就一句话：
+        用户信息里写着「在校生」，用户说「我毕业了」——这时应当新增成「已毕业」，
+        并把「在校生」那段旧说法填进 replace_text 让它退场。判断依据就一句话：
         常驻里的旧说法与本轮用户说的话矛盾了吗？矛盾就该改，改完不要保留旧说法。
         后台总结只会把新事实记成归档，它碰不到常驻，所以这一步只能你做。
+
+        你看到的常驻条目是纯正文，没有编号——记忆不是一张记录表，你也不该把它当
+        数据库去操作。要改哪一条，就用那条的原文片段去指认。
 
         Args:
             content (string): 记忆内容（简洁的一句话，常驻条目尽量 30 字内）
@@ -1520,8 +1522,11 @@ class HermesCore(Star):
                 preference（用户偏好：喜欢什么、不喜欢什么）、style（回复风格：长短、
                 格式、表情、语气）、rules（规则避雷：必须做的、绝不能做的）。留空 =
                 存进归档层按需检索。
-            replaces (number): 要替换的旧记忆编号。用户改主意（称呼、偏好、习惯变了）
-                时填旧条编号，旧条会退场且不再注入
+            replace_text (string): 旧说法里**照抄**的连续几个字（如「哥哥」「在校生」
+                「喜欢吃葡萄」）。用户改主意或情况变了时填它，含有这段原文的那条
+                旧说法会退场、不再每轮念。定位只认原文——凭印象改写（如把「称呼
+                其为哥哥」记成「叫哥哥」）会找不到，回执会明确说没找到；那时照着
+                下发的 [长期稳定信息] 里的原话再填一次即可。
             shareable (boolean): 用户明确说「这个在群里也能说」时设 true，该条才会在
                 群聊场景被引用；默认只在私聊可用
         """
@@ -1537,75 +1542,69 @@ class HermesCore(Star):
             return (f"未知词条 {block!r}。可选："
                     + "、".join(f"{b}（{t}）" for b, t in HermesDB.RESIDENT_BLOCKS))
 
-        # 改口时新条要继承旧条所在词条，否则「以后叫我老师」会落进归档层、
-        # 而常驻里的「叫我哥哥」继续每轮念——那正是两种说法并存的成因。
-        inherit_block = ""
-        if replaces:
-            try:
-                _old = self.db.memory_by_id(int(replaces))
-            except (TypeError, ValueError):
-                _old = None
-            if _old and int(_old.get("merged_into") or 0) == 0:
-                inherit_block = str(_old.get("block") or "")
-        blk = blk or inherit_block
+        # 改口：按「旧说法的片段」定位要退场的那条。先按指定词条找，找不到再
+        # 在常驻层里兜一次——模型常常只说「我毕业了」，顺手就没填 block。
+        # 认不出来就如实返回没找到，绝不猜一条去改：改错一条比不改更糟。
+        old_text = _clean_memory_text(replace_text)
+        old = None
+        if old_text:
+            old = self.db.find_memory_by_text(
+                old_text, sc["owner_id"], block=blk,
+                allow_private=True, group_id=sc["group_id"])
+            if old is None and blk:
+                old = self.db.find_memory_by_text(
+                    old_text, sc["owner_id"], block="",
+                    allow_private=True, group_id=sc["group_id"])
+        # 新条继承旧条所在词条：否则「以后叫我老师」会落进归档层，而常驻里的
+        # 「叫我哥哥」继续每轮念——那正是两种说法并存的成因。
+        if old is not None:
+            blk = blk or str(old.get("block") or "")
 
         vis = "public" if shareable else ("group" if sc["is_group"] else "private")
         mid, created = self.db.add_memory_smart(
             kind or "fact", text, scope="user", source="llm_tool",
             owner_id=sc["owner_id"], session_id=sc["sid"],
             platform=sc["platform"], group_id=sc["group_id"],
-            visibility=vis, block=blk, prefer_new=bool(replaces),
+            visibility=vis, block=blk, prefer_new=old is not None,
         )
-        # replaces 的处理：无论「新建」还是「合并强化到已有条目」都要生效——
-        # 模型明确要求顶掉旧条时，后者同样不能漏，否则旧说法依旧活着。
-        # 每个被拒理由都要如实回给模型：原来统一返回「已保存」，
-        # 模型以为旧条已被替换（如「兄弟→老爹」），实际两种说法并存注入。
+        # 旧说法的退场：无论这次是「新建」还是「并入同词条已有条目」都要生效，
+        # 否则旧说法依旧活着。被拒的理由如实回给模型，不能让它在没替换成功时
+        # 以为已经替换了（以前就出过「兄弟/老爹」两种说法并存注入）。
         replaced = 0
+        retired = ""
         reject = ""
-        if replaces:
-            try:
-                old = self.db.memory_by_id(int(replaces))
-            except (TypeError, ValueError):
-                old = None
+        if old_text:
             if old is None:
-                reject = f"旧记忆 #{replaces} 不存在"
-            elif int(old.get("merged_into") or 0) != 0:
-                reject = f"旧记忆 #{replaces} 已失效（被合并或丢弃）"
-            elif int(replaces) == mid:
-                reject = ""  # 顶掉的正是自己（合并强化场景），无需处理
+                reject = f"没有找到含有「{old_text[:16]}」的常驻条目"
+            elif int(old["id"]) == mid:
+                reject = ""          # 认出的正是这次要合并强化的那条，无需处理
             else:
-                # 只能替换自己的记忆。公共（无归属）条目会被全员共用，
-                # 任何群友都能借 replaces 把它从所有人视野里顶掉，只有管理员能替换。
-                mine_old = bool(sc["owner_id"]) and \
-                    (old.get("owner_id") or "") == sc["owner_id"]
-                shared_old = not (old.get("owner_id") or "")
-                if not (mine_old or (shared_old and self._is_admin(event))):
-                    reject = f"旧记忆 #{replaces} 不属于你（公共记忆需要管理员）"
-                elif not self._id_seen(sc["sid"], int(replaces)):
-                    reject = f"旧记忆 #{replaces} 不在本会话可见范围内"
+                replaced = self.db.supersede_memories([int(old["id"])], mid)
+                if replaced:
+                    retired = old_text[:16]
                 else:
-                    # 旧条的词条归属已经在上面的 inherit_block 里接过来了，
-                    # 这里只负责让它退场。
-                    replaced = self.db.supersede_memories([int(replaces)], mid)
-        # 这条新记忆必须登记进本会话的「已见集合」：replaces 的合法性校验
-        # （_id_seen）查的就是这个集合。不登记的话，模型刚 save_memory 拿到
-        # #17，紧接着拿 #17 去 replaces 就会被判「不在本会话可见范围内」——
-        # 新旧两种说法就一直并存，两边都注入。
-        # 放在 replaces 处理之后：顶掉的旧条要能查到，登记新条不影响它。
+                    # 上面 add_memory_smart 的否定词逻辑可能已经把旧条顶掉了
+                    # （「喜欢吃葡萄」→「不喜欢吃葡萄」走的就是那条路）。
+                    # 只要旧条确实退了场，就不算失败，回执照实说已顶掉。
+                    now = self.db.memory_by_id(int(old["id"])) or {}
+                    if int(now.get("merged_into") or 0) != 0:
+                        retired = old_text[:16]
+                    else:
+                        reject = "那条旧说法在写入时已被别的操作改掉了"
         state = self._inj_state.setdefault(sc["sid"], {"turn": 0, "seen": {}})
         state["seen"].setdefault(int(mid), state["turn"])
         self._clear_resident(sc["owner_id"])
-        tail = f"，已替换旧记忆 #{int(replaces)}" if replaced else ""
+        tail = f"，已顶掉旧说法「{retired}」" if retired else ""
         if reject:
-            tail += f"；注意：{reject}，它仍然有效，两种说法可能并存"
+            tail += f"；注意：{reject}，旧说法没有退场，可能两种并存"
         if created:
             # 常驻条目不进归档整理队列：它由词条预算管理，不需要「攒够 N 条合并」。
             if not blk:
                 self._queue_memories([mid])
             where = f"（{HermesDB.RESIDENT_BLOCK_TITLES.get(blk, blk)}词条，每轮都会带上）" if blk else ""
             tip = ""
-            if blk and not replaces:
-                # 同一词条里已经有别的条目、而这次没指定替换谁：很可能用户是在
+            if blk and not old_text:
+                # 同一词条里已经有别的条目、而这次没指定要顶掉谁：很可能用户是在
                 # 「说明变化」（毕业了、换工作了），正确动作是顶掉旧条，不是并存。
                 # 回执里点一句，比在注入块里每轮叮嘱更省，也更贴近决策现场。
                 try:
@@ -1621,13 +1620,13 @@ class HermesCore(Star):
                         allow_private=True, group_id=sc["group_id"], truncate=False)
                     same = [it for it in (others.get(blk) or {}).get("items") or []
                             if int(it["id"]) != int(mid)]
-                    listing = "；".join(f"#{it['id']} {it['content'][:24]}" for it in same[:4])
+                    listing = "；".join(it["content"][:24] for it in same[:4])
                     tip = (f"。该词条还有 {n_same} 条：{listing}。"
-                           "如果这次是在说明变化（旧的已作废），用 "
-                           "save_memory(replaces=旧编号) 顶掉它，别两种说法并存")
-            return f"已保存记忆 #{mid}{where}{tail}{tip}。"
+                           "如果这次是在说明变化（旧的已作废），把旧说法填进 "
+                           "replace_text 顶掉它，别两种说法并存")
+            return f"已保存{where}{tail}{tip}。"
         where = "已并入同词条已有条目" if blk else "这条和已有记忆高度重合"
-        return f"{where} #{mid}，已合并强化，没有新增{tail}。"
+        return f"{where}，已合并强化，没有新增{tail}。"
 
     @filter.llm_tool(name="list_skills")
     async def tool_list_skills(self, event: AstrMessageEvent) -> str:
@@ -2170,7 +2169,7 @@ class HermesCore(Star):
                     allow_private=not bool(gid), group_id=gid, truncate=False)
                 for info in blocks.values():
                     for it in info["items"]:
-                        rows_r.append(f"- #{it['id']} [{info['title']}] "
+                        rows_r.append(f"- [{info['title']}] "
                                       f"{_clean_memory_text(it['content'])[:80]}")
         except Exception:
             rows_r = []
@@ -2255,15 +2254,15 @@ class HermesCore(Star):
                 # 后台总结**永不写常驻**，一律落归档层。
                 #
                 # 常驻的更新只该发生在对话轮次里：用户说「我毕业了」时，前台
-                # 模型手上有那句话的完整上下文，也有常驻条目编号，能准确判断
-                # 该改哪一条、改成什么。而后台只有一段压缩过的总结稿，既分不清
+                # 模型手上有那句话的完整上下文，也看得到常驻条目的原文，能准确
+                # 判断该改哪一条、改成什么。而后台只有一段压缩过的总结稿，既分不清
                 # 「我毕业了」是当前状态还是回忆往事，也看不到常驻块里还写着
                 # 「在校生」——让它去改，等于拿一份二手材料覆盖用户画像，
                 # 而且事后查不出是哪轮对话改的。
                 #
                 # 所以这里把 block 固定为空。总结产出的「毕业」类事实会进归档，
                 # 下一轮对话里模型看到常驻写着「在校生」、用户又说已毕业，
-                # 由它自己调用 save_memory(replaces=旧编号) 完成更新。
+                # 由它自己把「在校生」填进 save_memory 的 replace_text 完成更新。
                 mid, created = self.db.add_memory_smart(
                     str(item.get("kind", "fact")), content_text,
                     scope="user" if owner else "group", source="auto_summary",

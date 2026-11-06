@@ -253,12 +253,14 @@ def main() -> int:
     ]
     rendered = format_memory_lines(rows)
     check("渲染：多类型加分组标题", rendered[0] == "画像：", str(rendered[:1]))
-    check("渲染：编号在行尾且可带附注",
-          rendered[1] == "- CPU 为 i5-1240P（#52）"
-          and rendered[3] == "- 称呼他为哥哥（#140，2026-11 更新）", str(rendered))
+    check("渲染：不带编号，附注仍在",
+          rendered[1] == "- CPU 为 i5-1240P"
+          and rendered[3] == "- 称呼他为哥哥（2026-11 更新）", str(rendered))
+    check("渲染：整块不出现存储层编号", not any("#" in x for x in rendered),
+          str(rendered))
     check("渲染：不再出现逐条 (kind) 标注", "(profile)" not in "\n".join(rendered))
     single = format_memory_lines([rows[1]])
-    check("渲染：单一类型不加分组标题", single == ["- CPU 为 i5-1240P（#52）"], str(single))
+    check("渲染：单一类型不加分组标题", single == ["- CPU 为 i5-1240P"], str(single))
     check("渲染：空内容与空列表不产生空行",
           format_memory_lines([{"id": 1, "kind": "fact", "content": "  "}]) == []
           and format_memory_lines([]) == [])
