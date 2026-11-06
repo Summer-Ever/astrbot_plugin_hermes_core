@@ -177,6 +177,11 @@ def main() -> int:
         FakeEvent(sender_id="u_nobody"), "你好呀", None)
     check("无词条的用户不注入常驻段", "长期稳定信息" not in empty_owner_blk,
           empty_owner_blk[:120])
+    # v1.2.0 修复回归：维护约定原先挂在「词条非空」里，用户清空常驻后
+    # 模型反而收不到任何维护指引（群聊实测踩坑）。
+    check("常驻为空的用户仍收到维护约定",
+          "维护约定" in empty_owner_blk and "update_resident" in empty_owner_blk,
+          empty_owner_blk[:200])
 
     # ---- 3. _resident_block 缓存与 _clear_resident ----
     print("== 缓存与清缓存 ==")
