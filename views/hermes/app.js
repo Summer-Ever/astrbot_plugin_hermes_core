@@ -14,6 +14,7 @@
   const TAB_META = {
     overview: ["概览", "记忆、技能与自动整理的运行状态"],
     memories: ["记忆", "检索、编辑、合并；合并走软删除，可回溯"],
+    resident: ["常驻记忆", "六个固定词条每轮必带；按用户与场景整段编辑文本"],
     skills: ["技能", "查看与维护模型沉淀下来的可复用流程"],
     models: ["模型", "主模型 + 有序降级链：谁先上、失败怎么重试、什么时候换人"],
     settings: ["设置", "直接修改插件配置，与 AstrBot 配置页同一份文件"],
@@ -28,22 +29,12 @@
   };
   const SCOPE_LABEL = { user: "按用户", group: "按群", global: "全局" };
 
-  // 常驻的六个固定词条。空串 = 归档层（按需检索），不算常驻。
-  const BLOCK_LABEL = {
-    address: "称呼",
-    assistant: "助手设定",
-    user: "用户信息",
-    preference: "用户偏好",
-    style: "回复风格",
-    rules: "规则避雷",
-  };
-  function blockSelect(r) {
-    const cur = r.block || "";
-    const opts = [["", "归档"], ...Object.entries(BLOCK_LABEL)]
-      .map(([v, t]) => `<option value="${v}"${cur === v ? " selected" : ""}>${t}</option>`)
-      .join("");
-    return `<select data-mem-block="${r.id}" title="常驻词条：选中后每轮都会注入；「归档」= 按需检索"
-      style="font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid rgba(128,128,128,.45);background:transparent;color:inherit">${opts}</select>`;
+  // 常驻的场景键：private=私聊一套，group:<gid>=该群一套，彼此隔离。
+  // 没有公共层——私聊说的不会出现在群里，群里说的也不会出现在私聊。
+  function scopeLabel(s) {
+    s = String(s || "private");
+    return s === "private" ? "私聊"
+      : (s.startsWith("group:") ? `群 ${s.slice(6)}` : s);
   }
 
   const state = {
@@ -51,6 +42,7 @@
     overview: null,
     overviewBusy: false,
     mem: { q: "", scope: "", kind: "", merged: false, limit: 50, offset: 0, total: 0, rows: [], selected: new Set() },
+    resident: { owners: [], owner: "", scope: "private", blocks: [] },
     skills: { rows: [], system: [], owners: [], filter: "", current: null, currentId: null, preview: false },
     settings: { groups: [], dirty: false },
     models: { data: null, draft: null, dirty: false },
@@ -241,6 +233,7 @@
     $("#page-sub").textContent = sub;
     if (name === "overview") loadOverview();
     if (name === "memories") loadMemories();
+    if (name === "resident") loadResident();
     if (name === "skills") loadSkills();
     if (name === "models") loadModels();
     if (name === "settings") loadSettings();
@@ -304,7 +297,7 @@
       ["注入效果", (() => {
         const mt = d.metrics || {};
         if (!mt.inject_requests) return '<span class="faint">还没有请求</span>';
-        return `${fmtNum(mt.inject_requests)} 次 · 平均 ${mt.avg_memories} 条 / ${fmtNum(mt.avg_inject_chars)} 字`
+        return `${fmtNum(mt.inject_requests)} 次 · 常驻平均 ${fmtNum(mt.avg_inject_chars)} 字`
           + ` <span class="faint">· 检索 ${mt.avg_recall_ms}ms</span>`;
       })()],
       ["模型调用", (() => {
@@ -435,9 +428,6 @@
         ? `<span class="mono" title="${esc(r.owner_id)}">${esc(String(r.owner_id).slice(0, 14))}</span>`
         : (r.group_id ? `<span class="muted">群 ${esc(String(r.group_id).slice(0, 10))}</span>` : '<span class="faint">全局</span>');
       const mergedChip = Number(r.merged_into) ? ' <span class="chip">已合并</span>' : "";
-      const blockChip = r.block
-        ? ` <span class="chip ok" title="常驻词条：每轮都会注入">${esc(BLOCK_LABEL[r.block] || r.block)}</span>`
-        : "";
       // 可见范围：私聊=只在私聊可用；群=只在来源群可用；公开=任何场景可用。
       // 群聊场景默认不引用 private，这条徽标就是排查「群里为什么想不起来」的入口。
       const visMap = {
@@ -452,13 +442,12 @@
           <td><input type="checkbox" class="checkbox mem-check" data-id="${r.id}" ${m.selected.has(r.id) ? "checked" : ""}></td>
           <td class="mono faint">${r.id}</td>
           <td><span class="chip blue">${esc(KIND_LABEL[r.kind] || r.kind)}</span></td>
-          <td class="content"><div class="text">${esc(r.content)}</div>${mergedChip}${blockChip}${visChip}</td>
+          <td class="content"><div class="text">${esc(r.content)}</div>${mergedChip}${visChip}</td>
           <td>${owner}</td>
           <td><span class="chip">${esc(r.source || "—")}</span></td>
           <td class="nowrap muted">${fmtTime(r.ts)}</td>
           <td>
             <div class="ops">
-              ${blockSelect(r)}
               <button class="btn tiny ghost" data-mem-edit="${r.id}">编辑</button>
               <button class="btn tiny danger" data-mem-del="${r.id}">删除</button>
             </div>
@@ -553,6 +542,91 @@
         loadOverview();
       },
     });
+  }
+
+  /* ---------------- 常驻记忆面板 ---------------- */
+
+  async function loadResident() {
+    try {
+      const d = await apiGet("resident/owners");
+      state.resident.owners = d.owners || [];
+      const cur = state.resident.owner;
+      const sel = $("#res-owner-pick");
+      if (sel) {
+        const owners = [...new Set(state.resident.owners.map((o) => o.owner_id))];
+        sel.innerHTML = `<option value="">选择用户…</option>` +
+          owners.map((o) =>
+            `<option value="${esc(o)}"${o === cur ? " selected" : ""}>${esc(o)}</option>`).join("");
+      }
+      if (cur) await loadResidentBlocks(cur, state.resident.scope);
+      else { renderScopePick(); renderResident(); }
+    } catch (err) {
+      toast(`读取常驻用户清单失败：${errMsg(err)}`, "err");
+    }
+  }
+
+  function renderScopePick() {
+    const sel = $("#res-scope-pick");
+    if (!sel) return;
+    const scopes = state.resident.owners
+      .filter((o) => o.owner_id === state.resident.owner)
+      .map((o) => o.scope);
+    if (!scopes.includes(state.resident.scope)) scopes.unshift(state.resident.scope);
+    sel.innerHTML = scopes.map((s) =>
+      `<option value="${esc(s)}"${s === state.resident.scope ? " selected" : ""}>${esc(scopeLabel(s))}</option>`).join("");
+    sel.disabled = !state.resident.owner;
+  }
+
+  async function loadResidentBlocks(owner, scope) {
+    owner = String(owner || "").trim();
+    scope = String(scope || "private").trim() || "private";
+    if (!owner) {
+      state.resident.owner = "";
+      state.resident.blocks = [];
+      renderScopePick();
+      renderResident();
+      return;
+    }
+    try {
+      const d = await apiGet("resident", { owner_id: owner, scope });
+      state.resident.owner = owner;
+      state.resident.scope = d.scope || scope;
+      state.resident.blocks = d.blocks || [];
+      renderScopePick();
+      renderResident();
+    } catch (err) {
+      toast(`读取常驻词条失败：${errMsg(err)}`, "err");
+    }
+  }
+
+  function renderResident() {
+    const box = $("#res-body");
+    if (!box) return;
+    const owner = state.resident.owner;
+    if (!owner) {
+      box.className = "muted";
+      box.style.padding = "10px 2px";
+      box.innerHTML = state.resident.owners.length
+        ? "选择一个用户和场景查看其六个常驻词条。"
+        : "还没有常驻词条。常驻可以为空：对话中让 AI 用 update_resident 写入，或发 /hermes 归位 让 AI 读归档记忆整理进词条。";
+      return;
+    }
+    box.className = "";
+    box.style.padding = "0";
+    box.innerHTML = `
+      <div class="muted" style="padding:2px 0 10px">
+        ${esc(owner)} · ${esc(scopeLabel(state.resident.scope))}——每个词条是一段纯文本，保存后下一轮对话就会带上；清空文本再保存即删除该词条。
+      </div>` +
+      (state.resident.blocks || []).map((b) => `
+      <div class="card" style="margin:0 0 12px;padding:12px 14px;box-shadow:none;border:1px solid rgba(128,128,128,.25)">
+        <div class="toolbar" style="margin-bottom:6px">
+          <strong>${esc(b.title)}</strong>
+          <span class="chip ${b.chars > b.limit ? "err" : "ok"}" data-res-count="${esc(b.block)}">${b.chars}/${b.limit} 字</span>
+          <span class="spacer"></span>
+          <button class="btn tiny primary" data-res-save="${esc(b.block)}">保存</button>
+        </div>
+        <textarea data-res-text="${esc(b.block)}" rows="3" placeholder="（空词条，不注入、不占 token）">${esc(b.text || "")}</textarea>
+      </div>`).join("");
   }
 
   function mergeMemoriesModal(records) {
@@ -1384,15 +1458,6 @@
       updateBulkBar();
       $("#mem-check-all").checked = state.mem.rows.every((r) => state.mem.selected.has(r.id));
     });
-    $("#mem-tbody").addEventListener("change", async (e) => {
-      const sel = e.target.closest("[data-mem-block]");
-      if (!sel) return;
-      try {
-        await apiPost("memories/block", { id: Number(sel.dataset.memBlock), block: sel.value });
-        toast(sel.value ? `已移入「${BLOCK_LABEL[sel.value]}」，之后每轮都会带上` : "已移回归档，改为按需检索");
-        loadMemories();
-      } catch (_) { /* 错误已由 apiPost 提示 */ }
-    });
     $("#mem-tbody").addEventListener("click", async (e) => {
       const edit = e.target.closest("[data-mem-edit]");
       if (edit) {
@@ -1443,6 +1508,47 @@
         loadMemories();
         loadOverview();
       });
+    });
+
+    // 常驻
+    $("#res-refresh").addEventListener("click", () => loadResident());
+    $("#res-owner-pick").addEventListener("change", (e) => {
+      state.resident.scope = "private";
+      loadResidentBlocks(e.target.value, "private");
+    });
+    $("#res-scope-pick").addEventListener("change", (e) => {
+      if (state.resident.owner) loadResidentBlocks(state.resident.owner, e.target.value);
+    });
+    $("#res-owner").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") loadResidentBlocks(e.target.value, state.resident.scope);
+    });
+    $("#res-body").addEventListener("input", (e) => {
+      const ta = e.target.closest("[data-res-text]");
+      if (!ta) return;
+      const b = (state.resident.blocks || []).find((x) => x.block === ta.dataset.resText);
+      const chip = $(`[data-res-count="${ta.dataset.resText}"]`);
+      if (!b || !chip) return;
+      const n = ta.value.trim().length;
+      chip.textContent = `${n}/${b.limit} 字`;
+      chip.className = `chip ${n > b.limit ? "err" : "ok"}`;
+    });
+    $("#res-body").addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-res-save]");
+      if (!btn) return;
+      const ta = $(`[data-res-text="${btn.dataset.resSave}"]`);
+      if (!ta) return;
+      btn.disabled = true;
+      try {
+        await apiPost("resident/save", {
+          owner_id: state.resident.owner,
+          scope: state.resident.scope,
+          block: btn.dataset.resSave,
+          text: ta.value,
+        });
+        toast("已保存");
+        loadResident();
+      } catch (_) { /* 错误已由 apiPost 提示 */ }
+      finally { btn.disabled = false; }
     });
 
     // 技能

@@ -21,6 +21,7 @@
       <nav class="nav" id="nav">
         <button class="nav-item active" data-tab="overview"><span class="dot"></span>概览</button>
         <button class="nav-item" data-tab="memories"><span class="dot"></span>记忆</button>
+        <button class="nav-item" data-tab="resident"><span class="dot"></span>常驻</button>
         <button class="nav-item" data-tab="skills"><span class="dot"></span>技能</button>
         <button class="nav-item" data-tab="models"><span class="dot"></span>模型</button>
         <button class="nav-item" data-tab="settings"><span class="dot"></span>设置</button>
@@ -171,6 +172,27 @@
               <span id="mem-page">1 / 1</span>
               <button class="btn tiny" id="mem-next">下一页</button>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 常驻记忆 ============ -->
+      <section id="tab-resident" class="tab-panel">
+        <div class="card">
+          <div class="toolbar">
+            <div class="grow row" style="gap:8px;align-items:center">
+              <select id="res-owner-pick" title="有常驻词条的用户" style="min-width:220px">
+                <option value="">选择用户…</option>
+              </select>
+              <select id="res-scope-pick" title="场景：私聊一套、每个群各一套" style="min-width:150px" disabled>
+                <option value="private">私聊</option>
+              </select>
+              <input type="text" id="res-owner" placeholder="或直接输入归属 ID 回车查看（如 QQ 号 / user_openid）" />
+            </div>
+            <button class="btn ghost" id="res-refresh">刷新</button>
+          </div>
+          <div id="res-body" class="muted" style="padding:10px 2px">
+            选择一个用户和场景查看其六个常驻词条。
           </div>
         </div>
       </section>

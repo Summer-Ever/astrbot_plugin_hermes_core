@@ -26,21 +26,6 @@ safe_join = _paths.safe_join
 PASS, FAIL = [], []
 
 
-def _items(blocks, key: str = "") -> list:
-    """常驻词条里的条目：不给 key 就拍平所有词条。"""
-    if key:
-        return list((blocks.get(key) or {}).get("items") or [])
-    return [it for info in blocks.values() for it in info.get("items") or []]
-
-
-def _ids(blocks) -> list:
-    return [int(it["id"]) for it in _items(blocks)]
-
-
-def _text(blocks) -> str:
-    return "；".join(info.get("text") or "" for info in blocks.values())
-
-
 def check(name: str, cond: bool, detail: str = "") -> None:
     (PASS if cond else FAIL).append(name)
     print(("  ok   " if cond else "  FAIL ") + name + (f"  [{detail}]" if detail and not cond else ""))
@@ -117,52 +102,79 @@ def main() -> int:
                                          owner_id="u1", threshold=0.70)
     check("add_memory_smart 重复不新增", created2 is False and mid2 == mid, f"{mid2},{created2}")
 
-    db.add_memory("profile", "用户是在上海做后端的工程师", owner_id="u1", block="user")
-    db.add_memory("profile", "另一个人是设计师", owner_id="u2", block="user")
+    db.add_memory("profile", "用户是在上海做后端的工程师", owner_id="u1")
+    db.add_memory("profile", "另一个人是设计师", owner_id="u2")
 
-    notes = db.resident_blocks("u1")
-    check("常驻只返回本人", "设计师" not in _text(notes), str(len(_ids(notes))))
-    check("常驻含写进词条的画像", "工程师" in _text(notes))
+    # --- 常驻层 v1.2.0：六个固定词条，每词条一段纯文本，按（人，场景）隔离 ---
+    check("set_resident 写入词条",
+          db.set_resident("u1", "private", "user", "在上海做后端工程师") is True)
+    notes = db.get_resident("u1", "private")
+    check("get_resident 只返回本人",
+          notes.get("user") == "在上海做后端工程师" and "设计师" not in str(notes),
+          str(notes))
+    check("中文标题归一成词条 id",
+          db.set_resident("u1", "private", "称呼", "哥哥") is True
+          and db.get_resident("u1", "private").get("address") == "哥哥")
+    check("未知词条拒绝（六词条封闭）",
+          db.set_resident("u1", "private", "nope", "x") is False)
+    check("无归属写入被拒", db.set_resident("", "private", "user", "x") is False)
+    check("无身份读取返回空（fail-closed）", db.get_resident("", "private") == {})
+    db.set_resident("u1", "private", "style", "第一行\n第二行\r\n第三行")
+    check("写入时压平换行",
+          db.get_resident("u1", "private").get("style") == "第一行 第二行 第三行",
+          str(db.get_resident("u1", "private")))
+    long_txt = "很长的词条文本" * 100
+    db.set_resident("u1", "private", "rules", long_txt)
+    check("存储层不截长度：全文原样保存",
+          db.get_resident("u1", "private").get("rules") == long_txt)
+    check("空文本=清空词条（删行）",
+          db.set_resident("u1", "private", "rules", "") is True
+          and "rules" not in db.get_resident("u1", "private"))
+    db.set_resident("u1", "group:G1", "preference", "本群只聊工作")
+    check("场景隔离：私聊与群各一套词条互不可见",
+          db.get_resident("u1", "group:G1").get("preference") == "本群只聊工作"
+          and "preference" not in db.get_resident("u1", "private")
+          and "style" not in db.get_resident("u1", "group:G1"),
+          str(db.resident_owners()))
+    check("get_resident 只含非空词条",
+          all(v for v in db.get_resident("u1", "private").values()))
+    owners = db.resident_owners()
+    check("resident_owners 按（人，场景）列出",
+          any(o["owner_id"] == "u1" and o["scope"] == "private" and o["count"] >= 2
+              for o in owners)
+          and any(o["owner_id"] == "u1" and o["scope"] == "group:G1" for o in owners),
+          str(owners))
+    check("resident_count 数非空词条",
+          db.resident_count() == sum(o["count"] for o in owners),
+          f"{db.resident_count()} vs {str(owners)}")
+    from modules.db import resident_scope as _rscope
+    check("resident_scope 映射场景键",
+          _rscope("") == "private" and _rscope("G1") == "group:G1"
+          and _rscope(None) == "private", _rscope("G1"))
 
-    # 没有词条归属的条目不进常驻：事实量大且多为一次性信息，只走检索层
-    db.add_memory("fact", "用户电脑 CPU 是 i5-1240P", owner_id="u1")
-    notes2 = db.resident_blocks("u1")
-    check("无词条归属的条目不进常驻", "i5-1240P" not in _text(notes2))
+    # 归档层与常驻层互不牵连：归档写入不再进常驻，block 遗留列恒为空
+    cpu_id = db.add_memory("fact", "用户电脑 CPU 是 i5-1240P", owner_id="u1")
+    check("归档写入的 block 遗留列恒为空", db.memory_by_id(cpu_id)["block"] == "")
     fact_hits = db.search_memories("i5-1240P CPU", owner_id="u1", limit=3)
     check("fact 仍可被检索", any("i5-1240P" in m["content"] for m in fact_hits))
+    check("归档条目不进常驻",
+          "i5-1240P" not in str(db.get_resident("u1", "private")))
 
-    # 丢弃：退出活跃池，检索与常驻都看不到，可恢复
+    # 丢弃：退出活跃池，检索看不到，可恢复
     did = db.add_memory("preference", "临时指令条目", owner_id="u1")
     check("discard 生效", db.discard_memories([did]) == 1)
     check("丢弃后检索不到", all(m["id"] != did for m in
                                 db.search_memories("临时指令", owner_id="u1", limit=5)))
-    check("丢弃后常驻不含", did not in _ids(db.resident_blocks("u1")))
     n_active = db.conn.execute(
         "SELECT COUNT(*) c FROM memories WHERE id=? AND merged_into=-1", (did,)).fetchone()["c"]
     check("丢弃是软删（保留原文）", n_active == 1)
+    check("丢弃不碰常驻词条",
+          db.get_resident("u1", "private").get("user") == "在上海做后端工程师")
 
-    # 词条归属：写进词条才进常驻，一条记忆只能在一个层
-    pid = db.add_memory("fact", "关键约束：部署必须使用内网镜像源", owner_id="u1",
-                        block="rules")
-    check("写进词条即进常驻（哪怕是 fact）", pid in _ids(db.resident_blocks("u1")))
-    tight = db.resident_blocks("u1", limits={"rules": 10})
-    check("单条超上限时截断而不是丢弃",
-          bool(_items(tight, "rules")) and tight["rules"]["chars"] <= 10,
-          str(tight.get("rules", {}).get("chars")))
-    check("词条内的条目拒绝丢弃", db.discard_memories([pid]) == 0)
-    check("移出词条后不再常驻", db.set_memory_block(pid, "") is True
-          and pid not in _ids(db.resident_blocks("u1")))
-    check("移回词条后重新常驻", db.set_memory_block(pid, "rules") is True
-          and pid in _ids(db.resident_blocks("u1")))
-
-    # 合并守卫：常驻词条里的、已经并过的条目都不能被再并一次，
+    # 合并：已经并过的条目不能被再并一次，
     # 否则回滚链（merged_into）会被改写，误合并再也还原不了
-    m1 = db.add_memory("preference", "喜欢喝美式", owner_id="u1", block="preference")
-    m2 = db.add_memory("preference", "喝美式不加糖", owner_id="u1", block="preference")
-    check("常驻词条里的条目拒绝归档合并",
-          db.merge_memories([m1, m2], "喜欢喝美式不加糖") == 0)
-    db.set_memory_block(m1, "")
-    db.set_memory_block(m2, "")
+    m1 = db.add_memory("preference", "喜欢喝美式", owner_id="u1")
+    m2 = db.add_memory("preference", "喝美式不加糖", owner_id="u1")
     mid = db.merge_memories([m1, m2], "喜欢喝美式不加糖")
     check("正常合并产出新条", mid > 0, str(mid))
     m3 = db.add_memory("preference", "美式要加冰", owner_id="u1")
@@ -171,7 +183,7 @@ def main() -> int:
         r["id"] == mid and (r["visibility"] or "") in ("private", "group", "public")
         for r in db.all_active_memories()))
 
-    ids = _ids(db.resident_blocks("u1"))
+    ids = [r["id"] for r in db.all_memories(owner_id="u1", limit=50)]
     if ids:
         db.bump_hits(ids)
         db.bump_hits(ids)
@@ -281,48 +293,41 @@ def main() -> int:
     check("水位：oldest 不受已总结的旧消息影响",
           bool(sw.get("oldest")) and time.time() - float(sw["oldest"]) < 60, str(sw.get("oldest")))
 
-    # --- 词条生命周期：称呼只能有一个当前值
-    a = db.add_memory("preference", "以后叫我兄弟就行", owner_id="u7", block="address")
-    check("写进称呼词条", a in _ids(db.resident_blocks("u7")))
-    b = db.add_memory("preference", "以后喊我老爹", owner_id="u7", block="address")
-    # 改口走 supersede：旧条退出活跃池，新条顶上。不再有「同槽位自动顶替」的
-    # 隐式魔法——那套正则只认第一人称祈使句，对落库的第三人称转述 0 命中。
+    # --- 归档改口：称呼走 supersede 顶替；常驻词条是另一层，整段文本独立维护
+    a = db.add_memory("preference", "以后叫我兄弟就行", owner_id="u7")
+    b = db.add_memory("preference", "以后喊我老爹", owner_id="u7")
+    # 改口走 supersede：旧条退出活跃池，新条顶上。
     check("显式取代生效", db.supersede_memories([a], b) == 1)
-    rn_ids = _ids(db.resident_blocks("u7"))
-    check("常驻只剩新称呼", b in rn_ids and a not in rn_ids, str(rn_ids))
+    check("取代后旧条挂上新父", int(db.memory_by_id(a)["merged_into"]) == b,
+          str(db.memory_by_id(a)["merged_into"]))
     check("旧称呼检索不到", all(m["id"] != a for m in
                                 db.search_memories("兄弟", owner_id="u7", limit=5)))
-    c = db.add_memory("fact", "用户不吃辣", owner_id="u7", block="preference")
+    db.set_resident("u7", "private", "address", "老爹")
+    check("归档 supersede 不碰常驻词条",
+          db.get_resident("u7", "private").get("address") == "老爹")
+    db.set_resident("u7", "private", "preference", "不吃辣")
     check("不同词条互不影响",
-          db.memory_by_id(b)["block"] == "address"
-          and db.memory_by_id(c)["block"] == "preference")
+          db.get_resident("u7", "private").get("address") == "老爹"
+          and db.get_resident("u7", "private").get("preference") == "不吃辣")
 
     # --- 极性反转（改主意）也是一次取代，不能让两个相反偏好并存
-    e1 = db.add_memory("preference", "用户喜欢吃香蕉", owner_id="u10", block="preference")
+    e1 = db.add_memory("preference", "用户喜欢吃香蕉", owner_id="u10")
     e2, created_e = db.add_memory_smart("preference", "用户不喜欢吃香蕉",
-                                        owner_id="u10", block="preference")
+                                        owner_id="u10")
     check("极性反转识别为新建", created_e is True and e2 != e1, f"{e2},{created_e}")
     check("极性反转后旧条退场", int(db.memory_by_id(e1)["merged_into"]) == e2,
           str(db.memory_by_id(e1)["merged_into"]))
-    check("改主意后新条留在同一词条", db.memory_by_id(e2)["block"] == "preference",
-          str(db.memory_by_id(e2)["block"]))
+    check("改主意后新条留在归档层（block 遗留列为空）",
+          db.memory_by_id(e2)["block"] == "", str(db.memory_by_id(e2)["block"]))
     check("相反偏好检索只剩新条",
           all(m["id"] != e1 for m in db.search_memories("喜欢吃香蕉", owner_id="u10", limit=5)))
 
-    # --- 显式取代（replaces）与词条字数上限
-    d1 = db.add_memory("preference", "喜欢清淡口味", owner_id="u8", block="preference")
-    d2 = db.add_memory("preference", "现在喜欢重辣", owner_id="u8", block="preference")
+    # --- 显式取代（replaces）
+    d1 = db.add_memory("preference", "喜欢清淡口味", owner_id="u8")
+    d2 = db.add_memory("preference", "现在喜欢重辣", owner_id="u8")
     check("supersede_memories 生效", db.supersede_memories([d1], d2) == 1)
-    check("被取代的条目不在常驻", d1 not in _ids(db.resident_blocks("u8")))
-    # 词条是按字数卡的，不是按条数：塞再多条，超预算就丢最旧的
-    for i in range(8):
-        db.add_memory("fact", f"规则条目 {i} 号内容", owner_id="u9", block="rules")
-    tight9 = db.resident_blocks("u9", limits={"rules": 60})
-    check("词条超预算时只留最新几条",
-          tight9["rules"]["dropped"] > 0 and tight9["rules"]["chars"] <= 60,
-          str((tight9["rules"]["dropped"], tight9["rules"]["chars"])))
-    check("保留的是最新的", "规则条目 7" in tight9["rules"]["text"],
-          tight9["rules"]["text"][:40])
+    check("被取代的条目检索不到",
+          all(m["id"] != d1 for m in db.search_memories("清淡口味", owner_id="u8", limit=5)))
 
     # --- 召回门槛校准：正常中文问句不能被虚词稀释掉
     db.add_memory("fact", "上次部署卡在 Nginx 证书链不完整，报错 SSL_ERROR", owner_id="u11")
@@ -336,34 +341,25 @@ def main() -> int:
     # --- 跨场景同名内容：私聊 + 群各存一条，但每个场景只看得到自己那条
     # 合并它们才是错的：并进私聊那条，群里从此想不起来；并进群那条，私事被搬到群里。
     x1, _c1 = db.add_memory_smart("preference", "用户喜欢深色主题", owner_id="u12",
-                                  session_id="private:u12", block="preference")
+                                  session_id="private:u12")
     x2, c2 = db.add_memory_smart("preference", "用户喜欢深色主题", owner_id="u12",
-                                 session_id="group:G2", group_id="G2", block="preference")
+                                 session_id="group:G2", group_id="G2")
     check("私聊与群各自成条（不同可见性不合并）", c2 is True and x2 != x1, f"{x2},{c2}")
-    priv = [it for it in _items(db.resident_blocks("u12", allow_private=True), "preference")
-            if "深色" in it["content"]]
+    priv = [m for m in db.search_memories("深色主题", owner_id="u12", limit=5,
+                                          allow_private=True)
+            if "深色" in m["content"]]
     # 群场景必须带 group_id：可见性判定以「当前就在哪个群」为准
-    grp = [it for it in _items(db.resident_blocks("u12", allow_private=False, group_id="G2"),
-                               "preference")
-           if "深色" in it["content"]]
+    grp = [m for m in db.search_memories("深色主题", owner_id="u12", group_id="G2",
+                                         platform="", limit=5, allow_private=False)
+           if "深色" in m["content"]]
     check("私聊场景命中 private 那条", len(priv) == 1 and priv[0]["id"] == x1, str(priv))
-    check("群场景只命中 group 那条", len(grp) == 1 and grp[0]["id"] == x2, str(grp))
-
-    # --- 词条超预算保新：老的可以丢，刚说的必须在
-    for i in range(6):
-        oid = db.add_memory("preference", f"旧偏好条目 {i} 号", owner_id="u13",
-                            block="preference")
-        aged = time.time() - 400 * 86400
-        db.conn.execute("UPDATE memories SET importance=0.6, hits=10, ts=?,"
-                        " updated_ts=?, last_hit_ts=0 WHERE id=?", (aged, aged, oid))
-    db.conn.commit()
-    fresh = db.add_memory("preference", "现在喜欢新风格了", owner_id="u13",
-                          block="preference")
-    notes_u13 = db.resident_blocks("u13", limits={"preference": 40})
-    check("超预算时新偏好一定在（丢的是最旧的）",
-          fresh in _ids(notes_u13), str(_ids(notes_u13)))
-    check("最旧的那条被挤掉", "旧偏好条目 0" not in _text(notes_u13),
-          _text(notes_u13)[:50])
+    check("群场景命中 group 那条", any(m["id"] == x2 for m in grp), str(grp))
+    # 常驻同理：同一人的私聊词条与群词条各一套，场景键不同就互不可见
+    db.set_resident("u12", "private", "preference", "私聊里深色主题")
+    db.set_resident("u12", "group:G2", "preference", "群里深色主题")
+    check("常驻场景隔离：群词条不串进私聊",
+          db.get_resident("u12", "private").get("preference") == "私聊里深色主题"
+          and db.get_resident("u12", "group:G2").get("preference") == "群里深色主题")
 
     # --- 修剪只删已总结的原文
     db.add_message("sp", "user", "已总结的旧消息")
@@ -390,7 +386,7 @@ def main() -> int:
 
     # --- 可见性隔离：群场景绝不能读到私聊内容
     secret = db.add_memory("fact", "下周要去做手术，别在群里提", owner_id="u20",
-                           session_id="private:u20", block="user")
+                           session_id="private:u20")
     in_private = db.search_memories("手术", owner_id="u20", limit=5, allow_private=True)
     in_group = db.search_memories("手术", owner_id="u20", group_id="G20",
                                   platform="qq", limit=5, allow_private=False)
@@ -398,8 +394,11 @@ def main() -> int:
           str([m["id"] for m in in_private]))
     check("群场景召回不到私聊记忆", all(m["id"] != secret for m in in_group),
           str([m["id"] for m in in_group]))
-    check("群场景常驻不含私聊条目",
-          secret not in _ids(db.resident_blocks("u20", allow_private=False)))
+    db.set_resident("u20", "private", "user", "下周要做手术，别在群里提")
+    check("群场景常驻不含私聊词条（无 group:G20 场景）",
+          db.get_resident("u20", "group:G20") == {}
+          and db.get_resident("u20", "private").get("user"),
+          str(db.resident_owners()))
 
     # 显式公开的条目任何场景都可用
     pub = db.add_memory("profile", "用户是后端工程师，写 Python", owner_id="u20",
@@ -441,7 +440,7 @@ def main() -> int:
 
     # --- v0.12.17 可见性：group 只在来源群生效，不能按人跨群泄漏
     ga = db.add_memory("preference", "A群约定每周五交作业", owner_id="u30",
-                       group_id="GA", visibility="group", block="preference")
+                       group_id="GA", visibility="group")
     gb_hits = db.search_memories("每周五交作业", owner_id="u30", group_id="GB",
                                  platform="p", allow_private=False)
     check("跨群不召回他群 group 记忆",
@@ -450,10 +449,11 @@ def main() -> int:
                                  platform="p", allow_private=False)
     check("本群可召回 group 记忆",
           any(r["id"] == ga for r in ga_hits), str([r["id"] for r in ga_hits]))
-    check("跨群常驻不含他群 group 记忆",
-          ga not in _ids(db.resident_blocks("u30", allow_private=False, group_id="GB")))
-    check("本群常驻包含 group 记忆",
-          ga in _ids(db.resident_blocks("u30", allow_private=False, group_id="GA")))
+    db.set_resident("u30", "group:GA", "rules", "每周五交作业")
+    check("常驻按群隔离：他群场景读不到本群词条",
+          db.get_resident("u30", "group:GB") == {}
+          and db.get_resident("u30", "group:GA").get("rules") == "每周五交作业",
+          str(db.resident_owners()))
     pub = db.add_memory("preference", "公开偏好喝美式", owner_id="u30",
                         group_id="GA", visibility="public")
     check("public 记忆在其他群仍可见",
@@ -509,13 +509,12 @@ def main() -> int:
     check("无身份时检索不到他人 private",
           not any(r["id"] == dm_priv for r in db.search_memories(
               "私聊说过的生日", owner_id="", allow_private=True)))
-    db.set_memory_block(dm_priv, "user")
-    check("无身份时常驻不含他人 private",
-          dm_priv not in _ids(db.resident_blocks("", allow_private=True)))
+    db.set_resident("u30", "private", "user", "生日是六月")
+    check("无身份时读不到任何常驻（fail-closed）",
+          db.get_resident("", "private") == {})
     check("有身份时本人才看得到自己的常驻",
-          dm_priv in _ids(db.resident_blocks(
-              db.memory_by_id(dm_priv)["owner_id"], allow_private=True)))
-    db.set_memory_block(dm_priv, "")
+          db.get_resident("u30", "private").get("user") == "生日是六月"
+          and db.get_resident("u31", "private") == {})
 
     # --- v0.12.17 删除合并父条不能把子条永久悬空
     c1 = db.add_memory("fact", "子条一", owner_id="u50")
@@ -603,21 +602,17 @@ def main() -> int:
     check("活跃会话水位保留", db.get_meta("summarized:s1") == "5",
           db.get_meta("summarized:s1"))
 
-    # --- 常驻词条同样 fail-closed：判不出查看者就不放行 private
+    # --- 常驻词条按 owner 隔离：换个人一条都拿不到；整段改写覆盖旧文本
     p_owner = "u_pin_order"
-    db.add_memory("fact", "老条目一", owner_id=p_owner, visibility="private",
-                  block="rules")
-    old_p = db.add_memory("fact", "老条目二", owner_id=p_owner, visibility="private",
-                          block="rules")
-    new_p = db.add_memory("fact", "新条目", owner_id=p_owner, visibility="private",
-                          block="rules")
-    mine = _ids(db.resident_blocks(p_owner, allow_private=True))
+    db.set_resident(p_owner, "private", "rules", "老规则文本")
     check("本人能读到自己的常驻词条",
-          set(mine) >= {old_p, new_p}, str(mine))
-    # 换个人读：owner 不匹配，一条都拿不到
+          db.get_resident(p_owner, "private").get("rules") == "老规则文本")
     check("读不到别人的常驻词条",
-          not (set(_ids(db.resident_blocks("u_other", allow_private=True)))
-               & {old_p, new_p}))
+          db.get_resident("u_other", "private") == {})
+    check("整段改写覆盖旧文本",
+          db.set_resident(p_owner, "private", "rules", "新规则文本") is True
+          and db.get_resident(p_owner, "private").get("rules") == "新规则文本"
+          and db.resident_count() == sum(o["count"] for o in db.resident_owners()))
 
     # --- v0.12.21 短 query 门槛：3 个实词只命中 1 个不该被硬编码的 0.5 砍掉
     q_docs = [{"id": 1, "content": "证书续期的处理办法要记下来", "kind": "fact"},
@@ -643,23 +638,6 @@ def main() -> int:
     check("连续追问注入量不低于半数", min(counts) >= 3, str(counts))
     check("重复抑制会轮转，不饿死后排记忆", len(touched) >= 4, str(sorted(touched)))
     check("首次注入仍给满", counts[0] == 5, str(counts[0]))
-
-    # --- v0.12.21 常驻排序：新鲜度主导，久未碰的老画像不能靠 kind 霸占席位
-    sort_owner = "u_res_sort"
-    for i in range(6):
-        db.add_memory("profile", f"久未更新的老画像第{i}条说明文字",
-                      owner_id=sort_owner, visibility="private")
-    aged = time.time() - 300 * 86400
-    with db._lock:
-        db.conn.execute("UPDATE memories SET importance=0.9, ts=?, updated_ts=?,"
-                        " last_hit_ts=? WHERE owner_id=?",
-                        (aged, aged, aged, sort_owner))
-        db.conn.commit()
-    fresh_pref = db.add_memory("preference", "用户刚说以后回答都要一句话讲完",
-                               owner_id=sort_owner, visibility="private",
-                               block="style")
-    res_ids = _ids(db.resident_blocks(sort_owner, limits={"style": 4000}))
-    check("新偏好能进常驻风格词条", fresh_pref in res_ids, str(res_ids))
 
     # --- v0.12.21 去重池：visible=private/public 不受 group_id 限制，group 仍按群隔离
     dedup_owner = "u_dedup_scope"
@@ -714,55 +692,78 @@ def main() -> int:
     check("撤销祖父可一次恢复全部来源条", db.unmerge(ce) >= 3,
           str([int(db.memory_by_id(x)["merged_into"]) for x in (c1, c2, cd)]))
 
-    # --- 常驻的写入权限：后台只进归档，前台才能在对话里改
-    #
-    # 这是 v1.1.1 的核心约束：常驻内容只能由对话轮次里的模型更新。
-    # 后台总结/归位/整理都没有权限让它退场，否则「我毕业了」这类一次性
-    # 陈述会被一段没有上下文的总结稿拿去覆盖用户画像。
+    # --- 归档与常驻两层独立：supersede 只动归档条目，词条文本不受牵连
     r1 = db.add_memory("profile", "用户是某大学在校生", owner_id="u50",
-                       visibility="private", block="user")
+                       visibility="private")
     arch = db.add_memory("profile", "用户 2026 年 6 月毕业", owner_id="u50",
                          visibility="private")
-    check("后台顶替常驻无效", db.supersede_archived([r1], arch) == 0)
-    check("常驻条目仍在", r1 in _ids(db.resident_blocks("u50")))
-    check("后台顶替归档有效", db.supersede_archived([arch], r1) == 1)
-    check("归档条目已退场",
-          int(db.memory_by_id(arch)["merged_into"] or 0) != 0)
+    db.set_resident("u50", "private", "user", "某大学在校生")
+    check("supersede 只作用于归档条目", db.supersede_memories([r1], arch) == 1)
+    check("被顶替的归档条目已退场",
+          int(db.memory_by_id(r1)["merged_into"] or 0) != 0)
+    check("supersede 不碰常驻词条",
+          db.get_resident("u50", "private").get("user") == "某大学在校生")
 
-    # 前台路径（save_memory 走的就是它）：新条进词条，旧条退场
+    # 归档写入不再挂词条；同义内容在归档池照常去重
     r3, made = db.add_memory_smart(
         "profile", "用户已毕业，2026 年 6 月拿到学位", scope="user",
-        source="llm_tool", owner_id="u50", visibility="private",
-        block="user", prefer_new=True)
-    check("前台写入落进词条", made is True and db.memory_by_id(r3)["block"] == "user")
-    check("前台可以顶掉旧常驻", db.supersede_memories([r1], r3) == 1)
-    rn50 = _text(db.resident_blocks("u50"))
-    check("常驻只剩新说法", "在校生" not in rn50 and "已毕业" in rn50, rn50)
-
-    # 归档写入不能把与常驻同义的内容再存一份
+        source="llm_tool", owner_id="u50", visibility="private", prefer_new=True)
+    check("前台写入落进归档层（block 遗留列为空）",
+          made is True and db.memory_by_id(r3)["block"] == "")
     dup, cdup = db.add_memory_smart(
         "profile", "用户已毕业，2026 年 6 月拿到学位", scope="user",
         source="auto_summary", owner_id="u50", visibility="private")
-    check("后台重复记录被常驻吸收", cdup is False and dup == r3, f"{dup},{cdup}")
+    check("后台重复记录被归档去重吸收", cdup is False and dup == r3, f"{dup},{cdup}")
 
-    # --- 本地规则归位（模型不可用时的兜底）
-    from modules.db import guess_block_local as _guess
-    cases = [
-        ("用户希望助手称呼他为哥哥", "address"),
-        ("用户希望被称呼为兄弟", "address"),
-        ("不喜欢太长的总结，希望以后简短、只讲重点。", "style"),
-        ("要求回复简短精炼，仅保留核心要点", "style"),
-        ("用户电脑为 Windows 11，CPU i5-1240P，平时一直插电使用。", "user"),
-        ("多步骤任务或有副作用的操作前，先简要说明意图", "rules"),
-        ("偏好以「小土豆」身份互动，热衷土豆扮演", "assistant"),
-        ("用户喜欢吃葡萄", "preference"),
-        # 删除指令、纯事件不该进常驻：认不出就留归档层
-        ("用户要求删除此条，不再关注儿童上网安全", ""),
-        ("2026-11-06 修好了召回双路融合", ""),
-    ]
-    for text, want in cases:
-        got = _guess(text)
-        check(f"规则归位：{text[:16]}", got == want, f"{got!r} != {want!r}")
+    # --- v1.2.0 一次性迁移：memories.block 条目 → resident 表六词条文本
+    #
+    # 全新库首次建表时迁移已在空 memories 上跑过并写了 resident_text_v1 标记，
+    # 要模拟旧库必须先删标记、插旧式行，再重开库触发迁移。
+    mdir = os.path.join(tmp, "resident_mig")
+    os.makedirs(mdir, exist_ok=True)
+    m0 = HermesDB(mdir, "m.db")
+    m0.conn.execute("DELETE FROM meta WHERE key = 'resident_text_v1'")
+
+    def _old_row(owner, gid, vis, blk, content):
+        m0.conn.execute(
+            "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
+            " session_id, platform, group_id, visibility, block)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), "preference", "user", content, "test", owner,
+             "", "qq", gid, vis, blk))
+
+    _old_row("um1", "", "private", "preference", "喜欢喝美式")
+    _old_row("um1", "", "private", "preference", "喜欢喝美式")   # 近重复，应被去重
+    _old_row("um1", "", "private", "preference", "喝美式不加糖")
+    _old_row("um1", "G7", "group", "rules", "本群只聊工作")
+    _old_row("um1", "", "public", "address", "喊我哥们")
+    _old_row("", "", "public", "rules", "无归属老条目")
+    _old_row("um2", "", "private", "user", "设计师")
+    m0.conn.commit()
+    m0.close()
+    m1db = HermesDB(mdir, "m.db")            # 重开：触发迁移
+    mig1 = m1db.get_resident("um1", "private")
+    check("迁移：近重复聚合为一段文本",
+          mig1.get("preference") == "喜欢喝美式；喝美式不加糖", str(mig1))
+    check("迁移：public 场景归回私聊层", mig1.get("address") == "喊我哥们", str(mig1))
+    check("迁移：群场景写进 group:<gid>",
+          m1db.get_resident("um1", "group:G7").get("rules") == "本群只聊工作",
+          str(m1db.resident_owners()))
+    check("迁移：无归属条目不挂任何人词条",
+          m1db.get_resident("", "private") == {})
+    left_blk = m1db.conn.execute(
+        "SELECT COUNT(*) c FROM memories WHERE COALESCE(block, '') != ''"
+    ).fetchone()["c"]
+    check("迁移：原行 block 全部清空", left_blk == 0, str(left_blk))
+    n_act = m1db.conn.execute(
+        "SELECT COUNT(*) c FROM memories WHERE merged_into = 0").fetchone()["c"]
+    check("迁移：原行保留在归档层（退回归档）", n_act == 7, str(n_act))
+    m1db.close()
+    m2db = HermesDB(mdir, "m.db")            # 再开一次：幂等
+    check("迁移：幂等重跑不重复写入",
+          m2db.get_resident("um1", "private").get("preference") == "喜欢喝美式；喝美式不加糖"
+          and m2db.resident_count() == 4, str(m2db.resident_count()))
+    m2db.close()
 
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")

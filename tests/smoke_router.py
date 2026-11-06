@@ -299,8 +299,10 @@ async def case_cooldown_floor() -> None:
     r = make_router({"llm_rpm": 0, "llm_min_interval": 0.0,
                      "llm_cooldown_seconds": 5}, {"a": a, "b": b})
     await r.chat("hi")
+    # cooldown_left 用 int() 向下取整：刚设完 120s 冷却立刻读也只能拿到 119，
+    # 断言留 1 秒取整容差，仍能证明下限是 120 量级而不是被 5 秒配置架空。
     left = r.cooldown_left("a")
-    check("cooldown=5 时限流仍冷却 >=120s", left >= 120, f"{left}s")
+    check("cooldown=5 时限流仍冷却 >=120s", left >= 119, f"{left}s")
 
     a2 = FakeProvider("a", [TimeoutError("request timeout")])
     r2 = make_router({"llm_rpm": 0, "llm_min_interval": 0.0,
@@ -311,7 +313,7 @@ async def case_cooldown_floor() -> None:
     except ModelError:
         pass
     left2 = r2.cooldown_left("a")
-    check("cooldown=5 时超时仍冷却 >=90s", left2 >= 90, f"{left2}s")
+    check("cooldown=5 时超时仍冷却 >=90s", left2 >= 89, f"{left2}s")
 
 
 async def case_soft_deadline() -> None:

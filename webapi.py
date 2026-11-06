@@ -32,9 +32,8 @@ PLUGIN_NAME = "astrbot_plugin_hermes_core"
 
 # 配置项分组：只影响页面上的展示顺序
 CONFIG_GROUPS: list[tuple[str, tuple[str, ...]]] = [
-    ("记忆注入", ("memory_injection", "memory_scope", "per_user_history",
+    ("记忆注入", ("memory_injection", "memory_scope",
                   "group_private_memory", "exclusive_memory",
-                  "inject_memories_topk", "inject_history_topk",
                   "recall_scan_limit")),
     ("自动总结", ("auto_summarize", "summarize_interval_minutes",
                   "min_new_messages", "summarize_grace_hours")),
@@ -93,12 +92,16 @@ class HermesWebAPI:
             (f"{self.prefix}/memories", self.memories, ["GET"], "记忆列表（筛选+分页）"),
             (f"{self.prefix}/memories/add", self.memory_add, ["POST"], "新增记忆"),
             (f"{self.prefix}/memories/update", self.memory_update, ["POST"], "修改记忆"),
-            (f"{self.prefix}/memories/block", self.memory_block, ["POST"],
-             "把记忆移入/移出常驻词条"),
             (f"{self.prefix}/memories/visibility", self.memory_visibility, ["POST"],
              "设置记忆可见范围（私聊/群/公开）"),
             (f"{self.prefix}/memories/delete", self.memory_delete, ["POST"], "删除记忆"),
             (f"{self.prefix}/memories/merge", self.memory_merge, ["POST"], "合并多条记忆"),
+            (f"{self.prefix}/resident", self.resident, ["GET"],
+             "某用户某场景的六个常驻词条文本（含字数上限）"),
+            (f"{self.prefix}/resident/save", self.resident_save, ["POST"],
+             "整段改写/清空一个常驻词条"),
+            (f"{self.prefix}/resident/owners", self.resident_owners, ["GET"],
+             "有常驻词条的用户与场景清单"),
             (f"{self.prefix}/skills", self.skills, ["GET"], "技能列表（含正文）"),
             (f"{self.prefix}/skills/save", self.skill_save, ["POST"], "新建/修改技能"),
             (f"{self.prefix}/skills/delete", self.skill_delete, ["POST"], "删除技能"),
@@ -315,8 +318,6 @@ class HermesWebAPI:
             group_id=str(data.get("group_id") or ""),
             visibility=str(data.get("visibility") or ""),
         )
-        # 常驻块有 60 秒缓存：新增的画像/偏好不清缓存就最多晚 60 秒才注入。
-        self.plugin._resident_cache.clear()
         return json_response({"id": mid})
 
     async def memory_visibility(self):
@@ -331,7 +332,6 @@ class HermesWebAPI:
         ok = self.plugin.db.set_visibility(mid, vis)
         if not ok:
             return self._fail("记忆不存在或已失效", 404)
-        self.plugin._resident_cache.clear()
         return json_response({"id": mid, "visibility": vis})
 
     async def memory_update(self):
@@ -354,29 +354,7 @@ class HermesWebAPI:
         ok = self.plugin.db.update_memory(mid, content, None if kind is None else str(kind))
         if not ok:
             return self._fail("记忆不存在或没有改动", 404)
-        # 改了正文/类型后，缓存里的旧内容还会被注入最多 60 秒
-        self.plugin._resident_cache.clear()
         return json_response({"id": mid, "record": self.plugin.db.memory_by_id(mid)})
-
-    async def memory_block(self):
-        """把一条记忆挪进某个常驻词条，或挪回归档层（block 传空串）。
-
-        面板上的「归位」入口：模型偶尔会把常驻内容写进归档层，或者把一条
-        具体事件塞进常驻，这里让用户能手工纠正，不用去改数据库。
-        """
-        data = await self._body()
-        try:
-            mid = int(data.get("id"))
-        except (TypeError, ValueError):
-            return self._fail("缺少记忆 id")
-        block = str(data.get("block") or "").strip().lower()
-        if block and block not in self.plugin.db.RESIDENT_BLOCK_TITLES:
-            return self._fail("未知的词条")
-        ok = self.plugin.db.set_memory_block(mid, block)
-        if not ok:
-            return self._fail("记忆不存在或已失效", 404)
-        self.plugin._resident_cache.clear()
-        return json_response({"id": mid, "block": block})
 
     async def memory_delete(self):
         data = await self._body()
@@ -388,8 +366,6 @@ class HermesWebAPI:
         if ok:
             queue = [i for i in self.plugin._pending_memory_ids() if i != mid]
             self.plugin.db.set_meta("consolidate_pending_memories", json.dumps(queue))
-            # 删掉的条目若还在缓存里，接下来 60 秒会继续注入一条幽灵记忆
-            self.plugin._resident_cache.clear()
         return json_response({"deleted": bool(ok)})
 
     async def memory_merge(self):
@@ -422,9 +398,69 @@ class HermesWebAPI:
             return self._fail("合并失败", 500)
         queue = [i for i in self.plugin._pending_memory_ids() if i not in set(ids)]
         self.plugin.db.set_meta("consolidate_pending_memories", json.dumps(queue))
-        # 旧条退出活跃池、新条产生：常驻缓存必须跟着失效
-        self.plugin._resident_cache.clear()
         return json_response({"id": new_id})
+
+    # ---------- 常驻词条 ----------
+
+    async def resident_owners(self):
+        """有常驻条目的用户清单（面板下拉用），按条数降序。"""
+        return json_response({"owners": self.plugin.db.resident_owners()})
+
+    async def resident(self):
+        """某用户某场景的六个常驻词条（含空词条），供面板渲染六个文本框。"""
+        owner = (request.query.get("owner_id") or "").strip()
+        if not owner:
+            return self._fail("缺少 owner_id")
+        scope = (request.query.get("scope") or "private").strip()
+        if scope != "private" and not scope.startswith("group:"):
+            return self._fail("scope 只能是 private 或 group:<群号>")
+        limits = self.plugin._resident_limits()
+        texts = self.plugin.db.get_resident(owner, scope)
+        blocks = []
+        for block, title in self.plugin.db.RESIDENT_BLOCKS:
+            text = texts.get(block, "")
+            blocks.append({
+                "block": block,
+                "title": title,
+                "limit": int(limits.get(block, 0)),
+                "text": text,
+                "chars": len(text),
+            })
+        return json_response({"owner_id": owner, "scope": scope, "blocks": blocks})
+
+    async def resident_save(self):
+        """整段改写/清空一个常驻词条（空文本=清空）。"""
+        data = await self._body()
+        owner = str(data.get("owner_id") or "").strip()
+        if not owner:
+            return self._fail("缺少 owner_id")
+        scope = str(data.get("scope") or "private").strip()
+        if scope != "private" and not scope.startswith("group:"):
+            return self._fail("scope 只能是 private 或 group:<群号>")
+        raw_block = str(data.get("block") or "").strip()
+        bid = ""
+        for b, t in self.plugin.db.RESIDENT_BLOCKS:
+            if raw_block.lower() == b or raw_block == t:
+                bid = b
+                break
+        if not bid:
+            return self._fail(f"未知词条：{raw_block}，只能是 "
+                              + "、".join(f"{b}（{t}）"
+                                          for b, t in self.plugin.db.RESIDENT_BLOCKS))
+        text = self.plugin._sanitize_memory(str(data.get("text") or ""))
+        title = self.plugin.db.RESIDENT_BLOCK_TITLES.get(bid, bid)
+        if text and self.plugin._looks_like_injection(text):
+            return self._fail(f"「{title}」文本含指令式语句（想改写规则或身份），"
+                              "词条每轮注入，不能这样写")
+        limit = int(self.plugin._resident_limits().get(bid, 0))
+        if text and len(text) > limit:
+            return self._fail(f"「{title}」超出字数上限 {limit}"
+                              f"（当前 {len(text)} 字），请精简")
+        if not self.plugin.db.set_resident(owner, scope, bid, text):
+            return self._fail("写入失败", 500)
+        self.plugin._clear_resident(owner)
+        return json_response({"owner_id": owner, "scope": scope,
+                              "block": bid, "chars": len(text)})
 
     # ---------- 技能 ----------
 

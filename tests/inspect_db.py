@@ -119,7 +119,8 @@ def cross_group_probe(db_path: str) -> list:
     if not kw:
         return ["（条目正文为空，跳过）"]
 
-    HermesDB = db_module().HermesDB  # 延迟导入：只在需要真正检索时加载
+    dmod = db_module()  # 延迟导入：只在需要真正检索时加载
+    HermesDB, resident_scope = dmod.HermesDB, dmod.resident_scope
 
     db = HermesDB(os.path.dirname(db_path))
     try:
@@ -128,14 +129,17 @@ def cross_group_probe(db_path: str) -> list:
             hit = [m["id"] for m in db.search_memories(
                 kw, owner_id=r0["owner_id"], group_id=gid,
                 allow_private=False, limit=50)]
-            blocks = db.resident_blocks(
-                r0["owner_id"], group_id=gid, allow_private=False)
-            rids = [it["id"] for info in blocks.values() for it in info["items"]]
-            lines.append(f"  {label} 检索 {hit[:8]} / 常驻 {rids[:8]}")
+            notes = db.get_resident(r0["owner_id"], resident_scope(gid))
+            lines.append(f"  {label} 检索 {hit[:8]} / 常驻词条 " +
+                         "；".join(f"{b}:{t[:20]}" for b, t in notes.items())[:160])
         anon = [m["id"] for m in db.search_memories(
             kw, owner_id="", group_id="", allow_private=True, limit=50)
             if (m.get("visibility") or "") == "private"]
         lines.append(f"  无身份时命中的 private 条目 {anon[:8]}（应为空）")
+        for o in db.resident_owners():
+            texts = db.get_resident(o["owner_id"], o["scope"])
+            lines.append(f"  常驻 {o['owner_id']}@{o['scope']}（{o['count']} 词条） " +
+                         "；".join(f"{b}:{t[:20]}" for b, t in texts.items())[:160])
         return lines
     finally:
         db.close()

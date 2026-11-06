@@ -82,8 +82,8 @@ def make_plugin(db: HermesDB):
                  "_queue_memories", "_pending_memory_ids",
                  "_requeue_after_consolidate",
                  "_resident_block", "_resident_limits",
-                 "_build_context_block", "_expand_query", "_bump_metric",
-                 "_inject_item", "_render_resident",
+                 "_build_context_block", "_bump_metric",
+                 "_render_resident",
                  "tool_save_memory", "tool_search_memory"):
         fn = getattr(m.HermesCore, name)
         # staticmethod 不能 MethodType 绑定——绑定后调用会多传一个 self。
@@ -137,10 +137,9 @@ def main() -> int:
     r = asyncio.run(p.tool_save_memory(ev, content="替换不可见条目", replaces=unseen))
     check("replaces 不可见编号：拒绝且明确告知", "不在本会话" in r, r)
 
-    # ---- save_memory：正常 replaces 必须真的顶掉旧条，并继承词条 ----
+    # ---- save_memory：正常 replaces 必须真的顶掉旧条 ----
     print("== save_memory 的 replaces 正常路径 ==")
-    old_c = db.add_memory("preference", "叫我兄弟", owner_id="u1", visibility="private",
-                          block="address")
+    old_c = db.add_memory("preference", "叫我兄弟", owner_id="u1", visibility="private")
     mark_seen(old_c)
     r = asyncio.run(p.tool_save_memory(ev, content="叫我老爹", kind="preference",
                                        replaces=old_c))
@@ -149,43 +148,42 @@ def main() -> int:
           int(db.memory_by_id(old_c)["merged_into"] or 0) != 0)
     rows_new = [row for row in db.all_memories(owner_id="u1")
                 if row["content"] == "叫我老爹"]
-    check("正常 replaces：新条留在同一词条",
-          bool(rows_new) and rows_new[0]["block"] == "address",
+    check("正常 replaces：新条留在归档层（block 遗留列为空）",
+          bool(rows_new) and rows_new[0]["block"] == "",
           str(rows_new[0]["block"]) if rows_new else "没找到新条")
 
-    # ---- save_memory 的词条参数 ----
-    print("== save_memory 的词条参数 ==")
-    r = asyncio.run(p.tool_save_memory(ev, content="测试内容", block="nope"))
-    check("未知词条被拒并列出可选值", "未知词条" in r and "address" in r, r)
+    # ---- save_memory 只写归档：常驻词条不受牵连 ----
+    print("== save_memory 只写归档 ==")
+    db.set_resident("u1", "private", "preference", "喜欢喝冰美式")
     r = asyncio.run(p.tool_save_memory(ev, content="用户喜欢喝冰美式",
-                                       kind="preference", block="preference"))
-    check("写进词条：回执点名词条", "用户偏好" in r and "每轮" in r, r)
+                                       kind="preference"))
+    check("save_memory 回执是归档而非常驻", "已保存归档记忆" in r and "每轮" not in r, r)
     rows_b = [row for row in db.all_memories(owner_id="u1")
               if row["content"] == "用户喜欢喝冰美式"]
-    check("写进词条：落库带 block",
-          bool(rows_b) and rows_b[0]["block"] == "preference",
+    check("save_memory 落库 block 恒为空（legacy 列）",
+          bool(rows_b) and not rows_b[0]["block"],
           str(rows_b[0]["block"]) if rows_b else "没落库")
-    r = asyncio.run(p.tool_save_memory(ev, content="用户在做一个记忆插件项目"))
-    check("不填词条：落进归档层", "每轮" not in r, r)
-    rows_a = [row for row in db.all_memories(owner_id="u1")
-              if row["content"] == "用户在做一个记忆插件项目"]
-    check("不填词条：block 为空",
-          bool(rows_a) and not rows_a[0]["block"])
+    check("save_memory 不改动常驻词条",
+          db.get_resident("u1", "private").get("preference") == "喜欢喝冰美式")
 
     # ---- 常驻词条：读取与渲染 ----
     print("== 常驻词条 ==")
-    blocks = p._resident_block("u1", allow_private=True)
-    check("词条按归属聚合", "preference" in blocks and any(
-        "冰美式" in it["content"] for it in blocks["preference"]["items"]),
-        str(list(blocks)))
+    db.set_resident("u1", "private", "address", "哥哥")
+    db.set_resident("u1", "private", "style", "回答一句话讲完")
+    blocks = p._resident_block("u1", "private")
+    check("词条按（人，场景）聚合为纯文本",
+          blocks.get("preference") == "喜欢喝冰美式"
+          and blocks.get("address") == "哥哥", str(list(blocks)))
     lines = m.HermesCore._render_resident(blocks)
     check("渲染成一行一个词条",
-          any(x.startswith("- 用户偏好：") for x in lines), str(lines[:2]))
-    check("渲染带编号（改口要靠它定位）",
-          bool(lines) and all("（#" in x for x in lines), str(lines[:1]))
+          "- 用户偏好：喜欢喝冰美式" in lines and "- 称呼：哥哥" in lines, str(lines))
+    check("渲染不带编号", all("#" not in x for x in lines), str(lines[:1]))
+    check("渲染按六词条固定顺序",
+          [x.split("：")[0] for x in lines] == ["- 称呼", "- 用户偏好", "- 回复风格"],
+          str(lines))
     check("空词条不产生空行", all(not x.endswith("：") for x in lines), str(lines))
-    check("别的用户读不到这份常驻",
-          p._resident_block("u_other", allow_private=True) == {})
+    check("别的用户读不到这份常驻", p._resident_block("u_other", "private") == {})
+    check("别的场景读不到这份常驻", p._resident_block("u1", "group:G9") == {})
 
     # ---- 变更信号：用户说「我自己的情况变了」时要提示模型更新常驻 ----
     print("== 状态变更信号 ==")
@@ -196,22 +194,14 @@ def main() -> int:
               "这个 bug 怎么修", "画一张关系图", "我电脑是什么系统"):
         check(f"不误触发：{q}", not m._state_change_signal(q), q)
 
-    # ---- 同词条已有条目时，回执要点出「该替换而不是并存」 ----
-    print("== 同词条更新提醒 ==")
-    r = asyncio.run(p.tool_save_memory(ev, content="用户偏好中文简短回复",
-                                       kind="preference", block="style"))
-    check("首条不提醒替换", "该词条还有" not in r, r)
-    r = asyncio.run(p.tool_save_memory(ev, content="用户偏好英文回复",
-                                       kind="preference", block="style"))
-    check("第二条起提醒可替换旧说法", "该词条还有" in r and "replaces" in r, r)
-    check("提醒里带上旧条编号",
-          any(f"#{row['id']}" in r for row in db.all_memories(owner_id="u1")
-              if row["content"] == "用户偏好中文简短回复"), r)
-
     # ---- 注入块：常驻由对话里的模型维护，这一授权必须每轮送达 ----
     print("== 注入块 ==")
+    p._clear_resident()
     blk = p._build_context_block(ev, "我电脑是什么系统", None)
-    check("注入块带常驻维护授权", "由你维护" in blk, blk[:160])
+    check("注入块带常驻维护授权", "维护约定" in blk and "update_resident" in blk,
+          blk[:160])
+    check("注入块带六词条行", "- 称呼：哥哥" in blk and "- 用户偏好：喜欢喝冰美式" in blk,
+          blk[:200])
     check("普通问题不追加变更提示", "情况变了" not in blk)
     blk2 = p._build_context_block(ev, "我上周毕业了", None)
     check("陈述变化时追加更新指令",
@@ -241,7 +231,7 @@ def main() -> int:
     check("被跳过时队列原样保留（不清空）",
           q1 in p._pending_memory_ids(), str(p._pending_memory_ids()))
 
-    # ---- WebUI 写记忆后必须让常驻缓存失效（60 秒缓存会注入幽灵/旧内容）----
+    # ---- WebUI 写归档不再动常驻缓存；写词条必须让缓存失效 ----
     print("== WebUI 记忆管理与常驻缓存 ==")
     import webapi as wa
 
@@ -253,14 +243,14 @@ def main() -> int:
     wa.HermesWebAPI._body = staticmethod(fake_body)
     wap = types.SimpleNamespace(
         db=db, _resident_cache={}, config=None,
+        _get_cfg=lambda k, d=None: d,
         _sanitize_memory=m.HermesCore._sanitize_memory,
         _looks_like_injection=m.HermesCore._looks_like_injection,
         _pending_memory_ids=lambda: [],
     )
+    for name in ("_resident_limits", "_clear_resident", "_resident_block"):
+        setattr(wap, name, types.MethodType(getattr(m.HermesCore, name), wap))
     api = wa.HermesWebAPI(wap)
-
-    def seed_cache():
-        wap._resident_cache[("u1", True, "")] = (time.time(), [{"id": 1}])
 
     def api_add(text):
         payload.clear()
@@ -268,30 +258,35 @@ def main() -> int:
                         "scope": "user", "kind": "preference"})
         return json.loads(asyncio.run(api.memory_add()).body)["id"]
 
-    seed_cache()
+    wap._resident_cache[("u1", "private")] = (time.time(), {"stale": 1})
     wa_a = api_add("WebUI 新增的记忆甲内容")
-    check("memory_add 后常驻缓存失效", not wap._resident_cache)
-    seed_cache()
+    check("memory_add 只写归档：不触发常驻缓存失效",
+          ("u1", "private") in wap._resident_cache)
     wa_b = api_add("WebUI 新增的记忆乙内容")
-    wap._resident_cache.clear()
-
-    seed_cache()
     payload.clear()
     payload.update({"id": wa_a, "content": "WebUI 改过的记忆甲内容"})
     asyncio.run(api.memory_update())
-    check("memory_update 后常驻缓存失效", not wap._resident_cache)
-
-    seed_cache()
     payload.clear()
     payload.update({"ids": [wa_a, wa_b], "content": "WebUI 合并后的记忆"})
     asyncio.run(api.memory_merge())
-    check("memory_merge 后常驻缓存失效", not wap._resident_cache)
-
-    seed_cache()
     payload.clear()
     payload.update({"id": wa_b})
     asyncio.run(api.memory_delete())
-    check("memory_delete 后常驻缓存失效", not wap._resident_cache)
+    check("归档增删改全程不碰常驻缓存",
+          ("u1", "private") in wap._resident_cache)
+
+    wap._resident_cache.clear()
+    db.set_resident("u1", "private", "user", "缓存里的旧文本")
+    wap._resident_block("u1", "private")          # 预热缓存
+    payload.clear()
+    payload.update({"owner_id": "u1", "scope": "private",
+                    "block": "user", "text": "WebUI 改过的词条文本"})
+    wap._resident_cache[("u1", "private")] = (time.time(), {"stale": 1})
+    asyncio.run(api.resident_save())
+    check("resident_save 后该（人，场景）缓存失效",
+          ("u1", "private") not in wap._resident_cache)
+    check("清缓存后读到新文本",
+          wap._resident_block("u1", "private").get("user") == "WebUI 改过的词条文本")
 
     # ---- 注入守卫窗口：旧值 300 秒会让重复提问整体失忆 ----
     print("== 注入守卫窗口 ==")

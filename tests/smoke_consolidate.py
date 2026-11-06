@@ -306,17 +306,15 @@ async def case_deep_bucket_count(tmp: str) -> None:
           and c2.get(UB) == 30 and c2.get(G1) == 20, str(c2))
 
     core._set_deep_watermarks({})
-    with core.db._lock:
-        core.db.conn.execute("UPDATE memories SET block = 'rules' WHERE id = 1")
-        core.db.conn.commit()
     c3 = core._deep_pending_by_bucket()
-    check("常驻词条条目不计入待整理", c3.get(UA) == 59, str(c3.get(UA)))
+    check("水位清空后计数复原", c3.get(UA) == 60, str(c3.get(UA)))
 
     ids = [r["id"] for r in core.db.all_active_memories()
-           if (r["owner_id"] or "") == "UA" and not (r["block"] or "")][:20]
+           if (r["owner_id"] or "") == "UA"][:20]
     core.db.merge_memories(ids, "用户甲的偏好汇总", "fact")
     c4 = core._deep_pending_by_bucket()
-    check("被合并的记忆不再撑高计数", c4.get(UA) == 40, str(c4.get(UA)))
+    # 20 条退场、合并产物 1 条进场
+    check("被合并的记忆不再撑高计数", c4.get(UA) == 41, str(c4.get(UA)))
 
 
 async def case_deep_bucket_cross_group(tmp: str) -> None:
