@@ -8,6 +8,7 @@
     D:/Local/AstrBot/backend/python/python.exe tests/smoke_tools.py
 """
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -71,7 +72,9 @@ class FakeEvent:
 def make_plugin(db: HermesDB):
     """只带工具链所需成员的假 self：真实方法 + 临时库。"""
     fake = types.SimpleNamespace(db=db, _resident_cache={}, _inj_state={},
-                                 _get_cfg=lambda k, d=None: d, _metrics={})
+                                 _get_cfg=lambda k, d=None: d, _metrics={},
+                                 # 注入块会读技能清单；这里不需要技能，给个空壳
+                                 hub=types.SimpleNamespace(list_for=lambda *a, **k: []))
     for k, v in vars(m.HermesCore).items():
         if not k.startswith("__") and not callable(v) and not hasattr(fake, k):
             setattr(fake, k, v)
@@ -79,8 +82,16 @@ def make_plugin(db: HermesDB):
                  "_queue_memories", "_pending_memory_ids",
                  "_requeue_after_consolidate",
                  "_resident_block", "_resident_limits",
+                 "_build_context_block", "_expand_query", "_bump_metric",
+                 "_inject_item", "_render_resident",
                  "tool_save_memory", "tool_search_memory"):
-        setattr(fake, name, types.MethodType(getattr(m.HermesCore, name), fake))
+        fn = getattr(m.HermesCore, name)
+        # staticmethod 不能 MethodType 绑定——绑定后调用会多传一个 self。
+        if inspect.getattr_static(m.HermesCore, name, None) is not None and \
+                isinstance(inspect.getattr_static(m.HermesCore, name), staticmethod):
+            setattr(fake, name, fn)
+        else:
+            setattr(fake, name, types.MethodType(fn, fake))
     return fake
 
 
@@ -175,6 +186,36 @@ def main() -> int:
     check("空词条不产生空行", all(not x.endswith("：") for x in lines), str(lines))
     check("别的用户读不到这份常驻",
           p._resident_block("u_other", allow_private=True) == {})
+
+    # ---- 变更信号：用户说「我自己的情况变了」时要提示模型更新常驻 ----
+    print("== 状态变更信号 ==")
+    for q in ("我上周毕业了", "以后叫我老师吧", "我搬家到杭州了",
+              "现在不喜欢吃辣了", "我换工作了", "重装了系统"):
+        check(f"命中变更信号：{q}", bool(m._state_change_signal(q)), q)
+    for q in ("把这段代码改成异步", "帮我写个快速排序", "今天天气怎么样",
+              "这个 bug 怎么修", "画一张关系图", "我电脑是什么系统"):
+        check(f"不误触发：{q}", not m._state_change_signal(q), q)
+
+    # ---- 同词条已有条目时，回执要点出「该替换而不是并存」 ----
+    print("== 同词条更新提醒 ==")
+    r = asyncio.run(p.tool_save_memory(ev, content="用户偏好中文简短回复",
+                                       kind="preference", block="style"))
+    check("首条不提醒替换", "该词条还有" not in r, r)
+    r = asyncio.run(p.tool_save_memory(ev, content="用户偏好英文回复",
+                                       kind="preference", block="style"))
+    check("第二条起提醒可替换旧说法", "该词条还有" in r and "replaces" in r, r)
+    check("提醒里带上旧条编号",
+          any(f"#{row['id']}" in r for row in db.all_memories(owner_id="u1")
+              if row["content"] == "用户偏好中文简短回复"), r)
+
+    # ---- 注入块：常驻由对话里的模型维护，这一授权必须每轮送达 ----
+    print("== 注入块 ==")
+    blk = p._build_context_block(ev, "我电脑是什么系统", None)
+    check("注入块带常驻维护授权", "由你维护" in blk, blk[:160])
+    check("普通问题不追加变更提示", "情况变了" not in blk)
+    blk2 = p._build_context_block(ev, "我上周毕业了", None)
+    check("陈述变化时追加更新指令",
+          "情况变了" in blk2 and "毕业" in blk2, blk2[-160:])
 
     # ---- search_memory 不泄他人私聊 ----
     print("== search_memory 隔离 ==")

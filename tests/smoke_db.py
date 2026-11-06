@@ -714,6 +714,37 @@ def main() -> int:
     check("撤销祖父可一次恢复全部来源条", db.unmerge(ce) >= 3,
           str([int(db.memory_by_id(x)["merged_into"]) for x in (c1, c2, cd)]))
 
+    # --- 常驻的写入权限：后台只进归档，前台才能在对话里改
+    #
+    # 这是 v1.1.1 的核心约束：常驻内容只能由对话轮次里的模型更新。
+    # 后台总结/归位/整理都没有权限让它退场，否则「我毕业了」这类一次性
+    # 陈述会被一段没有上下文的总结稿拿去覆盖用户画像。
+    r1 = db.add_memory("profile", "用户是某大学在校生", owner_id="u50",
+                       visibility="private", block="user")
+    arch = db.add_memory("profile", "用户 2026 年 6 月毕业", owner_id="u50",
+                         visibility="private")
+    check("后台顶替常驻无效", db.supersede_archived([r1], arch) == 0)
+    check("常驻条目仍在", r1 in _ids(db.resident_blocks("u50")))
+    check("后台顶替归档有效", db.supersede_archived([arch], r1) == 1)
+    check("归档条目已退场",
+          int(db.memory_by_id(arch)["merged_into"] or 0) != 0)
+
+    # 前台路径（save_memory 走的就是它）：新条进词条，旧条退场
+    r3, made = db.add_memory_smart(
+        "profile", "用户已毕业，2026 年 6 月拿到学位", scope="user",
+        source="llm_tool", owner_id="u50", visibility="private",
+        block="user", prefer_new=True)
+    check("前台写入落进词条", made is True and db.memory_by_id(r3)["block"] == "user")
+    check("前台可以顶掉旧常驻", db.supersede_memories([r1], r3) == 1)
+    rn50 = _text(db.resident_blocks("u50"))
+    check("常驻只剩新说法", "在校生" not in rn50 and "已毕业" in rn50, rn50)
+
+    # 归档写入不能把与常驻同义的内容再存一份
+    dup, cdup = db.add_memory_smart(
+        "profile", "用户已毕业，2026 年 6 月拿到学位", scope="user",
+        source="auto_summary", owner_id="u50", visibility="private")
+    check("后台重复记录被常驻吸收", cdup is False and dup == r3, f"{dup},{cdup}")
+
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")
     if FAIL:

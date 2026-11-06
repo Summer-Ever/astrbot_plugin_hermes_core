@@ -1163,6 +1163,13 @@ class HermesDB:
         kept.reverse()
         return kept, cap
 
+    @_db_locked
+    def resident_count(self) -> int:
+        """有词条归属的活跃记忆条数（跨所有者），供状态页显示。"""
+        return int(self.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE merged_into = 0"
+            " AND COALESCE(block, '') != ''").fetchone()[0])
+
     def set_memory_block(self, memory_id: int, block: str) -> bool:
         """把一条记忆挪进某个常驻词条（或挪回归档层，block=''）。"""
         b = _norm_block(block)
@@ -1214,6 +1221,36 @@ class HermesDB:
                 f"UPDATE memories SET merged_into = ?,"
                 f" updated_ts = ? WHERE id IN ({_ph(len(clean))})"
                 f" AND merged_into = 0 AND id != ?",
+                (new_id, time.time(), *clean, new_id),
+            )
+            self.conn.commit()
+            return cur.rowcount
+
+    def supersede_archived(self, ids: list[int], new_id: int) -> int:
+        """只让**归档层**的旧条目退场，常驻词条里的条目一律不动。
+
+        为什么需要它：后台总结（`auto_summary`）是无人确认的定时任务，它产出
+        的 `replaces` 来自一段没有实时上下文的总结稿。如果它指向常驻条目，
+        就等于让后台把用户稳定的称呼/身份/偏好改掉，而且事后查不出是哪轮
+        对话改的。常驻的更新只该发生在对话轮次里，由前台模型在用户说明
+        变化时亲手完成，所以后台这一侧把口子收紧到 `block = ''`。
+        """
+        new_id = int(new_id or 0)
+        clean = []
+        for x in ids or []:
+            try:
+                i = int(x)
+            except (TypeError, ValueError):
+                continue
+            if i and i != new_id:
+                clean.append(i)
+        if not clean or not new_id:
+            return 0
+        with self._lock:
+            cur = self.conn.execute(
+                f"UPDATE memories SET merged_into = ?, updated_ts = ?"
+                f" WHERE id IN ({_ph(len(clean))})"
+                f" AND merged_into = 0 AND id != ? AND COALESCE(block, '') = ''",
                 (new_id, time.time(), *clean, new_id),
             )
             self.conn.commit()
