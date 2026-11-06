@@ -745,6 +745,25 @@ def main() -> int:
         source="auto_summary", owner_id="u50", visibility="private")
     check("后台重复记录被常驻吸收", cdup is False and dup == r3, f"{dup},{cdup}")
 
+    # --- 本地规则归位（模型不可用时的兜底）
+    from modules.db import guess_block_local as _guess
+    cases = [
+        ("用户希望助手称呼他为哥哥", "address"),
+        ("用户希望被称呼为兄弟", "address"),
+        ("不喜欢太长的总结，希望以后简短、只讲重点。", "style"),
+        ("要求回复简短精炼，仅保留核心要点", "style"),
+        ("用户电脑为 Windows 11，CPU i5-1240P，平时一直插电使用。", "user"),
+        ("多步骤任务或有副作用的操作前，先简要说明意图", "rules"),
+        ("偏好以「小土豆」身份互动，热衷土豆扮演", "assistant"),
+        ("用户喜欢吃葡萄", "preference"),
+        # 删除指令、纯事件不该进常驻：认不出就留归档层
+        ("用户要求删除此条，不再关注儿童上网安全", ""),
+        ("2026-11-06 修好了召回双路融合", ""),
+    ]
+    for text, want in cases:
+        got = _guess(text)
+        check(f"规则归位：{text[:16]}", got == want, f"{got!r} != {want!r}")
+
     db.conn.close()
     print(f"\n通过 {len(PASS)} / 失败 {len(FAIL)}")
     if FAIL:

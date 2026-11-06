@@ -67,10 +67,10 @@ except ImportError:
         _expand_query_text = None
 
 try:
-    from .modules.db import HermesDB
+    from .modules.db import HermesDB, guess_block_local
 except ImportError:
     try:
-        from modules.db import HermesDB  # 插件目录本身在 sys.path 上时
+        from modules.db import HermesDB, guess_block_local  # 插件目录本身在 sys.path 上时
     except ImportError:  # 最后兜底：按文件路径直接加载，不污染 sys.path
         import importlib.util as _ilu
 
@@ -81,6 +81,7 @@ except ImportError:
         _db_mod = _ilu.module_from_spec(_db_spec)
         _db_spec.loader.exec_module(_db_mod)
         HermesDB = _db_mod.HermesDB
+        guess_block_local = _db_mod.guess_block_local
 
 # 模型路由：主模型 + 降级链 + 重试/错误分类，同样三级兜底
 try:
@@ -138,7 +139,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.1.2"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、"
@@ -1879,8 +1880,25 @@ class HermesCore(Star):
             "同一个意思有多条时，只输出最完整的那条。\n"
             '只输出 JSON 数组，每项 {"id": 编号, "block": 词条名}，不要解释。\n\n'
             "条目：\n")
-        text = await self.router.chat(
-            builder=lambda _b: head + listing, purpose="常驻归位")
+        # 90 秒总预算：这是一条交互式命令，用户在等。默认策略是
+        # 「每个模型 60 秒 × 4 次尝试」，模型整体不可用时要等四分钟才回话，
+        # 用户只会以为卡死了。给总闸之后，最坏情况 1.5 分钟就有结果，
+        # 而且剩不到一次请求的时间时 router 会自己收工，不必等满。
+        try:
+            text = await self.router.chat(
+                builder=lambda _b: head + listing, purpose="常驻归位",
+                deadline=time.monotonic() + 90)
+        except Exception as exc:
+            # 模型全挂时不能只报错就走：常驻空着意味着用户每轮对话都看不到
+            # 自己的称呼和偏好，那比「按规则粗分一遍」更糟。规则只分高置信度的，
+            # 分不出的留在归档层（之后照样能检索到），所以最坏是漏、不是错。
+            note = self._backfill_blocks_local(cand)
+            logger.warning(f"[hermes_core] 常驻归位模型不可用，已降级为本地规则："
+                           f"{type(exc).__name__}: {str(exc)[:120]}")
+            return (f"{note}\n模型这次没能用上（{type(exc).__name__}），"
+                    "以上是按关键词粗分的，可能有分错的——"
+                    "在 WebUI 记忆列表用每行右侧的下拉框就能改；"
+                    "等模型恢复后可以再发一次 /hermes 归位 重跑。")
         moved, bad = 0, 0
         for item in self._extract_json_array(text):
             if not isinstance(item, dict):
@@ -1913,6 +1931,27 @@ class HermesCore(Star):
         return (f"常驻归位完成：{moved} 条进入词条，"
                 f"{len(cand) - moved} 条留在归档层"
                 + (f"，{bad} 条格式无法识别" if bad else "") + "。")
+
+    def _backfill_blocks_local(self, cand: list[dict]) -> str:
+        """模型不可用时的兜底归位：按关键词把记忆分进词条。
+
+        这只是「总比常驻空着好」的下策，不是替代模型判断。所以：
+        - 只分高置信度的（db.guess_block_local 的规则），认不出的留归档层；
+        - 标记 `block_backfill_done_local`，让状态页知道这次是粗分，
+          模型恢复后可以重跑；
+        - 文案里明确告诉用户「可能分错、可以手工改」，不假装是模型分的。
+        """
+        moved = 0
+        for m in cand:
+            blk = guess_block_local(str(m.get("content") or ""))
+            if blk and self.db.set_memory_block(int(m["id"]), blk):
+                moved += 1
+        self.db.set_meta(self.BLOCK_BACKFILL_KEY, "1")
+        self.db.set_meta(self.BLOCK_BACKFILL_KEY + "_local", "1")
+        self.db.set_meta(self.BLOCK_BACKFILL_KEY + "_tries", "0")
+        self._clear_resident()
+        return (f"按关键词归位：{moved} 条进入词条，"
+                f"{len(cand) - moved} 条留在归档层。")
 
     async def _summarize_impl(self, force: bool = False) -> str:
         """按会话独立判断是否值得总结：各自攒够条数、或超时兜底、或手动强制。
@@ -3350,9 +3389,16 @@ class HermesCore(Star):
             resident_cnt = -1
         # 归位不再后台自动跑（它会改常驻内容），所以这里主动提示用户去做。
         backfilled = bool(self.db.get_meta(self.BLOCK_BACKFILL_KEY, ""))
-        backfill_hint = "" if backfilled else (
-            "\n提示: 存量记忆还没归入常驻词条，发 /hermes 归位 整理一次"
-            "（不归位也能用，只是画像不会每轮带上）")
+        by_rule = bool(self.db.get_meta(self.BLOCK_BACKFILL_KEY + "_local", ""))
+        if not backfilled:
+            backfill_hint = ("\n提示: 存量记忆还没归入常驻词条，发 /hermes 归位 整理一次"
+                             "（不归位也能用，只是画像不会每轮带上）")
+        elif by_rule:
+            # 上次模型不可用、走的兜底规则。不当作完成态，提示可以重跑。
+            backfill_hint = ("\n（常驻是按关键词粗分的，可能不准；"
+                             "模型恢复后可再发 /hermes 归位 重跑）")
+        else:
+            backfill_hint = ""
         yield event.plain_result(
             f"[Hermes记忆系统]\n"
             f"版本: v{PLUGIN_VERSION} (code {self._build_hash()})\n"
