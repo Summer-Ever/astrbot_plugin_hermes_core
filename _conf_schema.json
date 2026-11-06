@@ -232,6 +232,12 @@
         "description": "每累计新增/更新多少个技能，才自动合并一次（0 = 关闭，只能手动 /hermes 技能整理）",
         "hint": "技能整理会把技能正文全量发给模型，比记忆整理贵，因此默认 5 而不是 1"
     },
+    "skill_archive_days": {
+        "type": "int",
+        "default": 90,
+        "description": "多少个自然日没被 read_skill 读过的技能自动软归档（0 = 关闭）",
+        "hint": "软归档只是退出视野：不注入、不列表，正文仍在库里。同名重新保存自动复活，或 /hermes 恢复技能 <名> 找回"
+    },
     "auto_skill": {
         "type": "bool",
         "default": true,

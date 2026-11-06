@@ -210,6 +210,39 @@ def main() -> int:
     got = db.get_skill("deploy", "u1", "")
     check("get_skill 取到本人版本", bool(got) and "步骤一" in str(got.get("content")))
 
+    # --- 技能软归档（v1.2.1）
+    import time as _t
+    _p = db.peek_skill("deploy", "u1", "")
+    check("get_skill 刷新 last_used_ts",
+          float((_p or {}).get("last_used_ts") or 0) > 0, str(_p))
+    # u2 的私版：把时钟整体拨到 200 天前（上面 get_skill 刚刷新过
+    # last_used_ts，这里必须一起归零），扫描应只归档它
+    db.conn.execute(
+        "UPDATE skills SET created_ts = ?, updated_ts = 0, last_used_ts = 0"
+        " WHERE owner_id = 'u2' AND name = 'deploy'", (_t.time() - 200 * 86400,))
+    db.conn.commit()
+    gone = db.archive_unused_skills(90)
+    check("archive_unused_skills 只归档长期未用的（刚读过的 u1 版不动）",
+          [f"{g['owner_id']}:{g['name']}" for g in gone] == ["u2:deploy"], str(gone))
+    check("归档后本人列表看不到",
+          not any(s["name"] == "deploy" for s in db.list_skills("u2", "")))
+    check("归档后 get_skill 读不到", db.get_skill("deploy", "u2", "") is None)
+    check("归档后整理分组也排除",
+          not any(o["owner_id"] == "u2" for o in db.skill_owners()))
+    check("同名重新保存自动复活",
+          db.upsert_skill("deploy", "部署", "# v2", owner_id="u2", scope="private")
+          is False and any(s["name"] == "deploy" for s in db.list_skills("u2", "")))
+    db.conn.execute(
+        "UPDATE skills SET last_used_ts = 0, updated_ts = 0, created_ts = ?"
+        " WHERE owner_id = 'u2' AND name = 'deploy'", (_t.time() - 200 * 86400,))
+    db.conn.commit()
+    db.archive_unused_skills(90)
+    check("restore_skill 找回已归档条目",
+          db.restore_skill("deploy", "u2", "")
+          and any(s["name"] == "deploy" for s in db.list_skills("u2", "")))
+    check("restore_skill 不误找回他人同名",
+          not db.restore_skill("deploy", "nobody", ""))
+
     md = db.export_memories_markdown()
     check("export_memories_markdown 非空", bool(md.strip()), str(len(md)))
 

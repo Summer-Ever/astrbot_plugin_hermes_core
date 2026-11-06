@@ -280,7 +280,7 @@ RESIDENT_TABLE_SQL = """
 # 技能可见性：自己的 private + 本群 group + 全体 global。
 # owner_id 为空的存量记录一律按 global 处理，避免迁移后凭空消失。
 SKILL_VISIBLE_SQL = (
-    "merged_into = 0 AND ("
+    "merged_into = 0 AND archived = 0 AND ("
     " (scope = 'private' AND owner_id = ? AND owner_id != '')"
     " OR (scope = 'group' AND ? != '' AND group_id = ?)"
     " OR scope = 'global'"
@@ -387,6 +387,17 @@ class HermesDB:
             # 词条文本，本列只保留给老库兼容——启动迁移（resident_text_v1）
             # 会把它清空，业务代码不再读写。
             "ALTER TABLE memories ADD COLUMN block TEXT NOT NULL DEFAULT ''",
+        ):
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
+        # v1.2.1 迁移：技能软归档。last_used_ts 由 read_skill 的读路径刷新；
+        # archived=1 表示长期未用被软删除——不注入、不列表、读不到，但行留在
+        # 库里：同名重新保存或 /hermes 恢复技能 都能找回。
+        for ddl in (
+            "ALTER TABLE skills ADD COLUMN last_used_ts REAL DEFAULT 0",
+            "ALTER TABLE skills ADD COLUMN archived INTEGER DEFAULT 0",
         ):
             try:
                 c.execute(ddl)
@@ -1731,7 +1742,7 @@ class HermesDB:
             if exist:
                 self.conn.execute(
                     "UPDATE skills SET trigger = ?, content = ?, updated_ts = ?,"
-                    " scope = ?, group_id = ? WHERE id = ?",
+                    " scope = ?, group_id = ?, archived = 0 WHERE id = ?",
                     (trigger, content, now, scp, gid, exist["id"]),
                 )
                 created = False
@@ -1764,7 +1775,7 @@ class HermesDB:
 
         owner_id 传 None 表示不过滤（管理员视角看全部人）。
         """
-        conds: list[str] = []
+        conds: list[str] = ["archived = 0"]
         args: list = []
         if owner_id is not None:
             conds.append("owner_id = ?")
@@ -1881,7 +1892,9 @@ class HermesDB:
         # 后台线程里未提交的事务「顺手 commit」，把半成品写进库。
         with self._lock:
             self.conn.execute(
-                "UPDATE skills SET use_count = use_count + 1 WHERE id = ?", (row["id"],)
+                "UPDATE skills SET use_count = use_count + 1, last_used_ts = ?"
+                " WHERE id = ?",
+                (time.time(), row["id"]),
             )
             self.conn.commit()
         return dict(row)
@@ -1891,7 +1904,7 @@ class HermesDB:
         """按归属统计技能数量，供技能整理分组和 WebUI 筛选。"""
         rows = self.conn.execute(
             "SELECT owner_id, scope, group_id, COUNT(*) c FROM skills"
-            " WHERE merged_into = 0 GROUP BY owner_id, scope, group_id"
+            " WHERE merged_into = 0 AND archived = 0 GROUP BY owner_id, scope, group_id"
             " ORDER BY c DESC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -1903,10 +1916,48 @@ class HermesDB:
         rows = self.conn.execute(
             "SELECT id, owner_id, scope, group_id, name, trigger, content, use_count"
             " FROM skills WHERE owner_id = ? AND scope = ? AND group_id = ?"
-            " AND merged_into = 0 ORDER BY id",
+            " AND merged_into = 0 AND archived = 0 ORDER BY id",
             (owner_id, scope, group_id),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    @_db_locked
+    def archive_unused_skills(self, days: float) -> list[dict]:
+        """把 days 天没被 read_skill 读过的技能置 archived=1，返回被归档的行。
+
+        「没用过」的钟：last_used_ts 为 0（从没读过）退到 updated_ts/created_ts
+        ——出生起再没碰过的技能正是最该归档的那批。只动仍可见的活条目
+        （merged_into≠0 的早就不在视野里）。
+        """
+        cutoff = time.time() - max(0.0, float(days)) * 86400
+        rows = self.conn.execute(
+            "SELECT id, owner_id, scope, group_id, name FROM skills"
+            " WHERE archived = 0 AND merged_into = 0"
+            " AND COALESCE(NULLIF(last_used_ts, 0), NULLIF(updated_ts, 0), created_ts) < ?",
+            (cutoff,),
+        ).fetchall()
+        gone = [dict(r) for r in rows]
+        if gone:
+            self.conn.execute(
+                "UPDATE skills SET archived = 1 WHERE id IN (%s)"
+                % ",".join("?" * len(gone)),
+                [g["id"] for g in gone],
+            )
+            self.conn.commit()
+        return gone
+
+    @_db_locked
+    def restore_skill(self, name: str, owner_id: str = "",
+                      group_id: str = "") -> bool:
+        """找回一个软归档的技能：只认当前身份归属域内的同名条目。"""
+        cur = self.conn.execute(
+            "UPDATE skills SET archived = 0 WHERE name = ? AND archived = 1 AND ("
+            " (scope = 'private' AND owner_id = ? AND owner_id != '')"
+            " OR (scope = 'group' AND ? != '' AND group_id = ?))",
+            (name, owner_id, group_id, group_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
 
     # ---------- meta ----------
 

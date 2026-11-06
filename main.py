@@ -1618,6 +1618,10 @@ class HermesCore(Star):
                 await self._summarize()
             except Exception:
                 logger.error(f"[hermes_core] 总结循环异常:\n{traceback.format_exc()}")
+            try:
+                self._sweep_skill_archive()
+            except Exception:
+                logger.error(f"[hermes_core] 技能归档扫描异常:\n{traceback.format_exc()}")
             # 自动深度整理：这里只做一次分桶检查（几千条约 9ms），真正整理交给
             # 后台任务。绝不能在本循环里 await——逐片调模型能跑十几分钟，
             # 会把下一轮总结和下面的例行维护一起堵死。
@@ -2269,6 +2273,27 @@ class HermesCore(Star):
         if self._auto_consolidate_blocked() > 0:
             return False
         return queued >= every and self.db.stats()["skills"] >= 2
+
+    def _sweep_skill_archive(self) -> None:
+        """长期不用的技能软归档（skill_archive_days 天没被 read_skill 读过）。
+
+        归档只是退出视野：不注入、不列表、读不到，正文仍在库里——同名
+        重新保存自动复活，或 /hermes 恢复技能 <名> 找回。一条 UPDATE 的
+        成本，挂在总结循环后面每轮跑一次即可，无需独立调度。
+        """
+        try:
+            days = int(self._get_cfg("skill_archive_days", 90) or 0)
+        except (TypeError, ValueError):
+            days = 90
+        if days <= 0:
+            return
+        gone = self.db.archive_unused_skills(days)
+        if gone:
+            names = "、".join(str(g["name"])[:40] for g in gone[:10])
+            more = f" 等 {len(gone)} 个" if len(gone) > 10 else ""
+            self.job_emit(f"超过 {days} 天未使用，已软归档技能：{names}{more}"
+                          "（同名重新保存或 /hermes 恢复技能 可找回）",
+                          level="info", kind="skill")
 
     def _queue_progress(self) -> str:
         """给 /hermes 状态 用：离下次自动整理还差多少。"""
@@ -3518,6 +3543,18 @@ class HermesCore(Star):
             lines.append("[系统技能·只读]")
             lines += [f"- {s['name']}（{s['trigger'] or '通用'}）" for s in system]
         yield event.plain_result("\n".join(lines))
+
+    @hermes.command("恢复技能")
+    async def hermes_restore_skill(self, event: AstrMessageEvent, name: str = ""):
+        if not name:
+            yield event.plain_result("用法：/hermes 恢复技能 <技能名>"
+                                     "（被归档的名字见面板的整理日志）")
+            return
+        sc = self._scope_keys(event)
+        if self.db.restore_skill(name.strip(), sc["owner_id"], sc["group_id"]):
+            yield event.plain_result(f"技能 {name} 已恢复，重新回到技能索引。")
+        else:
+            yield event.plain_result(f"你名下没有名为 {name} 的已归档技能。")
 
     @hermes.command("导出")
     async def hermes_export(self, event: AstrMessageEvent):

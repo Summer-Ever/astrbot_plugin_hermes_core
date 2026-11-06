@@ -43,7 +43,7 @@ CONFIG_GROUPS: list[tuple[str, tuple[str, ...]]] = [
                   "consolidate_max_clusters")),
     ("技能", ("auto_skill", "skill_notify_admin", "skill_merge_same_name",
               "skill_merge_threshold", "skill_consolidate_max",
-              "skill_consolidate_every_n")),
+              "skill_consolidate_every_n", "skill_archive_days")),
     # 模型链的列表型配置（降级顺序、可重试错误）由「模型」页专门维护，
     # 设置页只放标量项，避免两处编辑同一份数据打架。
     ("模型容错", ("llm_max_retries", "llm_timeout", "llm_backoff",
