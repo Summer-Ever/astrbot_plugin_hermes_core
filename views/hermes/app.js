@@ -28,6 +28,24 @@
   };
   const SCOPE_LABEL = { user: "按用户", group: "按群", global: "全局" };
 
+  // 常驻的六个固定词条。空串 = 归档层（按需检索），不算常驻。
+  const BLOCK_LABEL = {
+    address: "称呼",
+    assistant: "助手设定",
+    user: "用户信息",
+    preference: "用户偏好",
+    style: "回复风格",
+    rules: "规则避雷",
+  };
+  function blockSelect(r) {
+    const cur = r.block || "";
+    const opts = [["", "归档"], ...Object.entries(BLOCK_LABEL)]
+      .map(([v, t]) => `<option value="${v}"${cur === v ? " selected" : ""}>${t}</option>`)
+      .join("");
+    return `<select data-mem-block="${r.id}" title="常驻词条：选中后每轮都会注入；「归档」= 按需检索"
+      style="font-size:12px;padding:2px 4px;border-radius:6px;border:1px solid rgba(128,128,128,.45);background:transparent;color:inherit">${opts}</select>`;
+  }
+
   const state = {
     tab: "overview",
     overview: null,
@@ -417,7 +435,9 @@
         ? `<span class="mono" title="${esc(r.owner_id)}">${esc(String(r.owner_id).slice(0, 14))}</span>`
         : (r.group_id ? `<span class="muted">群 ${esc(String(r.group_id).slice(0, 10))}</span>` : '<span class="faint">全局</span>');
       const mergedChip = Number(r.merged_into) ? ' <span class="chip">已合并</span>' : "";
-      const pinChip = Number(r.pinned) ? ' <span class="chip warn" title="钉住：每轮必注入，整理时不可合并/丢弃">钉住</span>' : "";
+      const blockChip = r.block
+        ? ` <span class="chip ok" title="常驻词条：每轮都会注入">${esc(BLOCK_LABEL[r.block] || r.block)}</span>`
+        : "";
       // 可见范围：私聊=只在私聊可用；群=只在来源群可用；公开=任何场景可用。
       // 群聊场景默认不引用 private，这条徽标就是排查「群里为什么想不起来」的入口。
       const visMap = {
@@ -432,13 +452,13 @@
           <td><input type="checkbox" class="checkbox mem-check" data-id="${r.id}" ${m.selected.has(r.id) ? "checked" : ""}></td>
           <td class="mono faint">${r.id}</td>
           <td><span class="chip blue">${esc(KIND_LABEL[r.kind] || r.kind)}</span></td>
-          <td class="content"><div class="text">${esc(r.content)}</div>${mergedChip}${pinChip}${visChip}</td>
+          <td class="content"><div class="text">${esc(r.content)}</div>${mergedChip}${blockChip}${visChip}</td>
           <td>${owner}</td>
           <td><span class="chip">${esc(r.source || "—")}</span></td>
           <td class="nowrap muted">${fmtTime(r.ts)}</td>
           <td>
             <div class="ops">
-              <button class="btn tiny ghost" data-mem-pin="${r.id}" data-pinned="${Number(r.pinned) ? 1 : 0}">${Number(r.pinned) ? "取消钉住" : "钉住"}</button>
+              ${blockSelect(r)}
               <button class="btn tiny ghost" data-mem-edit="${r.id}">编辑</button>
               <button class="btn tiny danger" data-mem-del="${r.id}">删除</button>
             </div>
@@ -1364,22 +1384,20 @@
       updateBulkBar();
       $("#mem-check-all").checked = state.mem.rows.every((r) => state.mem.selected.has(r.id));
     });
+    $("#mem-tbody").addEventListener("change", async (e) => {
+      const sel = e.target.closest("[data-mem-block]");
+      if (!sel) return;
+      try {
+        await apiPost("memories/block", { id: Number(sel.dataset.memBlock), block: sel.value });
+        toast(sel.value ? `已移入「${BLOCK_LABEL[sel.value]}」，之后每轮都会带上` : "已移回归档，改为按需检索");
+        loadMemories();
+      } catch (_) { /* 错误已由 apiPost 提示 */ }
+    });
     $("#mem-tbody").addEventListener("click", async (e) => {
       const edit = e.target.closest("[data-mem-edit]");
       if (edit) {
         const rec = state.mem.rows.find((r) => r.id === Number(edit.dataset.memEdit));
         if (rec) editMemoryModal(rec);
-        return;
-      }
-      const pinBtn = e.target.closest("[data-mem-pin]");
-      if (pinBtn) {
-        const id = Number(pinBtn.dataset.memPin);
-        const pinned = pinBtn.dataset.pinned === "1";
-        try {
-          await apiPost("memories/pin", { id, pinned: !pinned });
-          toast(pinned ? "已取消钉住" : "已钉住：每轮必注入");
-          loadMemories();
-        } catch (_) { /* 错误已由 apiPost 提示 */ }
         return;
       }
       const visBtn = e.target.closest("[data-mem-vis]");

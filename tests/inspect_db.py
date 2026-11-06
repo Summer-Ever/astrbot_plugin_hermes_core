@@ -128,9 +128,10 @@ def cross_group_probe(db_path: str) -> list:
             hit = [m["id"] for m in db.search_memories(
                 kw, owner_id=r0["owner_id"], group_id=gid,
                 allow_private=False, limit=50)]
-            pin = [m["id"] for m in db.pinned_memories(
-                r0["owner_id"], group_id=gid, allow_private=False)]
-            lines.append(f"  {label} 检索 {hit[:8]} / 钉住 {pin[:8]}")
+            blocks = db.resident_blocks(
+                r0["owner_id"], group_id=gid, allow_private=False)
+            rids = [it["id"] for info in blocks.values() for it in info["items"]]
+            lines.append(f"  {label} 检索 {hit[:8]} / 常驻 {rids[:8]}")
         anon = [m["id"] for m in db.search_memories(
             kw, owner_id="", group_id="", allow_private=True, limit=50)
             if (m.get("visibility") or "") == "private"]

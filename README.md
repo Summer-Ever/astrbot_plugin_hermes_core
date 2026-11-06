@@ -37,7 +37,7 @@
 | Hermes 能力 | 本插件实现 |
 |---|---|
 | SQLite + WAL + FTS5 会话存储 | `modules/db.py`；记忆检索不依赖 FTS 分词，改用字面双路打分（见[检索](#检索双路召回--注入闸门)） |
-| 长期记忆注入（MEMORY.md/USER.md） | 三层注入：「关于你」常驻块 + 按当前消息检索 top-k + 相关历史，经 `extra_user_content_parts` 临时注入（不打乱 prompt 缓存） |
+| 长期记忆注入（MEMORY.md/USER.md） | 三层注入：六个固定词条的常驻块 + 按当前消息检索 top-k + 相关历史，经 `extra_user_content_parts` 临时注入（不打乱 prompt 缓存） |
 | 周期性记忆 nudge / LLM 总结 | 后台循环调用你配置的 Provider，把新对话压缩成记忆条目（JSON 协议） |
 | 技能自动生成（Markdown Skill） | 总结时一并提炼；模型也可用 `save_skill` 主动沉淀，同名先读旧版再合并 |
 | 工具化记忆检索 | 6 个 llm_tool：`search_memory` / `save_memory` / `list_skills` / `read_skill` / `save_skill` / `update_skill` |
@@ -103,6 +103,7 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 | `/hermes 总结` | 立即触发一次总结（默认由后台按需自动跑） |
 | `/hermes 整理` | 把碎片化的相似记忆合并成一条。加 `深度` 全量交给模型归纳（能清垃圾条目），`预览` 只看不写，`重来` 忽略上次断点 |
 | `/hermes 整理结果` | 查最近一次整理的产出与进度 |
+| `/hermes 归位` | 把存量记忆按语义归入六个常驻词条。升级到 v1.1.0 后跑一次即可 |
 | `/hermes 技能整理` | 把重复的技能合并成一个，`预览` 只看不写 |
 | `/hermes 记住 <内容>` | 手动写入一条记忆 |
 | `/hermes 记忆` | 查看最近记忆（带 id，可配合删除）；**非管理员只看得到自己的** |
@@ -127,22 +128,28 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
 
 | 层 | 内容 | 依赖命中吗 |
 |---|---|---|
-| 常驻「关于你」 | 画像 / 偏好（`profile` / `preference`），按重要度取前 6 条、≤400 字 | 否，每次对话固定注入 |
+| 常驻六词条 | 称呼 / 助手设定 / 用户信息 / 用户偏好 / 回复风格 / 规则避雷，每个词条各有字数上限 | 否，每次对话固定注入 |
 | 相关记忆 | 按当前消息打分召回，用户 > 群 > 全局逐级补 | 是 |
 | 相关历史 | 同会话最近消息里按相关度取几条 | 是 |
+
+常驻为什么按「词条」而不是按「条数」：一条画像和一条偏好对模型的用途不同，
+挤在同一个池子里抢名额的结果是重复的偏好占满位置（实测 6 席里 2 席是同一句
+「叫哥哥」），真正该常驻的身份信息被挤掉。词条化之后每个位置各有预算，互不挤占。
+
+词条集合是封闭的——只能往已有词条里写，不能新建第七个。所以常驻规模天然有界，
+每个空词条也不注入、不占 token。
 
 注入块长这样：
 
 ```
-[关于这位用户（长期稳定信息）]
-画像：
-- 用户电脑 CPU 为 i5-1240P，插电使用…（#52）
-偏好：
-- 用户希望助手以后称呼他为“哥哥”。（#140，钉于 2026-11）
+[长期稳定信息（每轮必带）]
+- 称呼：用户希望助手始终称呼其为“哥哥”。（#185）
+- 用户信息：用户电脑为 Windows 11，CPU i5-1240P，平时一直插电使用。（#177）
+- 回复风格：用户偏好简洁回复，一段话配一个颜文字即可。（#180）
 ```
 
-编号放在行尾是有原因的：`pin_memory` 与 `save_memory(replaces=)` 要靠它定位
-条目，不能省；而逐条标 `(profile)` 纯属开销，类型已经提到分组标题了。
+编号放在行尾是有原因的：`save_memory(replaces=旧编号)` 要靠它定位条目。
+用户改口（「以后叫我老师」）时，模型拿这个编号顶掉旧说法，而不是再写一条。
 
 注入通过临时 content part 完成，不写进会话历史，所以不会污染 prompt 缓存。
 
@@ -181,8 +188,8 @@ git clone https://github.com/Summer-Ever/astrbot_plugin_hermes_core.git
   避免「先攒脏 N 条、再等整理」的窗口期；带否定词保护（`喜欢猫` 与 `不喜欢猫`
   不合并，极性反转视为改主意）；但**只在同一可见性内判重**，私聊与群的两条同义
   记忆不会互相合并；
-- **常驻排序带衰减**：按「重要度 × 120 天半衰 × 命中次数」排，不碰就淡出，新偏好
-  不会永远被老条目挤出前 6 条；
+- **常驻超预算保新弃旧**：词条按字数卡上限，超出时丢最旧的、留着刚说的——用户
+  改口以后，块里念的必须是新称呼，不能还是半年前那个；
 - **长度与类型约束**：记忆正文截断到 400 字，模型自创的 `kind` 统一归为 `fact`；
 - **技能清单渐进披露**：注入里只给「我的技能」前 12 个和系统技能数量，正文按需
   `read_skill` 读。
@@ -360,7 +367,7 @@ AstrBot 本体有一套技能目录（`data/skills/<slug>/SKILL.md`，全局共�
 
 三条规则只有一个实现：`db._visible_clause()` 生成
 `AND (public OR (private AND owner=?) OR (group AND group_id=?))`，
-`search_memories` 的三层、`resident_notes`、`pinned_memories`、`slot_conflicts`
+`search_memories` 的三层、`resident_blocks`、总结时的常驻对照
 全部复用它。判不出查看者时**不给任何 private 条目** —— 没有身份就没有私聊。
 
 配置项 `group_private_memory`（默认关）可整体放开，适合全员熟人的小群。WebUI
@@ -487,9 +494,13 @@ AstrBot 本体有一套技能目录（`data/skills/<slug>/SKILL.md`，全局共�
 | `memory_injection` | 开 | 每次请求前自动检索并注入记忆与历史 |
 | `inject_memories_topk` | 5 | 每次注入的记忆条数上限 |
 | `inject_history_topk` | 3 | 每次注入的相关历史条数上限 |
-| `resident_notes` | 开 | 常驻「关于你」块（不依赖关键词命中） |
-| `resident_max_items` | 6 | 常驻条目数上限（只含画像/偏好） |
-| `resident_max_chars` | 400 | 常驻块字符上限，越小越省 token（建议 300~800） |
+| `resident_notes` | 开 | 常驻六词条（不依赖关键词命中） |
+| `resident_chars_address` | 30 | 称呼词条的字数上限 |
+| `resident_chars_assistant` | 120 | 助手设定（性格、扮演角色） |
+| `resident_chars_user` | 200 | 用户信息（身份、职业、设备、环境） |
+| `resident_chars_preference` | 240 | 用户偏好（喜欢/不喜欢什么） |
+| `resident_chars_style` | 200 | 回复风格（长短、格式、表情、语气） |
+| `resident_chars_rules` | 180 | 规则避雷（必须做的、绝不能做的） |
 
 ### 检索
 
@@ -623,6 +634,20 @@ AstrBot/data/plugin_data/astrbot_plugin_hermes_core/hermes.db
    `/hermes 状态` 与概览页的「平均召回条数」能看到整体是否异常。
 5. **临时关掉新排序做对照**：把 `recall_fusion` 关掉，如果关掉后能召回、开着不行，
    说明是排序策略问题，可以把问句、库里那条记忆的 id 一起反馈。
+
+### 升级到 v1.1.0 后，常驻块是空的
+
+这是预期的，不是丢数据。v1.1.0 之前常驻没有专门的归属字段，是按 `kind` 猜的；
+升级后每条记忆都还没有词条归属，所以常驻为空，记忆仍可被检索召回。
+
+两种方式补上：
+
+- 等下一次后台总结自动归位（会调用一次模型，只在第一次跑）；
+- 或者立刻发 `/hermes 归位`，它会把这批记忆按语义分进六个词条，并告诉你
+  多少条进了词条、多少条留在归档层。
+
+归位之后可以在 WebUI 记忆列表里用每行右侧的下拉框手工纠正：选「归档」就退出
+常驻，选某个词条就每轮带上。归位是个一次性动作，不会每次总结都跑。
 
 ### 总结不触发
 

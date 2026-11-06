@@ -93,7 +93,8 @@ class HermesWebAPI:
             (f"{self.prefix}/memories", self.memories, ["GET"], "记忆列表（筛选+分页）"),
             (f"{self.prefix}/memories/add", self.memory_add, ["POST"], "新增记忆"),
             (f"{self.prefix}/memories/update", self.memory_update, ["POST"], "修改记忆"),
-            (f"{self.prefix}/memories/pin", self.memory_pin, ["POST"], "钉住/取消钉住记忆（常驻保护）"),
+            (f"{self.prefix}/memories/block", self.memory_block, ["POST"],
+             "把记忆移入/移出常驻词条"),
             (f"{self.prefix}/memories/visibility", self.memory_visibility, ["POST"],
              "设置记忆可见范围（私聊/群/公开）"),
             (f"{self.prefix}/memories/delete", self.memory_delete, ["POST"], "删除记忆"),
@@ -357,18 +358,25 @@ class HermesWebAPI:
         self.plugin._resident_cache.clear()
         return json_response({"id": mid, "record": self.plugin.db.memory_by_id(mid)})
 
-    async def memory_pin(self):
+    async def memory_block(self):
+        """把一条记忆挪进某个常驻词条，或挪回归档层（block 传空串）。
+
+        面板上的「归位」入口：模型偶尔会把常驻内容写进归档层，或者把一条
+        具体事件塞进常驻，这里让用户能手工纠正，不用去改数据库。
+        """
         data = await self._body()
         try:
             mid = int(data.get("id"))
         except (TypeError, ValueError):
             return self._fail("缺少记忆 id")
-        pinned = bool(data.get("pinned"))
-        ok = self.plugin.db.set_pinned(mid, pinned)
+        block = str(data.get("block") or "").strip().lower()
+        if block and block not in self.plugin.db.RESIDENT_BLOCK_TITLES:
+            return self._fail("未知的词条")
+        ok = self.plugin.db.set_memory_block(mid, block)
         if not ok:
             return self._fail("记忆不存在或已失效", 404)
         self.plugin._resident_cache.clear()
-        return json_response({"id": mid, "pinned": pinned})
+        return json_response({"id": mid, "block": block})
 
     async def memory_delete(self):
         data = await self._body()

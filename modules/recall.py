@@ -816,7 +816,7 @@ def format_memory_lines(items: list[dict[str, Any]], *,
                         note_key: str = "note") -> list[str]:
     """把记忆条目渲染成注入用的几行：类型分组 + 编号后置。
 
-    - 编号必须保留：pin_memory / save_memory(replaces=) 全靠它定位条目。
+    - 编号必须保留：save_memory(replaces=) 全靠它定位条目。
     - 编号放行尾而不是行首：正文优先，行首不再出现 #，客户端按 markdown
       渲染时也不会把 # 当成标记吃掉（截图里 `#127` 就变成了 `127`）。
     - kind 提到分组标题：6 条平铺时逐条 `(profile)` 是纯开销（实测省 52 字）。

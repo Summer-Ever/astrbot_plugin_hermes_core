@@ -1,4 +1,4 @@
-"""LLM 工具链冒烟测试：save_memory / pin_memory / search_memory 的边界行为。
+"""LLM 工具链冒烟测试：save_memory / search_memory 的边界行为。
 
 三套 smoke（db / router / consolidate）覆盖的是模块内部逻辑，但插件真正暴露给
 模型的入口是这些 @filter.llm_tool 方法——模型会填错编号、会尝试动别人的记忆、
@@ -78,7 +78,8 @@ def make_plugin(db: HermesDB):
     for name in ("_scope_keys", "_is_admin", "_id_seen", "_clear_resident",
                  "_queue_memories", "_pending_memory_ids",
                  "_requeue_after_consolidate",
-                 "tool_save_memory", "tool_pin_memory", "tool_search_memory"):
+                 "_resident_block", "_resident_limits",
+                 "tool_save_memory", "tool_search_memory"):
         setattr(fake, name, types.MethodType(getattr(m.HermesCore, name), fake))
     return fake
 
@@ -125,37 +126,55 @@ def main() -> int:
     r = asyncio.run(p.tool_save_memory(ev, content="替换不可见条目", replaces=unseen))
     check("replaces 不可见编号：拒绝且明确告知", "不在本会话" in r, r)
 
-    # ---- save_memory：正常 replaces 必须真的顶掉旧条 ----
+    # ---- save_memory：正常 replaces 必须真的顶掉旧条，并继承词条 ----
     print("== save_memory 的 replaces 正常路径 ==")
-    old_c = db.add_memory("preference", "叫我兄弟", owner_id="u1", visibility="private")
-    db.set_pinned(old_c, True)          # 旧条是常驻：新条必须继承
+    old_c = db.add_memory("preference", "叫我兄弟", owner_id="u1", visibility="private",
+                          block="address")
     mark_seen(old_c)
     r = asyncio.run(p.tool_save_memory(ev, content="叫我老爹", kind="preference",
                                        replaces=old_c))
     check("正常 replaces：提示已替换", "已替换" in r and f"#{old_c}" in r, r)
     check("正常 replaces：旧条退出活跃池",
           int(db.memory_by_id(old_c)["merged_into"] or 0) != 0)
-    new_ids = [i for i, row in ((r["id"], r) for r in db.all_memories(owner_id="u1"))
-               if row["content"] == "叫我老爹"]
-    check("正常 replaces：新条继承常驻身份",
-          bool(new_ids) and bool(int(db.memory_by_id(new_ids[0])["pinned"] or 0)))
+    rows_new = [row for row in db.all_memories(owner_id="u1")
+                if row["content"] == "叫我老爹"]
+    check("正常 replaces：新条留在同一词条",
+          bool(rows_new) and rows_new[0]["block"] == "address",
+          str(rows_new[0]["block"]) if rows_new else "没找到新条")
 
-    # ---- pin_memory 边界 ----
-    print("== pin_memory 边界 ==")
-    try:
-        r = asyncio.run(p.tool_pin_memory(ev, memory_id=424242))
-        check("pin 不存在：返回提示而非崩溃", "不存在" in r, r)
-    except Exception as e:
-        check("pin 不存在：返回提示而非崩溃", False, f"{type(e).__name__}: {e}")
-    pub = db.add_memory("fact", "群公共记忆一条", visibility="public")
-    mark_seen(pub)
-    r = asyncio.run(p.tool_pin_memory(ev, memory_id=pub))
-    check("非管理员不能钉公共记忆", "管理员" in r, r)
-    check("被拒后公共记忆未被钉", not int(db.memory_by_id(pub)["pinned"] or 0))
-    mine = db.add_memory("preference", "我自己的偏好", owner_id="u1", visibility="private")
-    mark_seen(mine)
-    r = asyncio.run(p.tool_pin_memory(ev, memory_id=mine))
-    check("钉自己的记忆成功", "已钉住" in r and bool(db.memory_by_id(mine)["pinned"]))
+    # ---- save_memory 的词条参数 ----
+    print("== save_memory 的词条参数 ==")
+    r = asyncio.run(p.tool_save_memory(ev, content="测试内容", block="nope"))
+    check("未知词条被拒并列出可选值", "未知词条" in r and "address" in r, r)
+    r = asyncio.run(p.tool_save_memory(ev, content="用户喜欢喝冰美式",
+                                       kind="preference", block="preference"))
+    check("写进词条：回执点名词条", "用户偏好" in r and "每轮" in r, r)
+    rows_b = [row for row in db.all_memories(owner_id="u1")
+              if row["content"] == "用户喜欢喝冰美式"]
+    check("写进词条：落库带 block",
+          bool(rows_b) and rows_b[0]["block"] == "preference",
+          str(rows_b[0]["block"]) if rows_b else "没落库")
+    r = asyncio.run(p.tool_save_memory(ev, content="用户在做一个记忆插件项目"))
+    check("不填词条：落进归档层", "每轮" not in r, r)
+    rows_a = [row for row in db.all_memories(owner_id="u1")
+              if row["content"] == "用户在做一个记忆插件项目"]
+    check("不填词条：block 为空",
+          bool(rows_a) and not rows_a[0]["block"])
+
+    # ---- 常驻词条：读取与渲染 ----
+    print("== 常驻词条 ==")
+    blocks = p._resident_block("u1", allow_private=True)
+    check("词条按归属聚合", "preference" in blocks and any(
+        "冰美式" in it["content"] for it in blocks["preference"]["items"]),
+        str(list(blocks)))
+    lines = m.HermesCore._render_resident(blocks)
+    check("渲染成一行一个词条",
+          any(x.startswith("- 用户偏好：") for x in lines), str(lines[:2]))
+    check("渲染带编号（改口要靠它定位）",
+          bool(lines) and all("（#" in x for x in lines), str(lines[:1]))
+    check("空词条不产生空行", all(not x.endswith("：") for x in lines), str(lines))
+    check("别的用户读不到这份常驻",
+          p._resident_block("u_other", allow_private=True) == {})
 
     # ---- search_memory 不泄他人私聊 ----
     print("== search_memory 隔离 ==")

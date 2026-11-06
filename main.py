@@ -138,14 +138,16 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "1.0.2"
+PLUGIN_VERSION = "1.1.0"
 
 SYSTEM_MEMORY_HINT = (
-    "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
-    "pin_memory(钉住重要记忆，钉住后每轮必定注入且不会被整理丢弃)、"
+    "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、"
+    "save_memory(保存重要事实；填 block 则写进常驻词条，每轮都会带上)、"
     "list_skills(查看技能，分「我的技能」和「系统技能·只读」)、read_skill(读取技能全文)、"
     "save_skill(把可复用流程存为我的技能)、update_skill(局部修改我的技能)。"
-    "遇到值得长期记住的信息请主动 save_memory；用户明确说「必须一直记住」时先保存再 pin_memory 钉住；"
+    "遇到值得长期记住的信息请主动 save_memory：每轮都用得上的（称呼、身份、偏好、"
+    "回复要求、规则）要填 block 写进对应词条，具体事件不要填；"
+    "用户改主意时用 save_memory(replaces=旧编号) 顶掉旧说法，不要两种并存。"
     "完成复杂流程后可用 save_skill 沉淀方法。"
     "改技能一律走 update_skill 做局部替换，不要整份重写；"
     "系统技能是 AstrBot 本体装的、全局共享，插件不能写它，要改就基于它生成个人副本。"
@@ -1150,15 +1152,8 @@ class HermesCore(Star):
         allow_private = bool(sc["allow_private"])
         resident = self._resident_block(owner_id, allow_private, sc["group_id"])
         if resident:
-            lines.append("[关于这位用户（长期稳定信息）]")
-            # 钉住的条目可能已经被用户改主意了（先说「叫我兄弟」后说「喊我老爹」），
-            # 所以只在有钉住条目时才加这句提示：常驻是「当时的说法」，不是最高优先级。
-            if any(int(r.get("pinned") or 0) for r in resident):
-                lines.append("（「钉」= 用户曾要求一直记住的旧信息；与之冲突时以本人本轮说法为准，"
-                             "并调用 save_memory(replaces=旧编号) 更新，不要两种说法同时沿用）")
-            # 编号保留（pin_memory / save_memory(replaces=) 要用），但放行尾：
-            # 正文优先，行首不出现 #，也省掉逐条 (kind) 标注——类型提到分组标题。
-            lines += format_memory_lines([self._inject_item(r) for r in resident])
+            lines.append("[长期稳定信息（每轮必带）]")
+            lines += self._render_resident(resident)
 
         # 第二层：按当前这句话检索相关记忆（用户 > 群 > 全局逐级补）
         scan = max(200, int(self._get_cfg("recall_scan_limit", 3000)))
@@ -1181,6 +1176,16 @@ class HermesCore(Star):
                 platform=sc["platform"], viewer_owner=owner_id, global_mode=True,
                 **rank_kw)
         raw_mem = len(memories)
+        # 常驻里已经念过的，不要再从检索层念一遍。两层各查各的，同一条记忆
+        # 完全可能同时被两边选中（实测 #159 和 #192 在同一轮注入里出现了两次），
+        # 白烧一份 token，还会让模型以为这条特别重要。
+        if resident:
+            res_ids = {int(it["id"]) for info in resident.values()
+                       for it in info.get("items") or []}
+            kept = [m for m in memories if int(m["id"]) not in res_ids]
+            if len(kept) != len(memories):
+                self._bump_metric("recall_resident_dedup", len(memories) - len(kept))
+                memories = kept
         memories = suppress_repeats(memories, state["seen"], state["turn"])
         if raw_mem > len(memories):
             self._bump_metric("recall_mem_suppressed", raw_mem - len(memories))
@@ -1272,41 +1277,37 @@ class HermesCore(Star):
 
     @staticmethod
     def _inject_item(row: dict) -> dict:
-        """把数据库行压成注入用的最小结构：净化正文 + 钉住附注。
+        """把数据库行压成注入用的最小结构：净化正文。
 
         注入前必须再净化一遍：记忆内容来自历史对话，可能被群友写进去过，
         入库拦截是概率性的，渲染侧不能假设库里全是干净的。
         """
-        pinned = int(row.get("pinned") or 0)
-        note = ""
-        if pinned:
-            d = _short_date(row.get("pinned_ts"))
-            note = f"钉于 {d}" if d else "钉住"
         return {
             "id": int(row["id"]),
             "kind": str(row.get("kind") or "fact"),
             "content": _clean_memory_text(str(row.get("content") or "")),
-            "note": note,
+            "note": "",
         }
 
     def _resident_block(self, owner_id: str, allow_private: bool = True,
-                        group_id: str = "") -> list[dict]:
-        """常驻条目（60 秒缓存）。写记忆/整理后由调用方清缓存。
+                        group_id: str = "") -> dict[str, dict]:
+        """常驻词条（60 秒缓存）。写记忆/整理后由调用方清缓存。
 
         缓存键必须带可见性和群：否则先私聊、再群聊时会拿到同一份（含私事）的缓存；
         换一个群也会拿到上一个群的「只在来源群可见」条目。
+
+        返回 {block: {...}}，只含非空词条——空词条不占注入行。
         """
         if not owner_id or not bool(self._get_cfg("resident_notes", True)):
-            return []
+            return {}
         key = (owner_id, bool(allow_private), str(group_id or ""))
         now = time.time()
         cached = self._resident_cache.get(key)
         if cached and now - cached[0] < 60:
             return cached[1]
-        items = self.db.resident_notes(
+        items = self.db.resident_blocks(
             owner_id,
-            limit=max(1, int(self._get_cfg("resident_max_items", 6))),
-            max_chars=max(120, int(self._get_cfg("resident_max_chars", 400))),
+            limits=self._resident_limits(),
             allow_private=bool(allow_private),
             group_id=str(group_id or ""),
         )
@@ -1320,6 +1321,37 @@ class HermesCore(Star):
                 self._resident_cache.pop(next(iter(self._resident_cache)))
         self._resident_cache[key] = (now, items)
         return items
+
+    @staticmethod
+    def _render_resident(blocks: dict[str, dict]) -> list[str]:
+        """把常驻词条渲染成注入行：一句一个词条，编号跟在每条后面。
+
+        编号必须保留——模型要改口时靠 save_memory(replaces=编号) 定位到
+        具体那一条。不保留的话它只能新写一条，旧说法会继续念下去。
+        """
+        out: list[str] = []
+        for info in blocks.values():
+            parts = [f"{_clean_memory_text(it['content'])}（#{it['id']}）"
+                     for it in info.get("items") or []]
+            if parts:
+                out.append(f"- {info['title']}：" + "；".join(parts))
+        return out
+
+    def _resident_limits(self) -> dict:
+        """六个词条的字数上限，从配置读；读不到就用内置默认值。
+
+        每个词条单列一项配置，比塞一个 JSON 字符串更不容易写坏：改一个
+        词条的预算不会连带影响其它五个。
+        """
+        out = {}
+        for block, default in (("address", 30), ("assistant", 120), ("user", 200),
+                               ("preference", 240), ("style", 200), ("rules", 180)):
+            try:
+                n = int(self._get_cfg(f"resident_chars_{block}", default))
+            except (TypeError, ValueError):
+                n = default
+            out[block] = n if n > 0 else default
+        return out
 
     def _clear_resident(self, owner_id: str = "") -> None:
         """清掉某个人的常驻缓存（两种可见性一起清）；不给 owner 时全清。"""
@@ -1393,43 +1425,6 @@ class HermesCore(Star):
             out.append("[历史] " + " | ".join(f"{m['role']}:{m['content'][:80]}" for m in reversed(msgs)))
         return "\n".join(out) or "没有找到相关内容。"
 
-    @filter.llm_tool(name="pin_memory")
-    async def tool_pin_memory(self, event: AstrMessageEvent, memory_id: int,
-                              pinned: bool = True) -> str:
-        """钉住/取消钉住一条长期记忆。钉住后该条每轮对话必定注入（不受字数预算挤出），整理时也不会被合并或丢弃。当用户明确要求「这条必须一直记住」「以后每次都要带上」时调用；用户改主意（如换称呼、改偏好）时，钉住新条会自动让同主题的旧条退场；用户说某条不用总是记着时用 pinned=false 取消。
-        Args:
-            memory_id (number): 记忆编号（注入块或 search_memory 结果里 # 后面的数字）
-            pinned (boolean): true=钉住，false=取消钉住
-        """
-        sc = self._scope_keys(event)
-        rec = self.db.memory_by_id(int(memory_id))
-        if not rec or int(rec.get("merged_into") or 0) != 0:
-            return f"记忆 #{memory_id} 不存在或已失效。"
-        # 只能操作自己的记忆。公共记忆（无归属）钉住后并不会对任何人常驻
-        # （常驻要求 owner 匹配），却会被永久排除在整理/深度清理之外——
-        # 任何群友都能借此把垃圾条目钉死在库里，所以公共条目只允许管理员钉。
-        mine = bool(sc["owner_id"]) and (rec.get("owner_id") or "") == sc["owner_id"]
-        if not mine and not self._is_admin(event):
-            return "只能钉住你自己的记忆；群/全局公共记忆需要管理员操作。"
-        # 编号必须是本会话真的见过的那几条。群里被注入的「把 #137 钉住」这种话
-        # 不会成功，因为 #137 从未出现在这个会话的上下文里。
-        if not self._id_seen(sc["sid"], int(memory_id)):
-            return (f"#{memory_id} 不在本会话可见范围内。先 search_memory 确认编号，"
-                    f"再对它操作。")
-        conflicts = self.db.slot_conflicts(int(memory_id)) if pinned else []
-        ok = self.db.set_pinned(int(memory_id), bool(pinned))
-        if not ok:
-            return f"记忆 #{memory_id} 状态未变化。"
-        self._resident_cache.clear()
-        if not pinned:
-            return f"#{memory_id} 已取消钉住。"
-        tail = ""
-        if conflicts:
-            tail = "；同主题的旧说法已退场：" + "、".join(f"#{i}" for i in conflicts)
-        if sc["is_group"] and (rec.get("visibility") or "") == "private":
-            tail += "；注意这条属于私聊内容，群里不会注入"
-        return f"#{memory_id} 已钉住：之后每轮对话都会注入这条记忆{tail}。"
-
     def _id_seen(self, sid: str, memory_id: int) -> bool:
         """这个编号是否在本会话出现过（注入块或 search_memory 结果里）。"""
         st = self._inj_state.get(sid) or {}
@@ -1437,15 +1432,32 @@ class HermesCore(Star):
 
     @filter.llm_tool(name="save_memory")
     async def tool_save_memory(self, event: AstrMessageEvent, content: str,
-                               kind: str = "fact", pinned: bool = False,
+                               kind: str = "fact", block: str = "",
                                replaces: int = 0, shareable: bool = False) -> str:
-        """把值得长期记住的信息保存为记忆（自动归属到当前发言用户）。用户偏好、重要事实、项目背景等都应保存。
+        """把值得长期记住的信息保存为记忆（自动归属到当前发言用户）。
+
+        记忆分两种去处，写之前先想清楚这条属于哪一种：
+
+        1. **常驻词条**（填 block）：每轮对话都会带上，所以只放「每轮都用得上」的
+           信息——怎么称呼他、他是谁、喜欢什么、要求怎么回复、你要扮演什么角色、
+           必须遵守什么规则。常驻有字数上限，**同一个词条里不要放两条意思相同的
+           东西**：往下发的 [长期稳定信息] 已经列出全部现有条目，写之前先对照，
+           已有的内容不要重复保存，改主意就用 replaces。
+        2. **归档记忆**（block 留空）：具体事件、一次性事实、项目细节。这类不进
+           常驻，需要时按关键词检索出来。
+
         Args:
-            content (string): 记忆内容（简洁的一句话）
+            content (string): 记忆内容（简洁的一句话，常驻条目尽量 30 字内）
             kind (string): 类型，fact/preference/profile/summary 之一
-            pinned (boolean): 用户明确要求「必须一直记住/每次都要带上」时设为 true，该条将每轮必定注入
-            replaces (number): 要替换的旧记忆编号。用户改变主意（称呼、偏好、习惯变了）时填旧条编号，旧条会退出且不再注入
-            shareable (boolean): 用户明确说「这个在群里也能说」时设 true，该条才会在群聊场景被引用；默认只在私聊可用
+            block (string): 常驻词条，六选一——address（称呼）、assistant（助手设定、
+                需要扮演的角色）、user（用户信息：身份、职业、设备、环境、长期状况）、
+                preference（用户偏好：喜欢什么、不喜欢什么）、style（回复风格：长短、
+                格式、表情、语气）、rules（规则避雷：必须做的、绝不能做的）。留空 =
+                存进归档层按需检索。
+            replaces (number): 要替换的旧记忆编号。用户改主意（称呼、偏好、习惯变了）
+                时填旧条编号，旧条会退场且不再注入
+            shareable (boolean): 用户明确说「这个在群里也能说」时设 true，该条才会在
+                群聊场景被引用；默认只在私聊可用
         """
         sc = self._scope_keys(event)
         text = _clean_memory_text(content)
@@ -1454,15 +1466,30 @@ class HermesCore(Star):
         if _is_injection(text):
             return ("这条内容包含指令式语句（想改写规则或身份），"
                     "不像可长期复用的信息，未保存。")
+        blk = str(block or "").strip().lower()
+        if blk and blk not in HermesDB.RESIDENT_BLOCK_TITLES:
+            return (f"未知词条 {block!r}。可选："
+                    + "、".join(f"{b}（{t}）" for b, t in HermesDB.RESIDENT_BLOCKS))
+
+        # 改口时新条要继承旧条所在词条，否则「以后叫我老师」会落进归档层、
+        # 而常驻里的「叫我哥哥」继续每轮念——那正是两种说法并存的成因。
+        inherit_block = ""
+        if replaces:
+            try:
+                _old = self.db.memory_by_id(int(replaces))
+            except (TypeError, ValueError):
+                _old = None
+            if _old and int(_old.get("merged_into") or 0) == 0:
+                inherit_block = str(_old.get("block") or "")
+        blk = blk or inherit_block
+
         vis = "public" if shareable else ("group" if sc["is_group"] else "private")
         mid, created = self.db.add_memory_smart(
             kind or "fact", text, scope="user", source="llm_tool",
             owner_id=sc["owner_id"], session_id=sc["sid"],
             platform=sc["platform"], group_id=sc["group_id"],
-            visibility=vis,
+            visibility=vis, block=blk, prefer_new=bool(replaces),
         )
-        if created and pinned:
-            self.db.set_pinned(mid, True)
         # replaces 的处理：无论「新建」还是「合并强化到已有条目」都要生效——
         # 模型明确要求顶掉旧条时，后者同样不能漏，否则旧说法依旧活着。
         # 每个被拒理由都要如实回给模型：原来统一返回「已保存」，
@@ -1491,17 +1518,13 @@ class HermesCore(Star):
                 elif not self._id_seen(sc["sid"], int(replaces)):
                     reject = f"旧记忆 #{replaces} 不在本会话可见范围内"
                 else:
-                    # 被替换的旧条原本是常驻的，新条要继承「常驻」身份，
-                    # 否则「以后别叫我兄弟」会把称呼槽位整个清空。
-                    inherit = bool(int(old.get("pinned") or 0))
+                    # 旧条的词条归属已经在上面的 inherit_block 里接过来了，
+                    # 这里只负责让它退场。
                     replaced = self.db.supersede_memories([int(replaces)], mid)
-                    if inherit:
-                        self.db.set_pinned(mid, True)
         # 这条新记忆必须登记进本会话的「已见集合」：replaces 的合法性校验
         # （_id_seen）查的就是这个集合。不登记的话，模型刚 save_memory 拿到
         # #17，紧接着拿 #17 去 replaces 就会被判「不在本会话可见范围内」——
-        # 新旧两种说法就一直并存，两边都注入。tool_search_memory 一直有
-        # 这一步（state["seen"].setdefault），save_memory 这条路径漏了。
+        # 新旧两种说法就一直并存，两边都注入。
         # 放在 replaces 处理之后：顶掉的旧条要能查到，登记新条不影响它。
         state = self._inj_state.setdefault(sc["sid"], {"turn": 0, "seen": {}})
         state["seen"].setdefault(int(mid), state["turn"])
@@ -1510,9 +1533,13 @@ class HermesCore(Star):
         if reject:
             tail += f"；注意：{reject}，它仍然有效，两种说法可能并存"
         if created:
-            self._queue_memories([mid])  # 手动存的也进整理队列，攒够阈值一起合并
-            return f"已保存记忆 #{mid}{tail}。"
-        return f"这条和已有记忆 #{mid} 高度重合，已合并强化，没有新增{tail}。"
+            # 常驻条目不进归档整理队列：它由词条预算管理，不需要「攒够 N 条合并」。
+            if not blk:
+                self._queue_memories([mid])
+            where = f"（{HermesDB.RESIDENT_BLOCK_TITLES.get(blk, blk)}词条，每轮都会带上）" if blk else ""
+            return f"已保存记忆 #{mid}{where}{tail}。"
+        where = "已并入同词条已有条目" if blk else "这条和已有记忆高度重合"
+        return f"{where} #{mid}，已合并强化，没有新增{tail}。"
 
     @filter.llm_tool(name="list_skills")
     async def tool_list_skills(self, event: AstrMessageEvent) -> str:
@@ -1717,6 +1744,84 @@ class HermesCore(Star):
         if self.db.get_meta(self._sum_backoff_key(sid), ""):
             self.db.set_meta(self._sum_backoff_key(sid), "")
 
+    BLOCK_BACKFILL_KEY = "block_backfill_done"
+
+    async def _backfill_blocks(self, force: bool = False) -> str:
+        """把存量记忆按语义归入六个常驻词条（升级后的一次性迁移）。
+
+        为什么必须有这一步：v1.1.0 之前没有 block 字段，常驻是靠 kind 猜的。
+        升级后 block 一律为空，不归位的话常驻会整个变空——用户的称呼、偏好、
+        规则全部退回「要关键词撞上才出现」，等于失忆。
+
+        为什么交给模型而不是写关键词规则：实测「用户偏好免费白嫖模型」按字面
+        像偏好，但后半截讲的是 OpenRouter 的速率限制，本质属于环境信息；
+        任何关键词表都会判错，而判错的代价是它一直占着错的词条预算。
+        """
+        if not force and self.db.get_meta(self.BLOCK_BACKFILL_KEY, ""):
+            return ""
+        cand = [m for m in self.db.all_active_memories()
+                if not (m.get("block") or "")]
+        # 只挑「可能属于常驻」的：画像/偏好，或旧版钉住过的。
+        # 具体事实与事件数量大、本来也不该常驻，全塞给模型是白花钱。
+        cand = [m for m in cand
+                if str(m.get("kind") or "") in ("profile", "preference")
+                or int(m.get("pinned") or 0)]
+        cand = cand[:200]
+        if not cand:
+            self.db.set_meta(self.BLOCK_BACKFILL_KEY, "1")
+            return "没有需要归位的记忆。"
+        listing = "\n".join(
+            f"#{m['id']} [{m.get('kind') or 'fact'}] "
+            f"{_clean_memory_text(str(m.get('content') or ''))[:120]}"
+            for m in cand)
+        head = (
+            "把下面这些长期记忆归入六个常驻词条之一。常驻词条每一轮对话都会被"
+            "带上，所以只放「放到任何一轮里都成立」的稳定信息。\n"
+            "- address 称呼：怎么称呼这位用户\n"
+            "- assistant 助手设定：助手要扮演的角色、性格\n"
+            "- user 用户信息：身份、职业、设备、环境、长期状况\n"
+            "- preference 用户偏好：喜欢什么、不喜欢什么\n"
+            "- style 回复风格：长短、格式、表情、语气\n"
+            "- rules 规则避雷：必须遵守的、绝不能做的\n"
+            "具体事件、一次性事实、已经作废的指令**不要输出**，让它留在归档层。\n"
+            "同一个意思有多条时，只输出最完整的那条。\n"
+            '只输出 JSON 数组，每项 {"id": 编号, "block": 词条名}，不要解释。\n\n'
+            "条目：\n")
+        text = await self.router.chat(
+            builder=lambda _b: head + listing, purpose="常驻归位")
+        moved, bad = 0, 0
+        for item in self._extract_json_array(text):
+            if not isinstance(item, dict):
+                continue
+            try:
+                mid = int(item.get("id"))
+            except (TypeError, ValueError):
+                bad += 1
+                continue
+            blk = str(item.get("block") or "").strip().lower()
+            if blk not in HermesDB.RESIDENT_BLOCK_TITLES:
+                bad += 1
+                continue
+            if self.db.set_memory_block(mid, blk):
+                moved += 1
+        # 一条都没归位时不要把「已归位」标记写死：模型返回空数组和解析失败
+        # 在 _extract_json_array 里长得一样，分辨不出。给三次机会，还不行就
+        # 放弃自动重试（否则每次总结都白调一次模型），留给 /hermes 归位 手工跑。
+        if moved > 0:
+            self.db.set_meta(self.BLOCK_BACKFILL_KEY, "1")
+            self.db.set_meta(self.BLOCK_BACKFILL_KEY + "_tries", "0")
+        else:
+            tries = int(self.db.get_meta(self.BLOCK_BACKFILL_KEY + "_tries", "0") or 0) + 1
+            self.db.set_meta(self.BLOCK_BACKFILL_KEY + "_tries", str(tries))
+            if tries >= 3:
+                self.db.set_meta(self.BLOCK_BACKFILL_KEY, "1")
+                logger.warning("[hermes_core] 常驻归位连续 3 次没有产出，"
+                               "已停止自动重试，可发 /hermes 归位 手动再跑")
+        self._clear_resident()
+        return (f"常驻归位完成：{moved} 条进入词条，"
+                f"{len(cand) - moved} 条留在归档层"
+                + (f"，{bad} 条格式无法识别" if bad else "") + "。")
+
     async def _summarize_impl(self, force: bool = False) -> str:
         """按会话独立判断是否值得总结：各自攒够条数、或超时兜底、或手动强制。
 
@@ -1726,6 +1831,17 @@ class HermesCore(Star):
         if not self.router.has_model():
             return ("本插件还没设置总结模型（它不跟随 AstrBot 主体的对话模型）："
                     "请到 Hermes记忆系统 插件页「模型」标签选择主模型。")
+
+        # 一次性：升级到「六个常驻词条」之后，把存量记忆归位。
+        # 放在总结链路里而不是启动时：这里已经确认模型可用，也能失败重试，
+        # 不会因为启动瞬间模型没配好就永久跳过。
+        if not self.db.get_meta(self.BLOCK_BACKFILL_KEY, ""):
+            try:
+                note = await self._backfill_blocks()
+                if note:
+                    logger.info(f"[hermes_core] {note}")
+            except Exception:
+                logger.error(f"[hermes_core] 常驻归位失败:\n{traceback.format_exc()}")
 
         min_new = max(1, int(self._get_cfg("min_new_messages", 8)))
         grace_h = float(self._get_cfg("summarize_grace_hours", 6))
@@ -1911,36 +2027,51 @@ class HermesCore(Star):
                 "（不要造近义新名），content 写该技能合并后的完整版本：\n" + lines_s
             )
 
-        # 把现有常驻条目给模型看：否则用户改了称呼/偏好，模型只会新增一条，
-        # 两条互相矛盾的「常驻」会同时注入，AI 只能自己猜哪个作数。
-        pinned_hint = ""
+        # 把现有常驻内容给模型看。这一步不能省：模型看不到常驻块，就不知道
+        # 那句话已经在了，只会再写一条——实测 #140「以后称呼他为哥哥」和
+        # #185「始终称呼其为哥哥」就是这么并存了两个月，两条都进注入块。
+        #
+        # 只带本批发言人自己的常驻内容，避免把别人的私事喂进这次总结；
+        # 群会话再收一层 allow_private=False，私聊里的称呼不会被写进群记忆。
+        resident_hint = ""
         try:
-            # 只带本批发言人自己的常驻条目，避免把别人的私事喂进这次总结。
-            # 群会话还要再收一层：私聊钉住的「叫我老爹」进了这段提示，模型很可能
-            # 顺手写进群记忆——那就是把私事带进群的最短路径。
-            pins = [p for p in self.db.pinned_memories(
-                        limit=30, allow_private=not bool(gid), group_id=gid,
-                        viewer_owner=solo_owner)
-                    if not p.get("owner_id") or p["owner_id"] in batch_owners]
+            owners = set(batch_owners)
+            if gid:
+                owners.add("")      # 群级常驻条目没有归属人，单独取一份
+            rows_r: list[str] = []
+            for ow in sorted(owners):
+                blocks = self.db.resident_blocks(
+                    ow, limits=self._resident_limits(),
+                    allow_private=not bool(gid), group_id=gid, truncate=False)
+                for info in blocks.values():
+                    for it in info["items"]:
+                        rows_r.append(f"- #{it['id']} [{info['title']}] "
+                                      f"{_clean_memory_text(it['content'])[:80]}")
         except Exception:
-            pins = []
-        if pins:
-            pl = "\n".join(
-                f"- #{p['id']} ({p['kind']}，owner={p.get('owner_id') or '群'}) "
-                f"{str(p['content'])[:80]}" for p in pins
-            )
-            pinned_hint = (
-                "\n\n[现有常驻记忆（每轮必带）]\n" + pl +
-                "\n若本次对话表明其中某条已经过时或被用户改掉（例如称呼从「兄弟」改成「老爹」），"
-                "把新提炼的那一项额外加 \"replaces\": [旧编号]——它会顶掉旧条并继续常驻；"
-                "不要只新增一条让两种说法并存，也不要原样重复旧条。"
+            rows_r = []
+        if rows_r:
+            resident_hint = (
+                "\n\n[已常驻的内容（每轮都会带上）]\n" + "\n".join(rows_r) +
+                "\n这些内容已经在常驻里，不要再写一遍同样的意思。"
+                "如果本次对话表明其中某条过时或被改掉（例如称呼从「兄弟」改成「老爹」），"
+                "输出该项时填 \"replaces\": [旧编号]，让它顶掉旧条；"
+                "不要只新增一条让两种说法并存。"
             )
 
         head = (self._get_cfg("summary_prompt", "")
                 + "\n\n对话中每位用户都带有 [用户 ID(昵称)] 标记。"
                   "若某条记忆只属于某个特定用户，请在该项追加 \"owner\": \"该用户的ID\"；"
                   "属于整段对话/全体时省略 owner。"
-                + pinned_hint
+                + "\n\n记忆分两种去处，输出每一条时先判断属于哪一种："
+                  "\n- 常驻（每轮必带）：只放「每轮都用得上」的稳定信息。这类要在该项加 "
+                  "\"block\" 字段，取值只能是 address（怎么称呼他）/ assistant（助手要扮演的"
+                  "角色与性格）/ user（身份、职业、设备、环境、长期状况）/ preference（喜欢"
+                  "什么、不喜欢什么）/ style（回复要求：长短、格式、表情、语气）/ rules"
+                  "（必须遵守的规则、绝不能做的事）。"
+                  "\n- 归档（按需检索）：具体事件、一次性事实、项目细节。这类不要填 block。"
+                  "\n判断标准很简单：这句话放到任何一轮对话里都成立吗？成立就是常驻，"
+                  "只在某个话题下才有意义就是归档。"
+                + resident_hint
                 + skill_hint
                 + "\n\n对话记录：\n")
 
@@ -2002,23 +2133,26 @@ class HermesCore(Star):
                         owner = ""  # 群聊里归属不明 → 降级为群公共记忆
                     if owner:
                         owner = self.db.resolve_owner(owner, fmt)
+                # 词条由模型在输出里给出；给错（不在六个之内）就退回归档层，
+                # 绝不让它污染常驻——最坏情况是多一条可检索的归档记忆，
+                # 而不是多占一个每轮都要念的位置。
+                item_block = str(item.get("block") or "").strip().lower()
+                if item_block not in HermesDB.RESIDENT_BLOCK_TITLES:
+                    item_block = ""
                 mid, created = self.db.add_memory_smart(
                     str(item.get("kind", "fact")), content_text,
                     scope="user" if owner else "group", source="auto_summary",
                     owner_id=owner, session_id=sid, platform=fmt, group_id=gid,
                     visibility="group" if gid else "private",
+                    block=item_block,
                 )
                 if created:
                     made_mem += 1
-                    # 用户改主意：新条顶掉旧常驻条，并继承「常驻」身份，
-                    # 否则旧的「叫我兄弟」会永远和新「喊我老爹」一起注入。
+                    # 用户改主意：新条顶掉旧条。词条归属已经在 block 参数里
+                    # 交给写入层了，这里只负责让旧说法退场。
                     repl = self._clean_replaces(item.get("replaces"), mid, owner or "")
                     if repl:
-                        self.db.set_pinned(mid, True)
                         self.db.supersede_memories(repl, mid)
-                    # 用户明确强调「必须一直记住」的条目自动钉住，进入常驻保护通道
-                    if item.get("pinned") and mid:
-                        self.db.set_pinned(mid, True)
         # 新记忆可能改变「关于你」的内容，清掉缓存让下一条消息用上
         self._resident_cache.clear()
         return made_mem, made_skill, skill_upd
@@ -2056,14 +2190,23 @@ class HermesCore(Star):
         return len(self._pending_memory_ids())
 
     def _queue_memories(self, ids) -> int:
-        """把新记忆加入待整理队列，返回队列长度。"""
+        """把新记忆加入待整理队列，返回队列长度。
+
+        常驻词条的条目不进队列：它们由词条自己的字数上限管理，不参与
+        「攒够 N 条合并」——把常驻条目排进归档整理队列，只会在整理时
+        被过滤掉，白占队列名额、还会让触发阈值提前。
+        """
         queue = self._pending_memory_ids()
         seen = set(queue)
         for i in ids:
             i = int(i)
-            if i not in seen:
-                queue.append(i)
-                seen.add(i)
+            if i in seen:
+                continue
+            row = self.db.memory_by_id(i)
+            if not row or str(row.get("block") or ""):
+                continue
+            queue.append(i)
+            seen.add(i)
         queue = queue[-self.MAX_QUEUE:]
         self.db.set_meta("consolidate_pending_memories", json.dumps(queue))
         return len(queue)
@@ -2204,7 +2347,9 @@ class HermesCore(Star):
         floor = min(wm.values()) if wm else 0
         counts: dict[tuple, int] = {}
         for d in self.db.active_memory_scope_rows(floor):
-            if int(d.get("pinned") or 0):
+            # 常驻词条不计入归档整理的水位：它们不参与合并，算进来只会让
+            # 「攒够 200 条就整理」提前触发，跑一次却找不到可合并的对象。
+            if str(d.get("block") or ""):
                 continue
             b = _scope_bucket(d)
             # 没水位的桶从 0 起算：升级后第一次见到它，历史记忆也该纳入整理
@@ -2358,8 +2503,10 @@ class HermesCore(Star):
             rows = [r for r in rows if _scope_bucket(r) in buckets]
         if not rows:
             return "还没有任何记忆。"
-        # 钉住的条目是用户明确要求保护的重要信息：不参与任何合并/丢弃归纳
-        rows = [m for m in rows if not int(m.get("pinned") or 0)]
+        # 常驻词条不参与归档整理：它由词条预算管理，被合并走那个词条就空了。
+        # 这一层过滤和 db.merge_memories 里的 block 排除是双保险——调用点
+        # 以后新增时忘了过滤，数据库层也不会把常驻条目吃掉。
+        rows = [m for m in rows if not str(m.get("block") or "")]
         if deep:
             return await self._deep_consolidate(rows, dry_run, force=force)
 
@@ -3170,6 +3317,22 @@ class HermesCore(Star):
             if deep else
             "记忆整理已开始（先本地聚类，有候选才会调用模型）。\n"
             "整理完会推给你，也可以发 /hermes 整理结果 查看。")
+
+    @hermes.command("归位")
+    async def hermes_backfill_blocks(self, event: AstrMessageEvent):
+        """/hermes 归位 —— 把存量记忆按语义归入六个常驻词条（升级后跑一次即可）"""
+        if not self._is_admin(event):
+            yield event.plain_result(self._deny_admin(event, "常驻归位"))
+            return
+        if not self.router.has_model():
+            yield event.plain_result("本插件还没设置总结模型，请先到插件页「模型」标签选择主模型。")
+            return
+        yield event.plain_result("开始把存量记忆归位到六个常驻词条（会调用一次模型）…")
+        try:
+            note = await self._backfill_blocks(force=True)
+        except Exception as e:
+            note = f"归位失败：{type(e).__name__}: {e}"
+        yield event.plain_result(note or "没有需要归位的记忆。")
 
     def _consolidate_report_text(self) -> str:
         raw = self.db.get_meta("consolidate_report", "")

@@ -9,7 +9,6 @@
 
 import functools
 import os
-import re
 import sqlite3
 import threading
 import time
@@ -86,12 +85,61 @@ def _db_locked(fn):
 # 去重时的否定词哨兵。只用于「两边是否同极性」的比较，不做语义分析。
 _NEG_WORDS = ("不", "没", "无", "别", "禁止", "取消", "勿", "无需")
 
-# 可互斥的「槽位」：同一槽位在常驻里只该有一个当前值。
-# 目前只识别称呼类——它是最典型的「值会被用户直接改掉」的槽位，
-# 且「兄弟」和「老爹」字面相似度为 0，字面去重完全抓不到。
-_SLOT_PATTERNS = (
-    ("address", re.compile(r"(叫我|喊我|称呼我|管我叫|叫我做|称呼为|称呼成)")),
+# 常驻记忆的六个固定词条。词条集合是封闭的：只能往已有词条里写，
+# 不能新建第七个——这样常驻的规模天然有界，不靠「条数」这种估算来管。
+#
+# 为什么按「词条」而不是按「条数」管：一条画像和一条偏好对模型的用途不同，
+# 用同一个池子抢席位，结果是重复的偏好占满名额（实测 6 席里 2 席同一句
+# 「叫哥哥」），而真正该常驻的身份信息被挤掉。词条化之后每个位置各有预算，
+# 互不挤占。
+#
+# block='' 表示「不属于常驻」，走归档层按需召回。一条记忆只能属于一边，
+# 这是「常驻与普通记忆不会重合」的结构性保证。
+RESIDENT_BLOCKS = (
+    ("address", "称呼"),
+    ("assistant", "助手设定"),
+    ("user", "用户信息"),
+    ("preference", "用户偏好"),
+    ("style", "回复风格"),
+    ("rules", "规则避雷"),
 )
+RESIDENT_BLOCK_IDS = tuple(b for b, _ in RESIDENT_BLOCKS)
+RESIDENT_BLOCK_TITLES = dict(RESIDENT_BLOCKS)
+
+
+def _norm_block(block: str) -> str:
+    """词条名归一。未知值一律归空串（归档层），绝不落进常驻。"""
+    b = str(block or "").strip().lower()
+    return b if b in RESIDENT_BLOCK_IDS else ""
+
+
+# 各词条的默认字数上限。这些值不是拍脑袋定的，是按现有记忆的实际长度分布
+# 留出的余量：称呼最稳定也最短（30 字够容下「哥哥」「老爹」这类），
+# 用户信息/偏好最长但去重后一般 150~200 字，回复风格含格式要求稍宽一些。
+# 全部可以在插件配置里改。
+DEFAULT_BLOCK_LIMITS = {
+    "address": 30,
+    "assistant": 120,
+    "user": 200,
+    "preference": 240,
+    "style": 200,
+    "rules": 180,
+}
+
+
+def _block_limits(overrides: dict[str, int] | None = None) -> dict[str, int]:
+    """合并默认上限与配置覆盖值；非法值（非正整数）一律回落到默认。"""
+    out = dict(DEFAULT_BLOCK_LIMITS)
+    for k, v in (overrides or {}).items():
+        if k not in out:
+            continue
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            out[k] = n
+    return out
 
 
 
@@ -153,7 +201,7 @@ def _visible_clause(allow_private: bool, group_id: str, viewer_owner: str = "",
         # else：连查看者是谁都判不出来，就不给任何 private 条目——
         # 这里曾经直接放行全部 private（"调用方已按 owner 收窄"），
         # 但适配器取不到 sender_id 时 owner 就是空串，等于把所有人的私聊记忆
-        # 摊给当前这个人（实测 pinned 里能看到别人的私聊。）没有身份就没有私聊。
+        # 摊给当前这个人（实测常驻块里能看到别人的私聊。）没有身份就没有私聊。
     if group_id:
         parts.append(f"({vis} = 'group' AND {prefix}group_id = ?)")
         args.append(group_id)
@@ -161,23 +209,8 @@ def _visible_clause(allow_private: bool, group_id: str, viewer_owner: str = "",
     return " AND (" + " OR ".join(parts) + ")", args
 
 
-def _neg_words(text: str) -> set[str]:    return {w for w in _NEG_WORDS if w in str(text or "")}
-
-
-def _slot_of(content: str) -> str:
-    """把记忆归到一个「只能有一个当前值」的槽位，没有则返回空串。
-
-    称呼是典型例子：用户先说「叫我兄弟」，后说「喊我老爹」，前者必须让位。
-    这两句字面相似度为 0，靠 jaccard 永远发现不了冲突，只能按语义槽位判定。
-    正则故意写窄——宁可漏判（靠模型 replaces 兜底），也不要误把
-    「叫我别忘了喝水」当成称呼槽位。
-    """
-    s = str(content or "")
-    for slot, pat in _SLOT_PATTERNS:
-        if pat.search(s):
-            return slot
-    return ""
-
+def _neg_words(text: str) -> set[str]:
+    return {w for w in _NEG_WORDS if w in str(text or "")}
 
 
 # 技能表：唯一键是 (owner_id, name)，同一个人不能有两条同名技能，
@@ -218,6 +251,11 @@ SKILL_VISIBLE_SQL = (
 
 
 class HermesDB:
+    # 常驻词条的枚举与中文名挂到类上：main.py 有三种导入路径（包内相对、
+    # modules.*、按文件路径直接加载），只有类名是三者都拿得到的。
+    RESIDENT_BLOCKS = RESIDENT_BLOCKS
+    RESIDENT_BLOCK_TITLES = RESIDENT_BLOCK_TITLES
+
     def __init__(self, data_dir: str, db_name: str = "hermes.db"):
         os.makedirs(data_dir, exist_ok=True)
         self.path = os.path.join(data_dir, db_name)
@@ -307,6 +345,11 @@ class HermesDB:
             # 在群里 @ 机器人时，私聊记忆一旦注入，回复就是把私事当众说出来。
             # private=仅私聊可用 / group=仅来源群可用 / public=任何场景可用
             "ALTER TABLE memories ADD COLUMN visibility TEXT DEFAULT ''",
+            # v1.1.0：常驻改为六个固定词条。block 非空 = 常驻层（每轮注入、
+            # 只被改写、不参与归档整理），block 为空 = 归档层（按需召回）。
+            # 取代原来的 pinned：钉住是「一条条保护」，词条是「按位置分配预算」，
+            # 前者挡不住同一个位置重复写入（实测两条「叫哥哥」同时钉住）。
+            "ALTER TABLE memories ADD COLUMN block TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 c.execute(ddl)
@@ -385,14 +428,11 @@ class HermesDB:
                 ON memories(merged_into, kind, id);
             CREATE INDEX IF NOT EXISTS idx_msg_sender
                 ON messages(session_id, sender_id, id);
-            -- 公共钉住条目的部分索引。常驻块要同时取「本人的钉住条目」和
-            -- 「所有人的公共钉住条目」，写成 (owner_id = ? OR visibility='public')
-            -- 会让 SQLite 放弃 idx_mem_active、改走 idx_mem_kind 全扫，
-            -- 实测 2000 条时 0.022ms -> 0.141ms。这条部分索引只索引 pinned=1
-            -- 的行，两个分支就都能走索引（实测 0.025ms），写入侧几乎无开销
-            -- （非 pinned 的行根本不进这个索引）。
-            CREATE INDEX IF NOT EXISTS idx_mem_pubpin
-                ON memories(merged_into, visibility) WHERE pinned = 1;
+            -- 常驻词条的读取索引。常驻查询是「按人 + 按可见域取 block 非空的
+            -- 活跃条目」，命中率极高但每次都跑，且要在 merged_into 上先过滤，
+            -- 所以列序从过滤性最强的两列开始。
+            CREATE INDEX IF NOT EXISTS idx_mem_block
+                ON memories(merged_into, owner_id, block);
             """
         )
         self._repair_orphan_private(c)
@@ -892,16 +932,16 @@ class HermesDB:
     def add_memory(self, kind: str, content: str, scope: str = "global",
                    source: str = "", owner_id: str = "", session_id: str = "",
                    platform: str = "", group_id: str = "",
-                   visibility: str = "") -> int:
+                   visibility: str = "", block: str = "") -> int:
         vis = self._norm_visibility(visibility, owner_id, group_id)
         with self._lock:
             cur = self.conn.execute(
                 "INSERT INTO memories(ts, kind, scope, content, source, owner_id,"
-                " session_id, platform, group_id, visibility)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                " session_id, platform, group_id, visibility, block)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), self._norm_kind(kind), scope, content, source,
                  owner_id or "", session_id or "", platform or "", group_id or "",
-                 vis),
+                 vis, _norm_block(block)),
             )
             self.conn.commit()
             return cur.lastrowid
@@ -915,31 +955,32 @@ class HermesDB:
                          source: str = "", owner_id: str = "", session_id: str = "",
                          platform: str = "", group_id: str = "",
                          visibility: str = "",
-                         threshold: float = 0.70) -> tuple[int, bool]:
-        """写入记忆前先判断「这条是不是已经说过了」。
+                         threshold: float = 0.70,
+                         block: str = "",
+                         prefer_new: bool = False) -> tuple[int, bool]:
+        """写入记忆，同时决定它属于「常驻词条」还是「归档层」。
 
-        返回 (id, 是否新建)。同一作用域里已有高度相似的条目时，不再插一条新的，
-        而是强化旧条：内容取更完整的那个，重要度上调。
-        这样注入质量不会在「攒够 10 条再合并」的窗口期里一路下滑。
+        返回 (id, 是否新建)。`block` 非空 = 写进常驻的某个词条；空 = 归档层。
+
+        **归属只在这里判定一次，这是「常驻不会和普通记忆重合」的结构性保证。**
+        旧实现里 `kind=preference` 既是常驻候选、又参与归档整理，同一条事实
+        会被工具写入和自动总结各存一份，两份都进注入块（实测两条「叫哥哥」
+        占掉 6 个席位里的 2 个）。
+
+        去重池按词条切分：同词条内高度相似就合并（同一位置只留一个当前值），
+        跨词条不合并——「喜欢葡萄」和「喜欢免费模型」都属用户偏好，但它们是
+        两件事，不能因为相似度就并成一条。
         """
         content = str(content or "").strip()
         if not content:
             return 0, False
         kind = self._norm_kind(kind)
+        block = _norm_block(block)
         vis = self._norm_visibility(visibility, owner_id, group_id)
         # 去重池不能带 session_id：同一个人在私聊和群里各说一次同样的偏好，
-        # session 不同就会各存一条，两条又会同时进常驻（实测注入块里出现过
-        # 一模一样的重复条目）。按人/按群归并。
-        #
+        # session 不同就会各存一条，两条又会同时进常驻。按人/按群归并。
         # 但去重必须同可见性：把群里说的话并进一条 private 记忆，等于让它
         # 从此在群里消失；反过来把私聊内容并进 group 记忆，就是把私事搬到群里。
-        #
-        # group_id 只在 visibility='group' 时才参与收窄——那是唯一「可见域由
-        # 群决定」的一档，跨群合并会把 A 群的内容搬到 B 群。private 只看 owner
-        # （且只在私聊可见）、public 全员可见，两者都与 group_id / session_id
-        # 无关；原来一律按 group_id 收窄，导致「群里沉淀了一条 private、私聊
-        # 再说同一句」时查不到旧条、又新建一条，生产库里这种 private+group_id
-        # 的条目实测有 4 条。
         if vis == "group":
             if owner_id:
                 pool_cond, pool_args = "owner_id = ? AND group_id = ?", (owner_id, group_id or "")
@@ -948,16 +989,23 @@ class HermesDB:
         else:
             pool_cond = "owner_id = ?" if owner_id else "owner_id = ''"
             pool_args = (owner_id,) if owner_id else ()
-        rows = self.conn.execute(
-            "SELECT id, content, importance, pinned FROM memories WHERE merged_into = 0"
-            " AND " + pool_cond +
-            " AND COALESCE(visibility, '') = ?"
-            " ORDER BY id DESC LIMIT 300",
-            (*pool_args, vis),
-        ).fetchall()
+        # 去重池按层切开：常驻写入只跟同词条比，归档写入只跟归档层比。
+        # 跨层不合并——层不同意味着「用途不同」，不是「说法不同」。
+        base_cond, base_args = pool_cond, tuple(pool_args)
+
+        def _scan(block_cond: str, extra: tuple) -> list:
+            return self.conn.execute(
+                "SELECT id, content FROM memories WHERE merged_into = 0"
+                " AND " + base_cond + " AND " + block_cond +
+                " AND COALESCE(visibility, '') = ?"
+                " ORDER BY id DESC LIMIT 300",
+                (*base_args, *extra, vis),
+            ).fetchall()
+
+        rows = _scan("COALESCE(block, '') = ?", (block,)) if block \
+            else _scan("COALESCE(block, '') = ''", ())
         best_id, best_sim = 0, 0.0
         corrections: list[int] = []
-        pin_old = False
         for r in rows:
             s = _jaccard(content, r["content"] or "")
             if s < 0.60:
@@ -967,15 +1015,33 @@ class HermesDB:
             # 旧条必须退场，否则两个相反偏好会同时被召回、同时注入。
             if _neg_words(content) != _neg_words(r["content"] or ""):
                 corrections.append(int(r["id"]))
-                pin_old = pin_old or bool(int(r["pinned"] or 0))
                 continue
             if s > best_sim:
                 best_id, best_sim = int(r["id"]), s
+        # 归档写入再额外看一眼常驻层：这句话已经每轮都在念了，就别在归档里
+        # 再存一份——那正是「后台 10 轮后又总结出一条」的后果（同一条事实
+        # 两份记录，一份常驻一份可检索，各自注入一次）。
+        # 这里只拦字面几乎一致的（≥0.85），不做语义判断：判断「这算不算同一件事」
+        # 是模型写 block 时的活，数据库层只兜住最明显的重复。
+        if not block and not (best_id and best_sim >= threshold):
+            for r in _scan("COALESCE(block, '') != ''", ()):
+                s = _jaccard(content, r["content"] or "")
+                if s < 0.85:
+                    continue
+                if _neg_words(content) != _neg_words(r["content"] or ""):
+                    continue
+                return int(r["id"]), False
         if best_id and best_sim >= threshold:
             old = self.conn.execute(
-                "SELECT content, importance FROM memories WHERE id = ?", (best_id,)
+                "SELECT content FROM memories WHERE id = ?", (best_id,)
             ).fetchone()
-            merged = old["content"] if len(old["content"]) >= len(content) else content
+            # prefer_new：调用方明确说「这条顶掉旧的」时，新表述必须生效。
+            # 默认取更长的那条是为了防信息丢失，但改口场景下旧的往往更长
+            # （「用户希望被称呼为哥哥」比「叫我老师」长），取长的等于没改。
+            if prefer_new:
+                merged = content
+            else:
+                merged = old["content"] if len(old["content"]) >= len(content) else content
             with self._lock:
                 self.conn.execute(
                     "UPDATE memories SET content = ?, updated_ts = ?,"
@@ -986,20 +1052,13 @@ class HermesDB:
                 self.conn.commit()
             if corrections:
                 self.supersede_memories(corrections, best_id)
-            if pin_old:
-                # 被改掉的是常驻条目：新说法合并进了 best，常驻身份要跟过来，
-                # 否则「叫我哥哥」被改成「叫我老师」后整个槽位从常驻里消失。
-                self.set_pinned(best_id, True)
             return best_id, False
         new_id = self.add_memory(kind, content, scope=scope, source=source,
                                  owner_id=owner_id, session_id=session_id,
                                  platform=platform, group_id=group_id,
-                                 visibility=vis)
+                                 visibility=vis, block=block)
         if corrections:
             self.supersede_memories(corrections, new_id)
-            if pin_old:
-                # 旧条本来是常驻的，新说法继续常驻，槽位不能空着
-                self.set_pinned(new_id, True)
         return new_id, True
 
     def bump_hits(self, ids: list[int]) -> None:
@@ -1017,172 +1076,105 @@ class HermesDB:
             self.conn.commit()
 
     @_db_locked
-    def resident_notes(self, owner_id: str, limit: int = 6,
-                       max_chars: int = 400,
-                       kinds: tuple[str, ...] = ("profile", "preference"),
-                       allow_private: bool = True,
-                       group_id: str = "") -> list[dict]:
-        """常驻「关于你」条目：不依赖检索命中，每次对话固定注入。
+    def resident_blocks(self, owner_id: str, limits: dict[str, int] | None = None,
+                        allow_private: bool = True, group_id: str = "",
+                        truncate: bool = True) -> dict[str, dict]:
+        """六个常驻词条的内容，每个词条各有独立的字数上限。
 
-        Hermes 的做法是把 MEMORY.md / USER.md 整块加载——「机器人记得你」的
-        基线不该建立在「这次的关键词恰好撞上」之上。这里只取稳定的画像与偏好
-        （fact 是具体事实，量大且多为一次性信息，走检索层按需召回），
-        按重要度与命中次数排序，最后按字符预算截断。
+        与旧实现的根本差别：不再「按重要度抢 6 个席位」，而是每个词条各有
+        预算。称呼只占 30 字、用户信息占 200 字，互不挤占——旧实现里 6 席被
+        两条重复的「叫哥哥」占掉 2 席，身份信息反而被挤出注入块。
 
-        allow_private=False 用于群聊场景：私聊里沉淀的条目一律不取。
-        这条不是「建议」，而是硬过滤——群里的回复是当众的，注进去就等于说出来。
+        返回 {block: {"block","title","items","text","chars","limit","dropped"}}。
+        空词条不出现在结果里：不注入空行，省的是每轮固定成本。
+
+        allow_private=False（群聊）时私聊词条整层不出现——群里的话是当众说的。
+        group_id 参与可见性判定：A 群「只在来源群可见」的条目不能进 B 群常驻。
+
+        truncate=False 供写入前对照用：要把**全部**已有条目交给模型看，
+        被预算挤掉的那几条恰恰最容易被重复写出来。
         """
         if not owner_id:
-            return []
-        marks = _ph(len(kinds))
-        # 可见性必须带群：A 群里沉淀的「只在来源群可见」条目，不能因为同一个人
-        # 在 B 群发言就进常驻。v0.12.17 之前这里只挡 private，group 条目会跨群。
+            return {}
+        caps = _block_limits(limits)
         vis, vis_args = _visible_clause(allow_private, group_id, owner_id)
-        # 第一批：钉住的条目（任何 kind）——用户/模型明确要求「每轮必带」的信息，
-        # 不受 kind 限制，也不受字符预算限制，这是重要信息的保护通道。
-        # 按 pinned_ts 倒序：同槽位冲突时最新的排前面，模型能看出先后。
-        #
-        # owner_id 不能是硬条件：public 条目没有归属人（owner_id 为空串），
-        # 它本来就对所有人可见（见 _visible_clause），钉住它的人表达的也是
-        # 「每轮都要带上这条全局规则」。原来写死 owner_id = ?，public 钉住条目
-        # 谁都匹配不上——面板里显示已钉住，模型每轮却收不到，钉住语义在最关键
-        # 的这条通道上失效，而且两处口径不一致（pinned_memories 在 owner_id 为空
-        # 时是不加 owner 过滤的）。
-        #
-        # 拆成 UNION ALL 两支而不是一条 OR：OR 会让 SQLite 放弃 idx_mem_active
-        # 改走全扫（实测 0.022ms -> 0.141ms）。两支各走各的索引，实测 0.025ms。
-        # 外层再套一层 SELECT *：SQLite 的复合查询里 ORDER BY 只能按列名或
-        # 列序号排，不能写 COALESCE(pinned_ts, 0) 这种表达式，直接套在 UNION
-        # 后面会报 "1st ORDER BY term does not match any column"。
-        #
-        # 两支的切分必须**互斥**。UNION ALL 不去重，一旦同一条记录两支都命中，
-        # 它就会在常驻块里出现两次——白占注入预算，还可能触发槽位冲突误判。
-        # 切分线划在「是否公共」上，而不是「owner 是本人 / 是公共」这两条
-        # 正交的轴上：
-        #   支1：owner 是本人 且 **非公共**（private / group 等）
-        #   支2：**公共**（visibility 为空串或 'public'），不论归属人
-        # 两支互补且互斥，任何一条记录最多命中一支。
-        # 判定用 _vis_expr()——和 _visible_clause 同一个表达式。支2 若写成
-        # `visibility = 'public'` 硬比较，早期没有 visibility 字段、值为空串
-        # 的老条目会判不出来，公共钉住条目凭空消失。
-        visx = _vis_expr()
-        pinned_rows = self.conn.execute(
-            "SELECT * FROM ("
-            " SELECT id, kind, content, importance, hits, pinned, pinned_ts,"
-            " COALESCE(visibility, '') AS visibility FROM memories"
-            " WHERE merged_into = 0 AND pinned = 1 AND owner_id = ?"
-            " AND " + visx + " != 'public'" + vis +
-            " UNION ALL "
-            " SELECT id, kind, content, importance, hits, pinned, pinned_ts,"
-            " COALESCE(visibility, '') AS visibility FROM memories"
-            " WHERE merged_into = 0 AND pinned = 1"
-            " AND " + visx + " = 'public'" + vis +
-            ") ORDER BY COALESCE(pinned_ts, 0) DESC, id DESC LIMIT ?",
-            (owner_id, *vis_args, *vis_args, max(1, int(limit))),
-        ).fetchall()
-        # 第二批：画像/偏好优先。重要度必须随时间衰减——importance 只在重复写入时
-        # +0.15、从不下降，按它硬排会让新偏好永远挤不进常驻（实测 6 条老条目
-        # importance 0.6 占满席位，新偏好 0 进不来）。改成「被召回/更新才续命」。
         rows = self.conn.execute(
-            f"SELECT id, kind, content, importance, hits, pinned, pinned_ts,"
-            f" ts, updated_ts, last_hit_ts, COALESCE(visibility, '') AS visibility"
-            f" FROM memories"
-            f" WHERE merged_into = 0 AND owner_id = ? AND pinned = 0 AND kind IN ({marks})"
-            + vis +
-            " ORDER BY id DESC LIMIT ?",
-            (owner_id, *kinds, *vis_args, max(40, int(limit) * 8)),
+            "SELECT id, block, content, kind FROM memories"
+            " WHERE merged_into = 0 AND COALESCE(block, '') != ''"
+            " AND owner_id = ?" + vis +
+            " ORDER BY id ASC",
+            (owner_id, *vis_args),
         ).fetchall()
-        now = time.time()
-        ranked: list[tuple] = []
+
+        grouped: dict[str, list[dict]] = {}
         for r in rows:
-            ref = float(r["last_hit_ts"] or r["updated_ts"] or r["ts"] or 0)
-            age_days = max(0.0, (now - ref) / 86400.0) if ref else 3650.0
-            fresh = 0.5 ** (age_days / 120.0)      # 120 天半衰：不碰就淡
-            score = ((1.0 + float(r["importance"] or 0))
-                     * fresh
-                     * (1.0 + min(0.5, float(r["hits"] or 0) * 0.02)))
-            kind_rank = 0 if r["kind"] == "profile" else 1
-            # 私聊场景里 private 比 group 更「贴身」：同一个人私下说的，比在群里
-            # 顺口说的一句更能代表他。
-            vis_rank = {"private": 0, "public": 1, "group": 2}.get(
-                str(r["visibility"] or "private"), 2)
-            # kind / 可见性只能当轻微偏好，不能当第一排序键：原来按
-            # (kind_rank, vis_rank, -score) 排，profile 永远排在 preference 前面，
-            # 新鲜度与重要度的加权被彻底架空——实测 6 条老 profile 占满席位，
-            # 刚写入的新 preference 无论多新都挤不进常驻，正是这条注释声称
-            # 要解决的「新偏好永远进不来」。改成乘进 score，主导权还给新鲜度。
-            kind_boost = 1.10 if kind_rank == 0 else 1.0
-            vis_boost = (1.05, 1.0, 0.95)[vis_rank]
-            ranked.append((-score * kind_boost * vis_boost, -int(r["id"]), r))
-        ranked.sort(key=lambda x: (x[0], x[1]))
-        rows = [x[2] for x in ranked]
-        out: list[dict] = []
-        used = 0
-        seen: set[int] = set()
-        kept_texts: list[str] = []
-        # 钉住条目先入，不受字符预算约束；但总条数仍受 limit 约束——
-        # 否则「6 条 pin + 6 条画像」会变成 12 条常驻，钉得越多越贵。
-        for r in pinned_rows:
-            if len(out) >= limit:
-                break
+            b = _norm_block(r["block"])
             text = str(r["content"] or "").strip()
-            if not text:
+            if not b or not text:
                 continue
-            out.append(dict(r))
-            seen.add(int(r["id"]))
-            kept_texts.append(text)
-            used += len(text) + 3
-        for r in rows:             # 其余条目受字符预算约束
-            if len(out) >= limit:
-                break
-            if int(r["id"]) in seen:
+            bucket = grouped.setdefault(b, [])
+            # 同一句话在私聊和群里各存一条（可见性不同不能合并），私聊场景
+            # 会同时看到两条：同词条内按字面去重，只留先写入的那条。
+            if any(_jaccard(text, x["content"]) >= 0.85 for x in bucket):
                 continue
-            text = str(r["content"] or "").strip()
-            if not text:
+            bucket.append({"id": int(r["id"]), "content": text,
+                           "kind": str(r["kind"] or "fact")})
+
+        out: dict[str, dict] = {}
+        for block, _title in RESIDENT_BLOCKS:
+            items = grouped.get(block) or []
+            if not items:
                 continue
-            # 同一句话在私聊和群里各存了一条（可见性不同不能合并），
-            # 私聊场景会同时看到两条一模一样的——按字面去重，只留排前面的那条。
-            if any(_jaccard(text, t) >= 0.85 for t in kept_texts):
-                continue
-            if used + len(text) > max_chars and out:
-                break
-            out.append(dict(r))
-            kept_texts.append(text)
-            used += len(text) + 3
+            cap = int(caps.get(block, 0))
+            kept, used = self._fit_block(items, cap if truncate else 10 ** 9)
+            text = "；".join(x["content"] for x in kept)
+            out[block] = {
+                "block": block,
+                "title": RESIDENT_BLOCK_TITLES[block],
+                "items": kept,
+                "text": text,
+                "chars": len(text),
+                "limit": cap,
+                "dropped": len(items) - len(kept),
+            }
         return out
 
-    @_db_locked
-    def pinned_memories(self, owner_id: str = "", limit: int = 30,
-                        allow_private: bool = True,
-                        group_id: str = "",
-                        viewer_owner: str = "") -> list[dict]:
-        """全部钉住条目，供总结时判断「哪条被改变了」。
+    @staticmethod
+    def _fit_block(items: list[dict], cap: int) -> tuple[list[dict], int]:
+        """按字数上限挑条目：**从最新的往回挑**，超了就丢最旧的。
 
-        allow_private=False 用于群会话的总结：私聊钉住的「叫我老爹」不该被塞进
-        一次群聊总结的提示里——那正是把私事写进群记忆的最短路径。
-        group_id 同样要参与：别的群里钉住的内容不能被拿来当本群总结的依据。
-
-        viewer_owner 是「这次总结在替谁看」：私聊总结传 solo_owner，
-        private 钉住条目才可见。不传时（或传空）fail-closed——
-        v0.12.17 的无身份不放行 private 修复落地时漏改了这个调用点，
-        导致私聊里钉的称呼/偏好从未进过总结提示，"replaces 旧编号"
-        机制对私聊钉住完全失效（旧说法一直活着、每轮注入）。
+        为什么不能像旧实现那样按重要度排：用户改口以后，新的说法在最后，
+        旧的还在。按重要度排会把刚写的「叫我老爹」挤掉、留着半年前的
+        「叫我兄弟」——常驻块里于是念着已经作废的称呼。
         """
-        sql = ("SELECT id, kind, content, owner_id, group_id, pinned_ts, visibility"
-               " FROM memories WHERE merged_into = 0 AND pinned = 1")
-        args: list = []
-        if owner_id:
-            sql += " AND owner_id = ?"
-            args.append(owner_id)
-        vis, vis_args = _visible_clause(allow_private, group_id,
-                                        viewer_owner or owner_id)
-        sql += vis
-        args += vis_args
-        # 最新优先：钉住超过 limit 条时，最近钉的（称呼刚改、偏好刚变）
-        # 才是这次总结最需要对照的；按 id 升序取会把新钉的挤出提示窗。
-        sql += " ORDER BY id DESC LIMIT ?"
-        args.append(max(1, int(limit)))
-        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+        kept: list[dict] = []
+        used = 0
+        for it in reversed(items):
+            cost = len(it["content"]) + 1
+            if kept and used + cost > cap:
+                continue
+            if not kept and cost > cap:
+                # 单条就超上限：截断而不是整条丢。丢掉等于这个词条永远空着，
+                # 上限本来是「省 token」的手段，不该变成「什么都记不下」。
+                it = dict(it, content=it["content"][: max(1, cap - 1)] + "…")
+                cost = len(it["content"]) + 1
+            kept.append(it)
+            used += cost
+        kept.reverse()
+        return kept, cap
+
+    def set_memory_block(self, memory_id: int, block: str) -> bool:
+        """把一条记忆挪进某个常驻词条（或挪回归档层，block=''）。"""
+        b = _norm_block(block)
+        now = time.time()
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE memories SET block = ?, updated_ts = ?"
+                " WHERE id = ? AND merged_into = 0",
+                (b, now, int(memory_id)),
+            )
+            self.conn.commit()
+        return cur.rowcount > 0
 
     def set_visibility(self, memory_id: int, visibility: str) -> bool:
         """改一条记忆的可见范围（用户明确说「这个可以在群里说」时才放宽）。"""
@@ -1199,44 +1191,12 @@ class HermesDB:
             self.conn.commit()
         return cur.rowcount > 0
 
-    @_db_locked
-    def slot_conflicts(self, memory_id: int) -> list[int]:
-        """只读：这条记忆入常驻时会顶掉哪些同槽位旧条（用于提示用户）。"""
-        rec = self.memory_by_id(int(memory_id))
-        if not rec:
-            return []
-        slot = _slot_of(rec["content"])
-        if not slot:
-            return []
-        rows = self.conn.execute(
-            "SELECT id, content FROM memories WHERE merged_into = 0 AND pinned = 1"
-            " AND owner_id = ? AND id != ?"
-            # 同槽位只在同一可见域里比较：私聊里的「叫我哥哥」不能被
-            # 另一个群里钉的「叫我老师」顶掉，反之亦然。
-            " AND (COALESCE(visibility, 'public') = 'public'"
-            "      OR COALESCE(group_id, '') = ?)",
-            (rec.get("owner_id") or "", int(memory_id),
-             rec.get("group_id") or ""),
-        ).fetchall()
-        return [int(r["id"]) for r in rows if _slot_of(r["content"]) == slot]
-
-    def supersede_slot_conflicts(self, memory_id: int) -> list[int]:
-        """把同一个人、同一槽位里被这条新记忆顶掉的旧条退场。
-
-        只在 set_pinned 之后有意义（只处理已钉住的旧条）。旧条不删文本，
-        只把 merged_into 指向新条 —— 所有「活跃记忆」查询天然排除，
-        误顶替时可以按 id 捞回原文。
-        """
-        gone = self.slot_conflicts(int(memory_id))
-        if gone:
-            self.supersede_memories(gone, int(memory_id))
-        return gone
-
     def supersede_memories(self, ids: list[int], new_id: int) -> int:
-        """旧记忆被新版本取代：退出活跃池（merged_into=new_id），并取消钉住。
+        """旧记忆被新版本取代：退出活跃池（merged_into=new_id）。
 
         与 merge_memories 的区别：这里不做内容合并，只是「新说法生效」。
-        原文保留，不物理删除。
+        旧条原文保留、不物理删除，也不清空它的 block——误顶替时按 id
+        捞回来就能原位复活。
         """
         new_id = int(new_id or 0)
         clean = []
@@ -1251,7 +1211,7 @@ class HermesDB:
             return 0
         with self._lock:
             cur = self.conn.execute(
-                f"UPDATE memories SET merged_into = ?, pinned = 0, pinned_ts = 0,"
+                f"UPDATE memories SET merged_into = ?,"
                 f" updated_ts = ? WHERE id IN ({_ph(len(clean))})"
                 f" AND merged_into = 0 AND id != ?",
                 (new_id, time.time(), *clean, new_id),
@@ -1292,7 +1252,7 @@ class HermesDB:
         """
         with self._lock:
             rows = self.conn.execute(
-                "SELECT id, owner_id, group_id, platform, visibility, pinned "
+                "SELECT id, owner_id, group_id, platform, visibility, block "
                 "FROM memories WHERE id > ? AND merged_into = 0",
                 (int(since_id),),
             ).fetchall()
@@ -1310,28 +1270,6 @@ class HermesDB:
         ).fetchone()
         return dict(row) if row else None
 
-    def set_pinned(self, memory_id: int, pinned: bool) -> bool:
-        """钉住/取消钉住一条记忆。钉住的条目：必进常驻注入，整理时不可合并或丢弃。
-
-        钉住不是终身制：重新钉住会刷新 pinned_ts，并自动让同槽位的旧说法退场
-        （例如先说「叫我兄弟」后说「喊我老爹」，旧条 unpin 且退出活跃池）。
-        """
-        now = time.time()
-        with self._lock:
-            cur = self.conn.execute(
-                "UPDATE memories SET pinned = ?, pinned_ts = ?, updated_ts = ?"
-                " WHERE id = ? AND merged_into = 0",
-                (1 if pinned else 0, now if pinned else 0, now, int(memory_id)),
-            )
-            self.conn.commit()
-        if cur.rowcount <= 0:
-            return False
-        if pinned:
-            # 顶掉同槽位的旧条；不删原文，只退出活跃池。
-            # 放锁外：supersede 自己会取锁，而 _lock 不可重入。
-            self.supersede_slot_conflicts(int(memory_id))
-        return True
-
     def merge_memories(self, ids: list[int], content: str, kind: str = "") -> int:
         """把一组记忆合成一条新的，旧条只标记 merged_into 指向新条（不物理删除）。
 
@@ -1348,12 +1286,14 @@ class HermesDB:
             return 0
         with self._lock:
             marks = _ph(len(ids))
-            # 只收活跃且未钉住的条目：并发整理可能已经把同一批 id 合并掉，
-            # 钉住则是用户明确要求保护的信息。原来只按 id 取，会把已合并条目的
-            # merged_into 指针改指向新条，回滚链（unmerge）就此断掉。
+            # 只收活跃且**在归档层**的条目：并发整理可能已经把同一批 id 合并掉；
+            # 常驻词条里的内容不能被归档整理合并走，否则那个词条会凭空变空。
+            # 原来只按 id 取，会把已合并条目的 merged_into 指针改指向新条，
+            # 回滚链（unmerge）就此断掉。
             rows = self.conn.execute(
                 f"SELECT * FROM memories WHERE id IN ({marks})"
-                " AND COALESCE(merged_into, 0) = 0 AND COALESCE(pinned, 0) = 0",
+                " AND COALESCE(merged_into, 0) = 0"
+                " AND COALESCE(block, '') = ''",
                 ids,
             ).fetchall()
             if len(rows) < 2 or len(rows) != len(set(ids)):
@@ -1391,7 +1331,8 @@ class HermesDB:
                 upd = self.conn.execute(
                     f"UPDATE memories SET merged_into = ?, updated_ts = ?"
                     f" WHERE id IN ({marks})"
-                    " AND COALESCE(merged_into, 0) = 0 AND COALESCE(pinned, 0) = 0",
+                    " AND COALESCE(merged_into, 0) = 0"
+                    " AND COALESCE(block, '') = ''",
                     (new_id, now, *ids),
                 )
                 if upd.rowcount != len(rows):
@@ -1433,7 +1374,7 @@ class HermesDB:
 
         深度整理用：一次性任务指令、闲聊反馈、技能清单这类「不该进长期记忆」
         的条目无法与任何东西合并，只能整体退出活跃池。
-        钉住的条目拒绝丢弃——那是用户明确要求保护的重要信息。
+        常驻词条里的条目拒绝丢弃——它占着那个位置，丢了词条就空了。
         """
         ids = [int(i) for i in ids if i]
         if not ids:
@@ -1442,7 +1383,8 @@ class HermesDB:
             marks = _ph(len(ids))
             cur = self.conn.execute(
                 f"UPDATE memories SET merged_into = -1, updated_ts = ?"
-                f" WHERE id IN ({marks}) AND merged_into = 0 AND pinned = 0",
+                f" WHERE id IN ({marks}) AND merged_into = 0"
+                f" AND COALESCE(block, '') = ''",
                 (time.time(), *ids),
             )
             self.conn.commit()
