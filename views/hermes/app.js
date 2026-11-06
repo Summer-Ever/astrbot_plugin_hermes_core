@@ -36,6 +36,7 @@
     settings: { groups: [], dirty: false },
     models: { data: null, draft: null, dirty: false },
     aliases: [],
+    job: { seq: 0, lastState: "" },
   };
 
   let modalSeq = 0;
@@ -224,7 +225,7 @@
     if (name === "skills") loadSkills();
     if (name === "models") loadModels();
     if (name === "settings") loadSettings();
-    if (name === "tools") { loadAliases(); }
+    if (name === "tools") { loadAliases(); pollJobStatus(); }
   }
 
   /* ---------------- 概览 ---------------- */
@@ -1148,6 +1149,111 @@
     }
   }
 
+  /* ---------------- 整理任务日志（服务端持久化 + 增量轮询） ---------------- */
+
+  const JOB_LV = { start: "开始", info: "信息", ok: "完成", warn: "注意", err: "错误" };
+  const JOB_SRC = { auto: "后台", page: "页面" };
+
+  function fmtClock(ts) {
+    const d = new Date(Number(ts || 0) * 1000);
+    if (Number.isNaN(d.getTime())) return "--:--:--";
+    const p = (x) => String(x).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  function renderJobLines(lines) {
+    const box = $("#job-log");
+    if (!box || !lines || !lines.length) return;
+    const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+    const empty = box.querySelector(".empty");
+    if (empty) empty.remove();
+    const frag = document.createDocumentFragment();
+    lines.forEach((ln) => {
+      const row = document.createElement("div");
+      row.className = `job-line ${JOB_LV[ln.level] ? ln.level : "info"}`;
+      const ts = document.createElement("span");
+      ts.className = "job-ts";
+      ts.textContent = fmtClock(ln.ts);
+      const lv = document.createElement("span");
+      lv.className = "job-lv";
+      lv.textContent = JOB_LV[ln.level] || "信息";
+      const msg = document.createElement("span");
+      msg.className = "job-msg";
+      msg.textContent = `${ln.src ? `[${JOB_SRC[ln.src] || ln.src}] ` : ""}${ln.msg || ""}`;
+      row.append(ts, lv, msg);
+      frag.appendChild(row);
+    });
+    box.appendChild(frag);
+    while (box.children.length > 200) box.removeChild(box.firstChild);
+    if (stick) box.scrollTop = box.scrollHeight;
+  }
+
+  function renderJobState(job, running, busy) {
+    const el = $("#job-state");
+    if (!el) return;
+    const map = { done: "已完成", failed: "未跑完", interrupted: "已中断" };
+    const st = running ? "running" : (job && job.state) || "";
+    el.textContent = running ? "运行中" : (busy ? "后台整理中" : (map[st] || "空闲"));
+    el.className = `chip ${running || busy ? "warn" : (st === "done" ? "ok" : "")}`;
+    // 完整结果（尤其预览计划）也回填到原输出框：刷新回来同样能看，不只有日志摘要。
+    if (!running && job && job.result) {
+      const out = job.kind === "skill" ? $("#out-skill") : $("#out-consolidate");
+      if (out && out.textContent !== job.result) {
+        out.classList.remove("hidden");
+        out.classList.toggle("ok", job.state === "done");
+        out.classList.toggle("err", job.state !== "done");
+        out.textContent = job.result;
+      }
+    }
+    if (state.job.lastState === "running" && !running) {
+      loadOverview();
+      if (state.tab === "skills") loadSkills();
+      if (state.tab === "memories") loadMemories();
+    }
+    state.job.lastState = st;
+  }
+
+  async function pollJobStatus() {
+    if (document.hidden || !getBridge()) return;
+    try {
+      const res = await apiGet("actions/job-status", { since: state.job.seq });
+      if (Array.isArray(res.lines) && res.lines.length) {
+        state.job.seq = Math.max(
+          state.job.seq, ...res.lines.map((l) => Number(l.seq) || 0));
+        renderJobLines(res.lines);
+      }
+      renderJobState(res.job, !!res.running, !!res.busy);
+    } catch (_) { /* 轮询失败不打扰用户，下次 tick 再试 */ }
+  }
+
+  async function startJob(kind, dry, btn, outEl) {
+    const path = kind === "memory" ? "actions/consolidate" : "actions/skill-consolidate";
+    setBusy(btn, true, "提交中");
+    if (outEl) {
+      outEl.classList.remove("hidden", "ok", "err");
+      outEl.textContent = "正在提交后台任务…";
+    }
+    try {
+      const res = await apiPost(path, { dry_run: dry });
+      if (res.started === false) {
+        if (outEl) { outEl.classList.add("err"); outEl.textContent = res.reason || "无法提交整理"; }
+        toast(res.reason || "无法提交整理", "err");
+        return;
+      }
+      if (outEl) {
+        outEl.classList.add("ok");
+        outEl.textContent = "已提交：下方「整理日志」会持续打印过程，离开页面也不会中断。";
+      }
+      toast("已提交，后台执行中");
+      await pollJobStatus();
+    } catch (err) {
+      if (outEl) { outEl.classList.add("err"); outEl.textContent = `失败：${errMsg(err)}`; }
+      toast(errMsg(err), "err");
+    } finally {
+      setBusy(btn, false);
+    }
+  }
+
   async function loadAliases() {
     try {
       const data = await apiGet("aliases");
@@ -1435,33 +1541,41 @@
     $("#act-summarize").addEventListener("click", (e) =>
       runAction(e.currentTarget, $("#out-summarize"), () => apiPost("actions/summarize"), "总结中"));
     $("#act-consolidate-preview").addEventListener("click", (e) =>
-      runAction(e.currentTarget, $("#out-consolidate"), () => apiPost("actions/consolidate", { dry_run: true }), "分析中"));
+      startJob("memory", true, e.currentTarget, $("#out-consolidate")));
     $("#act-consolidate").addEventListener("click", () => {
       openModal({
         title: "执行记忆整理",
         sub: "会真实写入：旧的碎片记忆被标记合并",
-        bodyHtml: '<p class="muted">确认执行？如果只是想看计划，先点「预览」。</p>',
+        bodyHtml: '<p class="muted">确认执行？提交后可在下方「整理日志」看进度，离开页面也不会中断。</p>',
         okText: "执行",
         onOk: async () => {
-          const btn = $("#act-consolidate");
-          await runAction(btn, $("#out-consolidate"), () => apiPost("actions/consolidate", { dry_run: false }), "整理中");
+          await startJob("memory", false, $("#act-consolidate"), $("#out-consolidate"));
         },
       });
     });
     $("#act-skill-preview").addEventListener("click", (e) =>
-      runAction(e.currentTarget, $("#out-skill"), () => apiPost("actions/skill-consolidate", { dry_run: true }), "分析中"));
+      startJob("skill", true, e.currentTarget, $("#out-skill")));
     $("#act-skill").addEventListener("click", () => {
       openModal({
         title: "执行技能整理",
         sub: "重叠技能会合并成一个，旧技能被删除",
-        bodyHtml: '<p class="muted">确认执行？建议先预览。</p>',
+        bodyHtml: '<p class="muted">确认执行？建议先预览。提交后可在下方「整理日志」看进度。</p>',
         okText: "执行",
         onOk: async () => {
-          const btn = $("#act-skill");
-          await runAction(btn, $("#out-skill"), () => apiPost("actions/skill-consolidate", { dry_run: false }), "整理中");
-          await loadSkills();
+          await startJob("skill", false, $("#act-skill"), $("#out-skill"));
         },
       });
+    });
+    $("#job-log-clear").addEventListener("click", async () => {
+      try {
+        const res = await apiPost("actions/job-log/clear");
+        if (res.cleared === false) return toast(res.reason || "整理运行中，稍后再清空", "err");
+        const box = $("#job-log");
+        if (box) box.innerHTML = '<div class="empty">暂无记录</div>';
+        toast("日志已清空");
+      } catch (err) {
+        toast(errMsg(err), "err");
+      }
     });
     $("#act-export").addEventListener("click", (e) =>
       runAction(e.currentTarget, $("#out-export"), () => apiPost("actions/export"), "导出中"));
@@ -1538,6 +1652,12 @@
     } catch (_) { /* context 晚到也不影响使用 */ }
 
     loadOverview();
+    // 整理日志在服务端，首次拉取全量、之后按 seq 拉增量；页面重新可见时立刻补一次。
+    pollJobStatus();
+    setInterval(pollJobStatus, 2500);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) pollJobStatus();
+    });
   }
 
   document.addEventListener("DOMContentLoaded", boot);

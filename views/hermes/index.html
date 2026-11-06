@@ -408,6 +408,19 @@
 
         <div class="card" style="margin-top:14px">
           <div class="card-head">
+            <h2>整理日志 <span class="chip" id="job-state">读取中…</span></h2>
+            <div class="row"><button class="btn ghost" id="job-log-clear">清空日志</button></div>
+          </div>
+          <p class="muted" style="font-size:12.5px;margin:0 0 8px">
+            记忆 / 技能整理都在后台执行，刷新或离开页面不会中断；这里按时间记录提交、进度与结果，回来还能接着看。
+          </p>
+          <div class="job-log mono" id="job-log" aria-live="polite">
+            <div class="empty">暂无记录</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-head">
             <h2>身份别名</h2>
             <span class="sub">QQ 官方机器人同一个人的 openid 在不同群/私聊里不一样，绑定后记忆才会归到同一个人</span>
           </div>

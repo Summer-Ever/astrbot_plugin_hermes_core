@@ -328,6 +328,26 @@ html[data-theme="dark"] .tag-ro { background: rgba(240, 170, 60, .16); }
 .output.ok { border-color: color-mix(in srgb, var(--ok) 35%, var(--border)); }
 .output.err { border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); color: var(--danger); }
 
+/* ---------- 整理日志小框（状态/过程刷新不丢） ---------- */
+
+.job-log {
+  height: 190px; overflow: auto; padding: 10px 12px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+  font-size: 12px; line-height: 1.65;
+}
+.job-line {
+  display: flex; gap: 8px; padding: 1px 0;
+  white-space: pre-wrap; word-break: break-word;
+}
+.job-line .job-ts { flex: 0 0 auto; color: var(--faint); }
+.job-line .job-lv { flex: 0 0 auto; min-width: 30px; }
+.job-line .job-msg { flex: 1 1 auto; }
+.job-line.start .job-lv, .job-line.ok .job-lv { color: var(--ok); }
+.job-line.warn .job-lv { color: var(--warn); }
+.job-line.err .job-lv { color: var(--danger); }
+.job-line.info .job-msg { color: var(--muted); }
+.job-log .empty { color: var(--muted); }
+
 /* ---------- 弹窗 / toast ---------- */
 
 .modal-mask {

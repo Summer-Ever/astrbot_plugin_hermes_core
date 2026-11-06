@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import traceback
 
@@ -137,7 +138,7 @@ except ImportError:
         format_memory_lines = _rc_mod.format_memory_lines
         suppress_repeats = _rc_mod.suppress_repeats
 
-PLUGIN_VERSION = "0.12.24"
+PLUGIN_VERSION = "0.12.25"
 
 SYSTEM_MEMORY_HINT = (
     "你拥有持久记忆系统。可用工具：search_memory(检索记忆/历史)、save_memory(保存重要事实)、"
@@ -316,6 +317,11 @@ class HermesCore(Star):
         # 手动整理是长任务（逐作用域调用模型），不能占着事件处理等平台回话：
         # QQ 官方被动回复只有 5 分钟有效期，超时后结果只能靠主动消息补发。
         self._consolidate_task: asyncio.Task | None = None
+        # WebUI 点「整理」走独立后台任务：HTTP 立刻返回，页面刷新/关掉也不影响
+        # 任务本身，过程与结果落在 meta 里由页面轮询拉取。
+        self._ui_job_task: asyncio.Task | None = None
+        self._job_lock = threading.Lock()
+        self._job_src = "auto"
         # 自动深度整理是独立的后台任务：它跑几分钟，不能 await 在总结循环里，
         # 也不该覆盖手动整理的报告或推动普通整理队列。调度标志在 create_task
         # 之前就置位，防止「任务还没开始、_consolidating 仍是 False」时重复调度。
@@ -567,6 +573,181 @@ class HermesCore(Star):
                     pass
         return h.hexdigest()[:10]
 
+    # ---- 整理任务日志：页面刷新 / 离开后仍可查回状态与过程 ----
+
+    JOB_LOG_KEY = "consolidate_job_log"
+    JOB_LOG_MAX = 160
+
+    def _job_log_read(self) -> dict:
+        """读日志；坏数据一律当空日志，绝不让页面轮询把后台流程带崩。"""
+        try:
+            raw = json.loads(self.db.get_meta(self.JOB_LOG_KEY, "") or "{}")
+        except (ValueError, TypeError, AttributeError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        lines = raw.get("lines") if isinstance(raw.get("lines"), list) else []
+        job = raw.get("job") if isinstance(raw.get("job"), dict) else None
+        try:
+            seq = int(raw.get("seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        return {"seq": seq, "lines": lines, "job": job}
+
+    def _job_log_write(self, data: dict) -> None:
+        self.db.set_meta(self.JOB_LOG_KEY, json.dumps(data, ensure_ascii=False))
+
+    def job_emit(self, msg: str, level: str = "info",
+                 kind: str = "", src: str = "") -> int:
+        """追加一行日志。seq 全局递增，前端据此只拉增量。"""
+        with self._job_lock:
+            data = self._job_log_read()
+            seq = int(data["seq"]) + 1
+            line = {"seq": seq, "ts": int(time.time()),
+                    "level": str(level)[:8], "kind": str(kind)[:12],
+                    "src": str(src or getattr(self, "_job_src", "auto"))[:12],
+                    "msg": str(msg)[:500]}
+            lines = list(data["lines"]) + [line]
+            if len(lines) > self.JOB_LOG_MAX:
+                lines = lines[-self.JOB_LOG_MAX:]
+            data.update({"seq": seq, "lines": lines})
+            self._job_log_write(data)
+            return seq
+
+    def job_snapshot(self, since: int = 0) -> dict:
+        data = self._job_log_read()
+        try:
+            since = int(since)
+        except (TypeError, ValueError):
+            since = 0
+        lines = [x for x in data["lines"]
+                 if isinstance(x, dict) and int(x.get("seq") or 0) > since]
+        job = data["job"] or {}
+        return {"seq": int(data["seq"]), "lines": lines, "job": job,
+                "running": job.get("state") == "running",
+                # 自动/命令触发的整理也会写日志，页面该如实显示「后台整理中」
+                "busy": bool(getattr(self, "_consolidating", False))}
+
+    def clear_job_log(self) -> dict:
+        data = self._job_log_read()
+        if (data["job"] or {}).get("state") == "running":
+            return {"cleared": False, "reason": "整理还在跑，等结束再清空"}
+        # seq 保留：页面手里的 since 不会回退，清完不会把旧行重新拉回来。
+        self._job_log_write({"seq": int(data["seq"]), "lines": [],
+                             "job": data["job"]})
+        return {"cleared": True}
+
+    def _job_finish(self, job_id: str, state: str, result: str) -> None:
+        with self._job_lock:
+            data = self._job_log_read()
+            job = data["job"] or {}
+            if job.get("id") != job_id:
+                return
+            job["state"] = state
+            job["result"] = str(result)[:4000]
+            job["finished"] = int(time.time())
+            data["job"] = job
+            self._job_log_write(data)
+
+    def start_consolidate_job(self, kind: str, dry_run: bool = False) -> dict:
+        """WebUI 提交整理：立刻返回 job_id，真正的整理在后台任务里跑。
+
+        以前 action_consolidate 直接 await 整理，HTTP 长连接既占着请求，
+        又让「是不是还在跑」这件事只存在于浏览器按钮上——刷新页面就全丢，
+        连接断开还有把协程一起取消的风险。
+        """
+        if kind not in ("memory", "skill"):
+            return {"started": False, "reason": "未知整理类型"}
+        if not self.router.has_model():
+            return {"started": False,
+                    "reason": "本插件还没设置总结模型，请先在「模型」标签选择主模型"}
+        running = (getattr(self, "_ui_job_task", None),
+                   getattr(self, "_consolidate_task", None),
+                   getattr(self, "_deep_task", None))
+        if (any(t is not None and not t.done() for t in running)
+                or self._consolidating):
+            return {"started": False,
+                    "reason": "已有整理任务在运行，等它跑完再点（下方日志能看到进度）"}
+        job_id = f"{int(time.time())}-{kind[:2]}"
+        with self._job_lock:
+            data = self._job_log_read()
+            data["job"] = {"id": job_id, "kind": kind, "dry": bool(dry_run),
+                           "state": "running", "ts": int(time.time()),
+                           "result": "", "progress": {"done": 0, "total": 0}}
+            self._job_log_write(data)
+        self._job_src = "页面"
+        label = "记忆" if kind == "memory" else "技能"
+        self.job_emit(f"已提交{label}整理{'（预览，不写库）' if dry_run else ''}，"
+                      "后台开始执行；离开页面也不会中断", level="start", kind=kind)
+        self._ui_job_task = asyncio.create_task(
+            self._run_ui_consolidate_job(job_id, kind, bool(dry_run)))
+        return {"started": True, "job_id": job_id,
+                "result": "已提交后台整理，过程见下方「整理日志」"}
+
+    async def _run_ui_consolidate_job(self, job_id: str, kind: str,
+                                      dry_run: bool) -> None:
+        label = "记忆" if kind == "memory" else "技能"
+        started = time.monotonic()
+        heartbeat = asyncio.create_task(
+            self._ui_job_heartbeat(kind, started))
+        ok, out = True, ""
+        try:
+            if kind == "memory":
+                out = await self._consolidate_memories(dry_run=dry_run)
+                if not dry_run:
+                    self._requeue_after_consolidate()
+            else:
+                out = await self._consolidate_skills(dry_run=dry_run)
+                if not dry_run:
+                    self.db.set_meta("skill_consolidate_pending", "0")
+            if "整理正在进行中" in out:
+                ok = False
+        except asyncio.CancelledError:
+            self._job_finish(job_id, "interrupted",
+                             "整理被中断（插件重载或后台退出）；已提交的合并已写库，"
+                             "没跑到的部分下次整理会继续。")
+            self.job_emit(f"{label}整理已中断", level="warn", kind=kind)
+            raise
+        except Exception:
+            ok = False
+            out = f"整理失败：{traceback.format_exc(limit=3)}"
+            logger.error(f"[hermes_core] {label}整理失败:\n{out}")
+        finally:
+            heartbeat.cancel()
+            self._job_src = "auto"
+        self._job_finish(job_id, "done" if ok else "failed", out)
+        self.job_emit(f"{label}整理{'完成' if ok else '未跑完'}，"
+                      f"耗时 {int(time.monotonic() - started)}s：{out[:260]}",
+                      level="ok" if ok else "err", kind=kind, src="页面")
+
+    async def _ui_job_heartbeat(self, kind: str, started: float) -> None:
+        """任务还在跑就定时报一次「活着」，回到页面能立刻看出没卡死。"""
+        while True:
+            await asyncio.sleep(12)
+            total = done = 0
+            try:
+                rep = json.loads(self.db.get_meta("consolidate_report", "") or "{}")
+                prog = (rep.get("progress") or {}) if isinstance(rep, dict) else {}
+                total, done = int(prog.get("total") or 0), int(prog.get("done") or 0)
+            except (ValueError, TypeError, AttributeError):
+                pass
+            tail = f"，进度 {done}/{total} 片" if total else ""
+            self.job_emit(f"仍在运行…已用时 {int(time.monotonic() - started)}s{tail}",
+                          level="info", kind=kind)
+
+    def _recover_interrupted_ui_job(self) -> None:
+        """重载 / 进程被杀后，把遗留的 running 标记落到日志里。"""
+        data = self._job_log_read()
+        job = data["job"] or {}
+        if job.get("state") != "running":
+            return
+        job["state"] = "interrupted"
+        job["result"] = ("上次整理被中断（插件重载或后台退出）；已提交的合并已写库，"
+                         "没跑到的部分下次整理会继续。")
+        data["job"] = job
+        self._job_log_write(data)
+        self.job_emit("检测到上次整理未跑完，已标记为中断", level="warn")
+
     def _recover_interrupted_job(self):
         """启动自检：把「进程被杀时留下的运行中标记」改成中断。
 
@@ -578,6 +759,7 @@ class HermesCore(Star):
         数据本身是安全的：每个作用域的合并/丢弃都在单个 SQLite 事务里提交，
         被中断只会丢掉"还没跑到的桶"，不会留下写了一半的条目。
         """
+        self._recover_interrupted_ui_job()
         raw = self.db.get_meta("consolidate_report", "")
         if not raw:
             return
@@ -615,6 +797,7 @@ class HermesCore(Star):
             return
         rep["progress"] = {"done": int(done), "total": int(total)}
         self.db.set_meta("consolidate_report", json.dumps(rep, ensure_ascii=False))
+        self.job_emit(f"深度整理进度：{done}/{total} 片", level="info", kind="memory")
 
     # ---- 进度推送 + 模型落款 ----
 
@@ -2017,8 +2200,12 @@ class HermesCore(Star):
         总结流程也一起堵住。
         """
         if self._consolidating:
+            self.job_emit("记忆整理被跳过：已有另一条整理在跑",
+                          level="warn", kind="memory")
             return "整理正在进行中，这次跳过（发 /hermes 整理结果 看进度）。"
         self._consolidating = True
+        self.job_emit(f"开始记忆整理{'（预览，不写库）' if dry_run else ''}"
+                      f"{'，深度' if deep else ''}", level="info", kind="memory")
         # 每次整理开始前清空上次的「已评估」记录：被跳过（拿不到锁）时
         # 它保持为空集，调用方的重建队列逻辑就等于什么也不清。
         self._last_evaluated = set()
@@ -2121,6 +2308,8 @@ class HermesCore(Star):
             seen.add(key)
             uniq.append(g)
         clusters = sorted(uniq, key=lambda g: -len(g))[:max_clusters]
+        self.job_emit(f"扫描 {len(rows)} 条活跃记忆，得到 {len(clusters)} 组候选，"
+                      "开始调用模型判断", level="info", kind="memory")
         # 这批 id 已交给模型判断过（合或不合都算结案），整理后从队列里退场；
         # 没进前 max_clusters 组的焦点 id 保留，等下一轮和更晚出现的相似记忆配对。
         self._last_evaluated = {int(x["id"]) for g in clusters for x in g}
@@ -2170,6 +2359,8 @@ class HermesCore(Star):
         )
         foot = self._footer()
         plan = self._extract_json_array(text)
+        self.job_emit(f"模型返回 {len(plan)} 条处理建议，开始校验归属与可见性",
+                      level="info", kind="memory")
 
         applied: list[str] = []
         for item in plan:
@@ -2202,6 +2393,9 @@ class HermesCore(Star):
             if new_id:
                 applied.append(f"#{'/'.join(map(str, ids))} → #{new_id}：{content[:80]}")
 
+        self.job_emit(f"本轮通过校验 {len(applied)} 组"
+                      f"{'（预览，未写库）' if dry_run else ''}",
+                      level="info", kind="memory")
         scope_note = (f"\n（每个作用域只检查最近 {cluster_max} 条，"
                       f"较早的 {capped} 条请用「深度整理」处理）" if capped else "")
         if not applied:
@@ -2564,8 +2758,12 @@ class HermesCore(Star):
         与总结流程里正在进行的 upsert_skill 撞上时，谁后写谁赢、对方那份直接消失。
         """
         if self._consolidating:
+            self.job_emit("技能整理被跳过：已有另一条整理在跑",
+                          level="warn", kind="skill")
             return "整理正在进行中，这次跳过技能整理。"
         self._consolidating = True
+        self.job_emit(f"开始技能整理{'（预览，不写库）' if dry_run else ''}",
+                      level="info", kind="skill")
         try:
             return await self._consolidate_skills_inner(dry_run=dry_run)
         finally:
@@ -2587,15 +2785,24 @@ class HermesCore(Star):
         picked = groups[:limit]
         done_all: list[str] = []
         notes: list[str] = []
-        for g in picked:
+        for idx, g in enumerate(picked, 1):
+            label = self._group_label(g)
+            self.job_emit(f"整理归属域 {idx}/{len(picked)}：{label}",
+                          level="info", kind="skill")
             try:
                 note, done, checked = await self._consolidate_skill_group(g, dry_run)
             except ModelError as exc:
-                notes.append(f"{self._group_label(g)}：整理失败（{exc.kind}），稍后重试")
+                self.job_emit(f"{label}：模型调用失败（{exc.kind}），稍后重试",
+                              level="warn", kind="skill")
+                notes.append(f"{label}：整理失败（{exc.kind}），稍后重试")
                 continue
             except Exception:
+                self.job_emit(f"{label}：整理失败，详情见后端日志",
+                              level="warn", kind="skill")
                 logger.error(f"[hermes_core] 整理技能失败:\n{traceback.format_exc()}")
                 continue
+            self.job_emit(f"{label}：模型判断合并 {len(done)} 组",
+                          level="info", kind="skill")
             if note:
                 notes.append(note)
             done_all += [f"{self._group_label(g)} {'/'.join(d)}" for d in done]
@@ -3230,7 +3437,7 @@ class HermesCore(Star):
         # 不等它就直接 close()，线程会在已关闭的连接上继续 DELETE。
         self.db.request_stop()
         tasks = [t for t in (self._bg_task, self._consolidate_task,
-                             self._deep_task, self._probe_task)
+                             self._deep_task, self._ui_job_task, self._probe_task)
                  if t is not None and not t.done()]
         for t in tasks:
             t.cancel()

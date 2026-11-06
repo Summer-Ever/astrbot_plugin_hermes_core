@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +63,9 @@ def new_core(tmp: str):
     obj._deep_task = None
     obj._deep_scheduled = False
     obj._consolidating = False
+    obj._ui_job_task = None
+    obj._job_lock = threading.Lock()
+    obj._job_src = "auto"
     obj._metrics = {}
     obj._metrics_dirty = 0
     return obj
@@ -519,11 +523,90 @@ async def case_skill_timeout(tmp: str) -> None:
     check("整理技能仍带 deadline", bool(kw) and kw.get("deadline") is not None)
 
 
+async def case_job_log(tmp: str) -> None:
+    """页面整理日志：持久化、增量、裁剪、坏数据、后台任务状态与中断恢复。"""
+    core = new_core(tmp)
+    check("空日志快照", core.job_snapshot(0)["lines"] == [])
+    s1 = core.job_emit("第一行", level="start", kind="memory")
+    s2 = core.job_emit("第二行")
+    check("seq 全局递增", s2 == s1 + 1)
+    snap = core.job_snapshot(s1)
+    check("增量只返回新行",
+          len(snap["lines"]) == 1 and snap["lines"][0]["msg"] == "第二行")
+    check("快照 seq 与最新一致", snap["seq"] == s2)
+    stored = json.loads(core.db.get_meta("consolidate_job_log", "{}"))
+    check("日志确实落库（刷新页面能拉回）", stored["seq"] == s2)
+
+    for i in range(core.JOB_LOG_MAX + 5):
+        core.job_emit(f"刷屏 {i}")
+    lines = core.job_snapshot(0)["lines"]
+    check("日志行数有上限", len(lines) == core.JOB_LOG_MAX, str(len(lines)))
+    check("裁剪保留最新行", str(lines[-1]["msg"]).startswith("刷屏"))
+
+    core.db.set_meta("consolidate_job_log", "{坏掉的 json")
+    check("坏 JSON 不抛异常", core.job_snapshot(0)["lines"] == [])
+    core.db.set_meta("consolidate_job_log", json.dumps(
+        {"seq": 7, "lines": "不是列表", "job": "不是字典"}))
+    bad = core.job_snapshot(0)
+    check("坏类型字段容错", bad["lines"] == [] and bad["job"] == {})
+
+    core.router = types.SimpleNamespace(has_model=lambda: False)
+    check("未配模型时拒绝提交",
+          core.start_consolidate_job("memory")["started"] is False)
+    core.router = types.SimpleNamespace(has_model=lambda: True)
+    check("未知整理类型被拒",
+          core.start_consolidate_job("nope")["started"] is False)
+
+    called: list = []
+
+    async def fake_consolidate(dry_run=False, **_kw):
+        called.append(dry_run)
+        return "模拟整理完成：1 组"
+
+    core._consolidate_memories = fake_consolidate
+    core._requeue_after_consolidate = lambda: called.append("requeue")
+    res = core.start_consolidate_job("memory", dry_run=True)
+    check("提交立刻返回 job_id", res["started"] is True and bool(res.get("job_id")))
+    check("运行中重复提交被拒",
+          core.start_consolidate_job("skill")["started"] is False)
+    check("运行中不允许清空日志", core.clear_job_log()["cleared"] is False)
+    await core._ui_job_task
+    await asyncio.sleep(0)
+    snap = core.job_snapshot(0)
+    check("任务结束状态为 done", snap["job"]["state"] == "done")
+    check("最终结果落库", "模拟整理完成" in snap["job"]["result"])
+    check("预览不重建整理队列", "requeue" not in called)
+    check("日志有完成行", any(x["level"] == "ok" for x in snap["lines"]))
+    check("日志标记来源为页面", any(x["src"] == "页面" for x in snap["lines"]))
+    check("任务结束恢复来源标记", core._job_src == "auto")
+    check("空闲可清空日志", core.clear_job_log()["cleared"] is True)
+    after = core.job_snapshot(0)
+    check("清空保留 seq（不会重放旧行）",
+          after["seq"] == snap["seq"] and after["lines"] == [])
+
+    async def boom(dry_run=False, **_kw):
+        raise RuntimeError("模型炸了")
+
+    core._consolidate_memories = boom
+    core.start_consolidate_job("memory")
+    await core._ui_job_task
+    await asyncio.sleep(0)
+    check("异常时状态为 failed",
+          core.job_snapshot(0)["job"]["state"] == "failed")
+
+    core.db.set_meta("consolidate_job_log", json.dumps(
+        {"seq": 99, "lines": [],
+         "job": {"id": "old", "state": "running", "result": ""}}))
+    core._recover_interrupted_ui_job()
+    check("重载后遗留 running 被标中断",
+          core.job_snapshot(0)["job"]["state"] == "interrupted")
+
+
 async def main() -> int:
     for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
                case_merge, case_visibility, case_mutex, case_detach, case_footer,
                case_deep_bucket_count, case_deep_plan, case_deep_schedule,
-               case_skill_timeout):
+               case_skill_timeout, case_job_log):
         tmp = tempfile.mkdtemp(prefix="hermes-cons-")
         try:
             await fn(tmp)

@@ -6,8 +6,9 @@ AstrBot 的插件页面通过 ``context.register_web_api`` 注册接口，前端
 转发到本文件的方法。
 
 设计原则：
-- 只做「读写自己的库」这类轻量操作，耗时操作（总结/整理）保留同步返回，
-  但前端会显示明确的进行中状态，避免用户以为卡死。
+- 只做「读写自己的库」这类轻量操作；整理是长任务，提交后立刻返回一个
+  job_id，由后台任务执行，过程与结果落 meta，页面用 actions/job-status 轮询。
+  这样刷新页面、切走再回来都不会中断任务，也不会只剩一个空白按钮。
 - 配置写入走 AstrBotConfig 的 save_config_async，和 WebUI 配置页改的是同一份文件。
 - 所有输入都做类型/范围校验，不让前端把字符串塞进 int 字段。
 """
@@ -111,6 +112,10 @@ class HermesWebAPI:
              ["POST"], "整理记忆"),
             (f"{self.prefix}/actions/skill-consolidate", self.action_skill_consolidate,
              ["POST"], "整理技能"),
+            (f"{self.prefix}/actions/job-status", self.action_job_status,
+             ["GET"], "整理任务状态与增量日志"),
+            (f"{self.prefix}/actions/job-log/clear", self.action_job_log_clear,
+             ["POST"], "清空整理日志"),
             (f"{self.prefix}/actions/export", self.action_export, ["POST"], "导出记忆 Markdown"),
             (f"{self.prefix}/aliases", self.aliases, ["GET"], "身份别名列表"),
             (f"{self.prefix}/aliases/add", self.alias_add, ["POST"], "添加身份别名"),
@@ -645,25 +650,24 @@ class HermesWebAPI:
 
     async def action_consolidate(self):
         data = await self._body()
-        dry = bool(data.get("dry_run"))
-        if not self.plugin.router.has_model():
-            return self._fail("本插件还没设置总结模型，请先在「模型」标签选择主模型")
-        result = await self.plugin._consolidate_memories(dry_run=dry)
-        if not dry:
-            # 整理被跳过（已有另一条在跑）时这里不能清队列——
-            # 重建逻辑只退场「真被评估过」的 id，被跳过时评估集为空，等于保留全部
-            self.plugin._requeue_after_consolidate()
-        return json_response({"result": result, "dry_run": dry})
+        return json_response(self.plugin.start_consolidate_job(
+            "memory", bool(data.get("dry_run"))))
 
     async def action_skill_consolidate(self):
         data = await self._body()
-        dry = bool(data.get("dry_run"))
-        if not self.plugin.router.has_model():
-            return self._fail("本插件还没设置总结模型，请先在「模型」标签选择主模型")
-        result = await self.plugin._consolidate_skills(dry_run=dry)
-        if not dry:
-            self.plugin.db.set_meta("skill_consolidate_pending", "0")
-        return json_response({"result": result, "dry_run": dry})
+        return json_response(self.plugin.start_consolidate_job(
+            "skill", bool(data.get("dry_run"))))
+
+    async def action_job_status(self):
+        try:
+            query = request.query if request is not None else {}
+            since = int(query.get("since") or 0)
+        except (ValueError, TypeError, AttributeError):
+            since = 0
+        return json_response(self.plugin.job_snapshot(since))
+
+    async def action_job_log_clear(self):
+        return json_response(self.plugin.clear_job_log())
 
     async def action_export(self):
         md = self.plugin.db.export_memories_markdown()

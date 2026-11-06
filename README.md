@@ -731,6 +731,39 @@ qwen3.7-flash 约 32.5s、nemotron 28~52s。测试通不代表长任务能在预
 配置 clamp）、smoke_consolidate 59→**66**（整理技能 timeout 端到端跟随配置），
 db 146 / tools 22，合计 **273 项**全绿；`ruff check --select=E9,F` 通过。
 
+## 整理状态可在页面回看（v0.12.25）
+
+以前点「执行整理 / 执行技能整理」，按钮上的「整理中」和结果都只在**浏览器
+内存**里：WebAPI 直接 `await` 整理，HTTP 长连接一挂就是几十秒到十几分钟；切到
+别的插件页或刷新一下，DOM 重建，状态全空，人也无从判断后台到底还在不在跑。
+后端那套 `consolidate_report` 只服务 `/hermes 整理` 命令，WebUI 触发的整理
+根本不写它。
+
+现在改成**提交即返回 + 后台执行 + 服务端日志 + 前端轮询**：
+
+- `POST actions/consolidate` / `actions/skill-consolidate` 只做参数校验和互斥检查，
+  立刻返回 `job_id`；真正的整理在 `_ui_job_task` 里跑，页面关掉、连接断开都不影响。
+  任务纳入 `terminate()` 的 cancel 列表，重载时会通过 `_recover_interrupted_ui_job()`
+  把遗留的 `running` 标成「已中断」，不会永远显示运行中。
+- 日志落在 `meta.consolidate_job_log`：`seq` 全局递增、最多保留 160 行，记录提交、
+  开始、扫描到几组候选、模型返回几条建议、通过校验几组、深度整理的片进度、
+  每 12 秒一次「仍在运行…已用时 Xs」心跳、以及最终完整结果。自动整理与命令
+  触发的整理也写同一份日志，行首用 `[页面]` / `[后台]` 区分。
+- `GET actions/job-status?since=N` 返回增量行 + 当前 job 状态 + `busy`（是否有
+  非页面来源的整理在跑）；`POST actions/job-log/clear` 清空，运行中拒绝清空，
+  清空保留 `seq` 以免旧行重放。
+- 工具页新增「整理日志」小框：加载时拉全量、之后每 2.5 秒按 `seq` 拉增量，
+  页面重新可见时立刻补拉；标签显示「运行中 / 后台整理中 / 已完成 / 已中断」，
+  任务结束会自动刷新概览与列表，完整结果（含预览计划）回填到原输出框。
+
+这套改动**完全不进 LLM prompt，零 token 增量**。边界：「立即总结」仍是同步长
+请求（本次只改整理）；日志是最近 160 行的滚动窗口，不是永久审计日志；
+轮询只在页面可见时发请求。
+
+测试：smoke_consolidate 66→**90**（日志落库/增量/裁剪/坏数据容错、后台任务
+状态机、互斥、清空、中断恢复），db 146 / router 39 / tools 22，合计 **297 项**
+全绿；真实整理链路探针确认 6 行过程日志与增量拉取；`ruff --select=E9,F` 通过。
+
 ## 清上下文 vs 清记忆：两套独立存储
 
 很容易混淆的一点：**上下文和记忆在物理上是分开存的**。
@@ -779,7 +812,7 @@ AstrBot 的环境里跑，由 `tests/_astrbot_stub.py` 在导入前注入一个 
 
 ```bash
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_router.py      # 39 项：节流、429 退避、冷却下限、两级预算、超时换模型、配置 clamp
-D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 66 项：切片、断点、单片超时、连续失败止损、模型落款、水位与自动深度整理、整理超时跟随配置
+D:/Local/AstrBot/backend/python/python.exe tests/smoke_consolidate.py # 90 项：切片、断点、单片超时、连续失败止损、模型落款、水位与自动深度整理、整理超时跟随配置、整理任务日志
 D:/Local/AstrBot/backend/python/python.exe tests/smoke_tools.py       # 22 项：工具链编号边界与越权、队列重建、WebUI 缓存失效、注入守卫窗口
 ```
 
