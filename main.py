@@ -111,7 +111,7 @@ except ImportError:
         SkillHub = _sh_mod.SkillHub
         guess_data_root = _sh_mod.guess_data_root
 
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.2.1"
 
 
 # ============ 记忆巩固：相似度与聚类（纯本地，不花 token）============
