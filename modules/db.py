@@ -1307,6 +1307,25 @@ class HermesDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def memory_scope_rows(self, ids: list[int]) -> list[dict]:
+        """按 id 批量取作用域字段，供待整理队列分桶计数。
+
+        队列上限 200 条，逐条 memory_by_id 会在每次概览轮询里打出 200 次
+        查询、还把正文全读进内存；这里一条 SQL 只取分桶要用的几列。
+        不过滤 merged_into：队列里可能还留着刚被合并、尚未退场的 id，
+        滤掉会让分桶合计小于界面上的全局数字。
+        """
+        ids = [int(i) for i in ids if i]
+        if not ids:
+            return []
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, owner_id, group_id, platform, visibility "
+                f"FROM memories WHERE id IN ({_ph(len(ids))})",
+                ids,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     @_db_locked
     def max_memory_id(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) m FROM memories").fetchone()

@@ -30,7 +30,7 @@
 
       <div class="side-foot">
         <div class="line"><span>版本</span><b id="side-version">—</b></div>
-        <div class="line"><span>记忆队列</span><b id="side-queue-mem">—</b></div>
+        <div class="line"><span>记忆队列</span><b id="side-queue-mem" title="全局待整理条数 / 触发阈值 · 单个作用域（同一用户/群/可见性）里的最高条数。阈值按全局判，配对只在作用域内进行">—</b></div>
         <div class="line"><span>技能队列</span><b id="side-queue-skill">—</b></div>
       </div>
     </aside>
@@ -69,8 +69,9 @@
             <div class="d" id="stat-kinds">—</div>
           </div>
           <div class="card stat">
-            <div class="k" title="累计新增、还没被整理评估过的长期记忆 / 触发一次自动整理所需的条数。与下面的待总结消息是两级不同的队列">记忆待整理</div>
+            <div class="k" title="全局累计的待整理长期记忆 / 触发一次自动整理所需的条数。阈值按全库合计，不是按单个用户或单个群分别计算；与下面的待总结消息是两级不同的队列">记忆待整理</div>
             <div class="v" id="stat-queue">—</div>
+            <div class="d" id="stat-queue-scope" title="把队列按作用域（同一用户/群/可见性，不按会话切分）分桶后条数最多的那个桶。相似配对只在桶内进行，所以这个数才决定本次能不能合出东西">单作用域最高 — 条</div>
             <div class="d" id="stat-pending" title="已被记录、但还没被总结成长期记忆的对话消息条数（全库合计）。点「立即总结」可立刻消化">消息待总结 — 条</div>
           </div>
         </div>
@@ -90,7 +91,7 @@
             </div>
             <div id="queue-box"></div>
             <div class="hint faint" style="font-size:11.5px;margin-top:8px">
-              前两行是「攒够 N 条新记忆/技能就合并一次」的增量整理。第三行的深度整理是<strong>另一套阈值</strong>：按每个作用域单独数「自上次深度整理以来新增且仍活跃的长期记忆」，达标才在后台全量归纳，与上面的队列互不相干。想立刻整理去「工具」页。
+              前两行是「全局攒够 N 条新记忆/技能就触发一次合并」的增量整理：<strong>阈值按全库合计</strong>，所以记忆行同时给出<strong>全局</strong>和<strong>单作用域最高</strong>两个数——相似配对只在同一用户/群/可见性内进行（不按会话切分），全局达标而单作用域最高很小时，触发了也可能一组都合不出来。第三行的深度整理是<strong>另一套阈值</strong>：按每个作用域单独数「自上次深度整理以来新增且仍活跃的长期记忆」，达标才在后台全量归纳，与上面的队列互不相干。想立刻整理去「工具」页。
             </div>
           </div>
         </div>

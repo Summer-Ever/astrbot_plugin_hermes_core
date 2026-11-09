@@ -2168,6 +2168,19 @@ class HermesCore(Star):
     def _queued_memory_count(self) -> int:
         return len(self._pending_memory_ids())
 
+    def _queued_memory_by_bucket(self) -> dict[tuple, int]:
+        """待整理队列按 _scope_bucket 分桶计数，口径与整理时的配对完全一致。
+
+        触发阈值数的是全库合计，配对却只在同桶内进行，两个数字必须一起看：
+        全局达标而最高桶很小，就是「触发了却一组都合不出来」。桶按用户/群/
+        可见性切，不按会话切——同一个人跨会话的记忆本来就该互相配对。
+        """
+        counts: dict[tuple, int] = {}
+        for d in self.db.memory_scope_rows(self._pending_memory_ids()):
+            b = _scope_bucket(d)
+            counts[b] = counts.get(b, 0) + 1
+        return counts
+
     def _queue_memories(self, ids) -> int:
         """把新记忆加入待整理队列，返回队列长度。
 
@@ -2299,7 +2312,13 @@ class HermesCore(Star):
         """给 /hermes 状态 用：离下次自动整理还差多少。"""
         mem_every, sk_every = self._mem_every(), self._skill_every()
         mem_on = mem_every > 0 and bool(self._get_cfg("auto_consolidate", True))
-        mem_txt = f"记忆 {self._queued_memory_count()}/{mem_every} 条" if mem_on else "记忆 关闭"
+        if mem_on:
+            buckets = self._queued_memory_by_bucket()
+            mem_txt = (f"记忆 全局 {self._queued_memory_count()}/{mem_every} 条"
+                       f"（单作用域最高 {max(buckets.values(), default=0)} 条，"
+                       f"共 {len(buckets)} 个作用域）")
+        else:
+            mem_txt = "记忆 关闭"
         sk_n = int(self.db.get_meta("skill_consolidate_pending", "0") or 0)
         sk_txt = f"技能 {sk_n}/{sk_every} 个" if sk_every > 0 else "技能 关闭"
         blocked = self._auto_consolidate_blocked()
@@ -2512,6 +2531,11 @@ class HermesCore(Star):
         # 按住好几秒，所以只取最近 600 条；更老的条目走深度整理（按片处理）。
         cluster_max = 600
         capped = 0
+        # 扫过但同桶内找不到搭档的焦点 id。它们必须结案退场，否则队列永远
+        # 降不到阈值以下，每轮总结都重新触发一次整理。退场不会丢配对机会：
+        # 上面的 pool 取的是该桶**全部活跃记忆**而非队列成员，日后同桶来了
+        # 相似的新记忆，由新记忆当焦点照样能把它捞回来合并。
+        no_partner: set[int] = set()
         if focus_ids:
             clusters: list[list[dict]] = []
             by_bucket: dict[tuple, list[dict]] = {}
@@ -2525,9 +2549,11 @@ class HermesCore(Star):
                     continue
                 mg = grams_by_id.get(m["id"]) or set()
                 if not mg:
+                    no_partner.add(int(m["id"]))
                     continue
                 pool = [r for r in by_bucket[_scope_bucket(m)] if r["id"] != m["id"]]
                 if not pool:
+                    no_partner.add(int(m["id"]))
                     continue
                 scored = sorted(
                     ((_similarity_sets(mg, grams_by_id[r["id"]] or set()), r) for r in pool),
@@ -2536,6 +2562,17 @@ class HermesCore(Star):
                 if picked:
                     # 组内按 id 排序，新记忆排最后（LLM 能看出时间顺序）
                     clusters.append(sorted(picked + [m], key=lambda r: r["id"]))
+                else:
+                    no_partner.add(int(m["id"]))
+            if not clusters:
+                # 零候选时 listing 为空，调模型等于请它「合并零组记忆」：
+                # 白烧一次调用和十几秒，返回的 [] 又让队列一条都退不掉。
+                self._last_evaluated = no_partner
+                spread = len({_scope_bucket(r) for r in rows if r["id"] in focus_ids})
+                note = (f"已扫描 {len(no_partner)} 条待整理记忆（分散在 {spread} 个作用域），"
+                        "各自作用域内没有相似搭档，本次不调用模型。")
+                self.job_emit(note, level="info", kind="memory")
+                return note
         else:
             if len(rows) < min_total:
                 return f"记忆只有 {len(rows)} 条，暂无整理必要。"
@@ -2567,9 +2604,10 @@ class HermesCore(Star):
         clusters = sorted(uniq, key=lambda g: -len(g))[:max_clusters]
         self.job_emit(f"扫描 {len(rows)} 条活跃记忆，得到 {len(clusters)} 组候选，"
                       "开始调用模型判断", level="info", kind="memory")
-        # 这批 id 已交给模型判断过（合或不合都算结案），整理后从队列里退场；
-        # 没进前 max_clusters 组的焦点 id 保留，等下一轮和更晚出现的相似记忆配对。
-        self._last_evaluated = {int(x["id"]) for g in clusters for x in g}
+        # 这批 id 已交给模型判断过（合或不合都算结案），加上扫过但无搭档的，
+        # 整理后一并从队列退场；有候选却没进前 max_clusters 组的焦点 id 保留，
+        # 等下一轮和更晚出现的相似记忆配对。
+        self._last_evaluated = {int(x["id"]) for g in clusters for x in g} | no_partner
 
         listing: list[str] = []
         id_to_group: dict[int, int] = {}

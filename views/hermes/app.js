@@ -283,12 +283,17 @@
     $("#stat-kinds").textContent = kindText;
 
     const q = d.queue || {};
-    $("#stat-queue").textContent = q.memories_every > 0 && q.auto_memories
-      ? `${q.memories}/${q.memories_every}`
-      : "关闭";
+    const memOn = q.memories_every > 0 && q.auto_memories;
+    const memTop = fmtNum(q.memories_max_bucket);
+    $("#stat-queue").textContent = memOn ? `${q.memories}/${q.memories_every}` : "关闭";
+    $("#stat-queue-scope").textContent = memOn
+      ? `单作用域最高 ${memTop} 条 · 共 ${fmtNum(q.memories_buckets)} 个作用域`
+      : "自动整理已关闭";
     const sm = d.summarize || {};
     $("#stat-pending").textContent = `消息待总结 ${fmtNum(sm.pending_messages)} 条`;
-    $("#side-queue-mem").textContent = q.memories_every > 0 ? `${q.memories}/${q.memories_every}` : "关闭";
+    $("#side-queue-mem").textContent = q.memories_every > 0
+      ? `${q.memories}/${q.memories_every} · 单作用域最高 ${memTop}`
+      : "关闭";
     $("#side-queue-skill").textContent = q.skills_every > 0 ? `${q.skills}/${q.skills_every}` : "关闭";
     $("#run-version").textContent = `v${d.version || "?"} · code ${d.code_hash || "?"}`;
 
@@ -329,23 +334,29 @@
     const skPct = q.skills_every > 0 ? Math.min(100, (q.skills / q.skills_every) * 100) : 0;
     const deepPct = deep.enabled && deep.every > 0
       ? Math.min(100, (deep.max / deep.every) * 100) : 0;
+    const memGlobal = q.memories >= q.memories_every
+      ? `全局 ${q.memories} 条 · 已达标`
+      : `全局 ${q.memories} / ${q.memories_every} 条`;
+    const memVal = memOn
+      ? `${memGlobal} · 单作用域最高 ${memTop} 条`
+      : "自动整理已关闭（可用工具页手动触发）";
     $("#queue-box").innerHTML = `
       <div class="queue-row">
         <div class="row-between">
-          <span title="累计新增、还没被整理评估过的长期记忆；攒够阈值就调一次模型合并相似记忆">记忆（增量）</span>
-          <span class="${q.auto_memories && q.memories_every > 0 ? "muted" : "faint"}">
-            ${q.memories_every > 0 && q.auto_memories
-              ? `${q.memories} / ${q.memories_every} 条`
-              : "自动整理已关闭（可用工具页手动触发）"}
-          </span>
+          <span title="左边是触发口径：全库合计攒够阈值就跑一次模型整理。右边是配对口径：相似记忆只在同一作用域（同一用户/群/可见性，不按会话切分）内配对，跨作用域的重复条目不会合并。所以全局达标而单作用域最高很小时，触发了也可能一组都合不出来">记忆（增量整理）</span>
+          <span class="${memOn ? "muted" : "faint"}">${memVal}</span>
         </div>
         <div class="bar"><i style="width:${memPct}%"></i></div>
       </div>
       <div class="queue-row">
         <div class="row-between">
-          <span title="累计新增/更新的技能数；攒够阈值就合并一次">技能（增量）</span>
+          <span title="全局累计新增/更新的技能数；攒够阈值就合并一次">技能（增量 · 全局累计）</span>
           <span class="${q.skills_every > 0 ? "muted" : "faint"}">
-            ${q.skills_every > 0 ? `${q.skills} / ${q.skills_every} 个` : "自动技能整理已关闭"}
+            ${q.skills_every > 0
+              ? (q.skills >= q.skills_every
+                ? `${q.skills} 个 · 已达标`
+                : `${q.skills} / ${q.skills_every} 个`)
+              : "自动技能整理已关闭"}
           </span>
         </div>
         <div class="bar"><i style="width:${skPct}%"></i></div>

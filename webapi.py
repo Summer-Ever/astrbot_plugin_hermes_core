@@ -206,6 +206,7 @@ class HermesWebAPI:
         mem_every = self.plugin._mem_every()
         sk_every = self.plugin._skill_every()
         pending_mem = self.plugin._queued_memory_count()
+        mem_buckets = self.plugin._queued_memory_by_bucket()
         pending_skill = int(db.get_meta("skill_consolidate_pending", "0") or 0)
         skills = db.all_skills()
         # 深度整理是独立于上面队列的第二套阈值：按作用域各记水位，数的是
@@ -240,6 +241,11 @@ class HermesWebAPI:
             "queue": {
                 "memories": pending_mem,
                 "memories_every": mem_every,
+                # 阈值按 memories（全库合计）判，配对却只在同一作用域内进行。
+                # 只给全局数字会让「13/10 已达标却没合并」看起来像卡住了，
+                # 所以把最高的那个作用域一并带出去，口径同 _scope_bucket。
+                "memories_max_bucket": max(mem_buckets.values(), default=0),
+                "memories_buckets": len(mem_buckets),
                 "skills": pending_skill,
                 "skills_every": sk_every,
                 "auto_memories": bool(self._cfg("auto_consolidate", True)),

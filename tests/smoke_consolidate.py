@@ -234,6 +234,126 @@ async def case_visibility(tmp: str) -> None:
 
 
 
+async def case_focus_no_partner(tmp: str) -> None:
+    """focus 模式零候选：不调模型、队列要能退场，且不丢日后的配对机会。
+
+    线上事故：13 条待整理散在 5 个作用域，桶内谁都配不上谁，于是每轮总结
+    都发一次「零组记忆」的空提示词给模型，`_last_evaluated` 又是空集，
+    队列一条都退不掉，计数永久卡在 13/10。
+    """
+    core = new_core(tmp)
+    m1 = core.db.add_memory("preference", "用户喜欢吃葡萄", owner_id="u1",
+                            visibility="private")
+    m2 = core.db.add_memory("fact", "服务器部署在阿里云杭州节点", owner_id="u1",
+                            visibility="private")
+    # 与 m1 字面完全相同，但在另一个桶（群可见）——按设计绝不能合并
+    m3 = core.db.add_memory("preference", "用户喜欢吃葡萄", owner_id="u1",
+                            group_id="g1", visibility="group")
+    core._queue_memories([m1, m2, m3])
+    core.router = FakeRouter(lambda i, p: "[]")
+
+    out = await core._consolidate_memories(focus_ids={m1, m2, m3})
+    check("零候选不调用模型", len(core.router.calls) == 0,
+          f"{len(core.router.calls)} 次")
+    check("零候选文案说明原因", "没有相似搭档" in out, out[:80])
+    core._requeue_after_consolidate()
+    check("无搭档的 id 全部退场（不再卡 13/10）",
+          core._pending_memory_ids() == [], str(core._pending_memory_ids()))
+    active = {int(r["id"]) for r in core.db.all_active_memories()}
+    check("跨桶的同文记忆没有被合并", {m1, m3} <= active, str(sorted(active)))
+
+    # 退场不等于失去配对机会：pool 取的是桶内全部活跃记忆，不是队列成员。
+    # 日后同桶来了相似的新记忆，由新记忆当焦点照样能把 m1 捞回来合并。
+    m4 = core.db.add_memory("preference", "用户比较喜欢吃葡萄", owner_id="u1",
+                            visibility="private")
+    core._queue_memories([m4])
+    core.router = FakeRouter(lambda i, p: json.dumps(
+        [{"ids": [m1, m4], "kind": "preference", "content": "用户喜欢吃葡萄"}],
+        ensure_ascii=False))
+    await core._consolidate_memories(focus_ids={m4})
+    check("已退场的旧记忆仍能被新记忆配对合并",
+          int(core.db.memory_by_id(m1)["merged_into"] or 0) != 0,
+          str(core.db.memory_by_id(m1)["merged_into"]))
+    core._requeue_after_consolidate()
+    check("合并后队列清空", core._pending_memory_ids() == [],
+          str(core._pending_memory_ids()))
+
+
+async def case_focus_cluster_cap(tmp: str) -> None:
+    """有候选但被 max_clusters 截断的焦点 id 必须留在队列里等下一轮。
+
+    这是「无搭档就退场」不能误伤的另一半：它们有搭档，只是本轮没排进前 N 组。
+    """
+    core = cfg_core(new_core(tmp), consolidate_max_clusters=1)
+    a1 = core.db.add_memory("preference", "喜欢喝美式咖啡", owner_id="u2",
+                            visibility="private")
+    a2 = core.db.add_memory("preference", "爱喝美式咖啡不加糖", owner_id="u2",
+                            visibility="private")
+    b1 = core.db.add_memory("fact", "住在杭州西湖区", owner_id="u2",
+                            visibility="private")
+    b2 = core.db.add_memory("fact", "家住杭州西湖区附近", owner_id="u2",
+                            visibility="private")
+    core._queue_memories([a1, a2, b1, b2])
+    core.router = FakeRouter(lambda i, p: "[]")
+    await core._consolidate_memories(focus_ids={a1, a2, b1, b2})
+    check("有候选时照常调模型", len(core.router.calls) == 1,
+          str(len(core.router.calls)))
+    core._requeue_after_consolidate()
+    rest = set(core._pending_memory_ids())
+    check("被截断的那一组留在队列里", rest in ({a1, a2}, {b1, b2}) and len(rest) == 2,
+          str(sorted(rest)))
+
+
+async def case_queue_bucket_display(tmp: str) -> None:
+    """队列数字展示：全局合计 + 单作用域最高，分桶口径必须与配对时一致。
+
+    只给全局数字时，「13/10 已达标却没合并」看起来像卡住了；两个数字一起给
+    才解释得清——阈值按全局判，配对只在作用域内做。
+    """
+    core = cfg_core(new_core(tmp), consolidate_every_n_memories=10)
+    ids = []
+    # 同一个人跨两个会话：会话不是隔离边界，六条必须落进同一个桶
+    for sid in ("s1", "s2"):
+        for i in range(3):
+            ids.append(core.db.add_memory(
+                "fact", f"甲的部署记录{sid}-{i}", owner_id="UA", session_id=sid,
+                visibility="private"))
+    # 同一个人换个群、换个人、群公共条目：各自另一个桶
+    ids.append(core.db.add_memory("fact", "甲在群里的发言", owner_id="UA",
+                                  group_id="G1", visibility="group"))
+    ids.append(core.db.add_memory("fact", "乙的私事", owner_id="UB",
+                                  visibility="private"))
+    ids.append(core.db.add_memory("fact", "群公共事项", group_id="G1",
+                                  visibility="group"))
+    core._queue_memories(ids)
+
+    c = core._queued_memory_by_bucket()
+    check("队列按 _scope_bucket 分桶", c.get(UA) == 6 and c.get(UA_G1) == 1
+          and c.get(UB) == 1 and c.get(G1) == 1, str(c))
+    check("会话不切分桶", len(c) == 4, str(sorted(c)))
+    check("分桶合计等于全局计数",
+          sum(c.values()) == core._queued_memory_count() == 9,
+          f"{sum(c.values())} vs {core._queued_memory_count()}")
+    check("单作用域最高取最大桶而非全局", max(c.values(), default=0) == 6)
+
+    txt = core._queue_progress()
+    check("状态文案同时给出两个数字",
+          "全局 9/10" in txt and "单作用域最高 6 条" in txt, txt)
+
+    # 物理删除后 id 还留在队列里（下次整理才退场）：分桶少一条、全局不变。
+    # 这个短暂差值是有意的，全局数字必须继续与触发判定同源。
+    core.db.delete_memory(ids[0])
+    c2 = core._queued_memory_by_bucket()
+    check("已删除的 id 不炸分桶", sum(c2.values()) == 8 and c2.get(UA) == 5, str(c2))
+    check("全局计数仍与触发判定同源", core._queued_memory_count() == 9)
+
+    core._reset_memory_queue()
+    check("空队列最高为 0",
+          max(core._queued_memory_by_bucket().values(), default=0) == 0)
+    check("空队列状态文案不炸", "单作用域最高 0 条" in core._queue_progress(),
+          core._queue_progress())
+
+
 async def case_mutex(tmp: str) -> None:
     """自动总结、手动命令、WebUI 三条路径不能同时对同一批记忆写库。"""
     core = new_core(tmp)
@@ -632,7 +752,9 @@ async def case_job_log(tmp: str) -> None:
 
 async def main() -> int:
     for fn in (case_chunk, case_resume, case_streak, case_unit_deadline_skip,
-               case_merge, case_visibility, case_mutex, case_detach, case_footer,
+               case_merge, case_visibility, case_focus_no_partner,
+               case_focus_cluster_cap, case_queue_bucket_display,
+               case_mutex, case_detach, case_footer,
                case_deep_bucket_count, case_deep_bucket_cross_group,
                case_deep_plan, case_deep_schedule,
                case_skill_timeout, case_job_log):
