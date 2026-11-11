@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Hermes 记忆系统" width="180" />
+</p>
+
 # astrbot_plugin_hermes_core
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -829,7 +833,7 @@ python hot_reload.py --pull        # 拉代码 + 重载 + 核对是否真的生�
 算出的哈希比对，输出「✅ 已生效」或「❌ 未生效」。
 
 > 第 4 步不是多余的：接口返回 200 只代表重载流程跑完了，不代表你改的代码真的被
-> 加载。`/hermes 状态` 也会显示 `版本: v1.2.1 (code <10 位哈希>)`，一眼能看出跑
+> 加载。`/hermes 状态` 也会显示 `版本: v1.3.0 (code <10 位哈希>)`，一眼能看出跑
 > 的是哪份代码。版本号有两处来源：插件管理器读 `metadata.yaml`，`/hermes 状态`
 > 与面板读 `main.py` 的 `PLUGIN_VERSION`，发版时两处必须一起改。
 
