@@ -233,6 +233,18 @@ def _clean_memory_text(text: str) -> str:
     return s[:MAX_MEMORY_CHARS]
 
 
+def _clean_resident_text(text: str) -> str:
+    """常驻词条专用净化：压平换行、抹掉块边界标记，但**不按 400 字截断**。
+
+    常驻词条的长度上限由 resident_chars_* 配置单独把关（最高可设 2000），
+    绝不能套用归档记忆的 MAX_MEMORY_CHARS=400：否则用户明明设了 1000 字，
+    保存和注入时却各自被静默砍到 400 字，连超限提示都收不到。
+    """
+    s = re.sub(r"[\r\n\t\u0000-\u001f]+", " ", str(text or "")).strip()
+    return s.replace("[记忆系统上下文", "［记忆系统上下文").replace(
+        "[/记忆系统上下文]", "［/记忆系统上下文］")
+
+
 def _is_injection(text: str) -> bool:
     """内容是否带明确的「指令腔」。命中不静默吞掉，交给调用方拒绝并提示。"""
     return bool(_INJ_PATTERNS.search(str(text or "")))
@@ -644,6 +656,11 @@ class HermesCore(Star):
         return _clean_memory_text(text)
 
     @staticmethod
+    def _sanitize_resident(text: str) -> str:
+        """常驻词条写入侧净化：只压平/抹边界标记，不套归档记忆的 400 字上限。"""
+        return _clean_resident_text(text)
+
+    @staticmethod
     def _looks_like_injection(text: str) -> bool:
         return _is_injection(text)
 
@@ -764,7 +781,9 @@ class HermesCore(Star):
                 or self._consolidating):
             return {"started": False,
                     "reason": "已有整理任务在运行，等它跑完再点（下方日志能看到进度）"}
-        job_id = f"{int(time.time())}-{kind[:2]}"
+        # 秒级时间戳在同一秒内任务瞬结时可能撞 ID，导致状态写到别的 job 上；
+        # 用纳秒时间戳消除冲突。
+        job_id = f"{time.time_ns()}-{kind[:2]}"
         with self._job_lock:
             data = self._job_log_read()
             data["job"] = {"id": job_id, "kind": kind, "dry": bool(dry_run),
@@ -1243,7 +1262,7 @@ class HermesCore(Star):
         for block, title in HermesDB.RESIDENT_BLOCKS:
             text = blocks.get(block)
             if text:
-                out.append(f"- {title}：{_clean_memory_text(text)}")
+                out.append(f"- {title}：{_clean_resident_text(text)}")
         return out
 
     def _resident_limits(self) -> dict:
@@ -1309,10 +1328,15 @@ class HermesCore(Star):
             query (string): 检索关键词，用一两个区分度高的核心词；没命中就换别的关键词再调用一次，不要把很多词塞进同一次查询（会稀释排序相关性）
         """
         sc = self._scope_keys(event)
+        # memory_scope=global 时放开「全机器人共享」检索：db 侧仍按可见性
+        # 分层（public 全员可见、group 本群、private 仅自己），不会泄露私聊。
+        global_mode = (str(self._get_cfg("memory_scope", "user")).strip().lower()
+                       == "global")
         mems = self.db.search_memories(
             query, limit=5, owner_id=sc["owner_id"], session_id=sc["sid"],
             platform=sc["platform"], group_id=sc["group_id"] or None,
             allow_private=bool(sc["allow_private"]), viewer_owner=sc["owner_id"],
+            global_mode=global_mode,
             scan=max(200, int(self._get_cfg("recall_scan_limit", 3000))),
             **_recall_rank_kw(self._get_cfg))
         if mems:
@@ -1459,7 +1483,7 @@ class HermesCore(Star):
             return ("未知词条 " + repr(block) + "。六选一："
                     + "、".join(f"{b}（{t}）" for b, t in HermesDB.RESIDENT_BLOCKS))
         title = dict(HermesDB.RESIDENT_BLOCKS)[bid]
-        clean = re.sub(r"[\r\n\t\u0000-\u001f]+", " ", str(text or "")).strip()
+        clean = _clean_resident_text(text)
         if clean and _is_injection(clean):
             return (f"「{title}」词条文本带指令腔（试图改写规则或身份），已拒绝。"
                     "词条记录的是事实与偏好，不是指令。")
@@ -1788,7 +1812,7 @@ class HermesCore(Star):
             "读下面这位用户的归档记忆，把「放到任何一轮对话里都成立」的稳定信息"
             "合并进六个常驻词条。词条每轮都会带上，具体事件、一次性事实、"
             "已经作废的指令**不要写进词条**，让它们留在归档层。\n"
-            "- address 称呼：怎么称呼这位用户\n"
+            "- address 称呼：怎么称呼对方\n"
             "- assistant 助手设定：助手要扮演的角色、性格\n"
             "- user 用户信息：身份、职业、设备、环境、长期状况\n"
             "- preference 用户偏好：喜欢什么、不喜欢什么\n"
@@ -1806,9 +1830,16 @@ class HermesCore(Star):
         # 90 秒总预算：这是一条交互式命令，用户在等。默认策略是
         # 「每个模型 60 秒 × 4 次尝试」，模型整体不可用时要等四分钟才回话，
         # 用户只会以为卡死了。给总闸之后，最坏情况 1.5 分钟就有结果。
+        def build(budget: int) -> str:
+            # 与其他所有 chat 调用一致：按模型预算裁剪归档记忆，
+            # 否则 200 条 × 120 字会撑爆上下文，整条降级链全部失败。
+            room = max(600, budget - len(head) - 40)
+            body = listing[:room] if len(listing) > room else listing
+            return head + body
+
         try:
             text = await self.router.chat(
-                builder=lambda _b: head + listing, purpose="常驻归位",
+                builder=build, purpose="常驻归位",
                 deadline=time.monotonic() + 90)
         except Exception as exc:
             # 没有本地关键词降级：词条是整段文本，按关键词粗分只会拼出
@@ -1822,9 +1853,17 @@ class HermesCore(Star):
             return ("归位失败：模型返回的内容无法解析成六个词条，词条未改动。"
                     "可以再发一次 /hermes 归位试试。")
         scene = "本群" if group_id else "私聊"
+        # 模型可能只返回部分键（输出被截断/省略空词条）。缺键一律保留原值，
+        # 绝不按空串写回——set_resident 的空串语义是「清空词条」，
+        # 那会把用户已有画像静默删掉且不可恢复。
+        missing = [t for b, t in HermesDB.RESIDENT_BLOCKS if b not in parsed]
         filled = []
+        skipped = []
         for b, t in HermesDB.RESIDENT_BLOCKS:
-            v = _clean_memory_text(str(parsed.get(b) or ""))
+            if b not in parsed:
+                skipped.append(t)
+                continue
+            v = _clean_resident_text(str(parsed.get(b) or ""))
             cap = int(limits.get(b, 0))
             if v and cap and len(v) > cap:
                 v = v[: max(1, cap - 1)] + "…"
@@ -1832,10 +1871,12 @@ class HermesCore(Star):
             if v:
                 filled.append(f"{t}（{len(v)} 字）")
         self._clear_resident(owner_id)
-        if not filled:
+        note = (f"；未返回的 {len(missing)} 个词条保持原样"
+                if missing else "")
+        if not filled and not missing:
             return (f"{scene}的常驻词条已全部清空——模型认为没有合适的内容。"
                     "归档记忆不受影响。")
-        return (f"{scene}的常驻归位完成：{'、'.join(filled)}。"
+        return (f"{scene}的常驻归位完成：{'、'.join(filled) or '无写入'}{note}。"
                 f"其余 {len(cand)} 条记忆留在归档层，可用 search_memory 检索。")
 
     async def _summarize_impl(self, force: bool = False) -> str:
@@ -3210,15 +3251,30 @@ class HermesCore(Star):
         return "", done, len(skills)
 
     @staticmethod
+    def _find_json_start(text: str, opener: str):
+        """从第一个 opener 起用 raw_decode 取最外层完整 JSON，忽略尾部解释文字。
+
+        旧写法 re.search(r"\\[.*\\]", text, re.S) 贪婪匹配到最后一个右括号，
+        模型在 JSON 后补一句「已按[上限]处理」就会连尾巴一起吞进去，
+        json.loads 失败 → 整轮总结/整理的产出被静默丢弃。
+        """
+        decoder = json.JSONDecoder()
+        start = text.find(opener)
+        while start != -1:
+            try:
+                obj, _ = decoder.raw_decode(text[start:])
+                return obj
+            except (ValueError, TypeError):
+                start = text.find(opener, start + 1)
+        return None
+
+    @staticmethod
     def _extract_json_array(text: str) -> list:
         if not text:
             return []
         text = re.sub(r"```(?:json)?|```", "", text).strip()
-        m = re.search(r"\[.*\]", text, re.S)
-        if not m:
-            return []
         try:
-            data = json.loads(m.group(0))
+            data = HermesCore._find_json_start(text, "[")
             return data if isinstance(data, list) else []
         except Exception:
             return []
@@ -3233,11 +3289,8 @@ class HermesCore(Star):
         if not text:
             return None
         text = re.sub(r"```(?:json)?|```", "", text).strip()
-        m = re.search(r"\{.*\}", text, re.S)
-        if not m:
-            return None
         try:
-            data = json.loads(m.group(0))
+            data = HermesCore._find_json_start(text, "{")
             return data if isinstance(data, dict) else None
         except Exception:
             return None

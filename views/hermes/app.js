@@ -632,6 +632,7 @@
       <div class="card" style="margin:0 0 12px;padding:12px 14px;box-shadow:none;border:1px solid rgba(128,128,128,.25)">
         <div class="toolbar" style="margin-bottom:6px">
           <strong>${esc(b.title)}</strong>
+          ${b.desc ? `<span class="muted" style="font-size:12px">${esc(b.desc)}</span>` : ""}
           <span class="chip ${b.chars > b.limit ? "err" : "ok"}" data-res-count="${esc(b.block)}">${b.chars}/${b.limit} 字</span>
           <span class="spacer"></span>
           <button class="btn tiny primary" data-res-save="${esc(b.block)}">保存</button>

@@ -316,14 +316,26 @@ class HermesWebAPI:
         if scope not in ("user", "group", "global"):
             return self._fail("scope 只能是 user/group/global")
         owner = str(data.get("owner_id") or "").strip()
+        group_id = str(data.get("group_id") or "").strip()
         if scope == "user" and not owner:
             return self._fail("按用户隔离的记忆必须填写归属 ID")
+        if scope == "group" and not group_id:
+            return self._fail("按群/会话隔离的记忆必须填写群 ID（group_id）")
+        # 显式给出 visibility，不让 db 按 owner 猜：
+        # 面板选了「按群」却没写 visibility 时，db 会因 owner 为空推断成 public，
+        # 把群记忆泄露给所有人；填了 owner 又会被推断成 private，语义完全相反。
+        visibility = str(data.get("visibility") or "").strip().lower()
+        if visibility not in ("private", "group", "public"):
+            visibility = {"user": "private", "group": "group", "global": "public"}[scope]
         mid = self.plugin.db.add_memory(
-            kind, content[:500], scope=scope, source="webui",
+            kind, content, scope=scope, source="webui",
             owner_id=owner, platform=str(data.get("platform") or ""),
-            group_id=str(data.get("group_id") or ""),
-            visibility=str(data.get("visibility") or ""),
+            group_id=group_id, visibility=visibility,
         )
+        if mid:
+            # 与其他所有新增路径一致：进整理队列，否则面板加的记忆
+            # 永远不计入自动整理阈值，也不会被整理链路看到。
+            self.plugin._queue_memories([mid])
         return json_response({"id": mid})
 
     async def memory_visibility(self):
@@ -428,6 +440,7 @@ class HermesWebAPI:
             blocks.append({
                 "block": block,
                 "title": title,
+                "desc": self.plugin.db.RESIDENT_BLOCK_DESCS.get(block, ""),
                 "limit": int(limits.get(block, 0)),
                 "text": text,
                 "chars": len(text),
@@ -453,7 +466,7 @@ class HermesWebAPI:
             return self._fail(f"未知词条：{raw_block}，只能是 "
                               + "、".join(f"{b}（{t}）"
                                           for b, t in self.plugin.db.RESIDENT_BLOCKS))
-        text = self.plugin._sanitize_memory(str(data.get("text") or ""))
+        text = self.plugin._sanitize_resident(str(data.get("text") or ""))
         title = self.plugin.db.RESIDENT_BLOCK_TITLES.get(bid, bid)
         if text and self.plugin._looks_like_injection(text):
             return self._fail(f"「{title}」文本含指令式语句（想改写规则或身份），"
@@ -677,7 +690,13 @@ class HermesWebAPI:
                         raise ValueError(f"不能大于 {high}")
                     cleaned[key] = val
                 elif typ == "float":
-                    cleaned[key] = float(raw)
+                    val = float(raw)
+                    low, high = meta.get("min"), meta.get("max")
+                    if isinstance(low, (int, float)) and val < low:
+                        raise ValueError(f"不能小于 {low}")
+                    if isinstance(high, (int, float)) and val > high:
+                        raise ValueError(f"不能大于 {high}")
+                    cleaned[key] = val
                 elif typ == "list":
                     # 列表型配置（降级链、可重试错误类别）：允许数组或逗号分隔字符串
                     if isinstance(raw, str):
@@ -760,8 +779,10 @@ class HermesWebAPI:
             return self._fail("别名和主 ID 都要填")
         if alias == canonical:
             return self._fail("别名不能等于主 ID")
-        ok = self.plugin.db.add_alias(alias, canonical, str(data.get("platform") or ""))
-        return json_response({"ok": bool(ok)})
+        created = self.plugin.db.add_alias(alias, canonical, str(data.get("platform") or ""))
+        # add_alias 返回的是「是否新建」，覆盖更新已有别名时返回 False，
+        # 但那也是成功；直接当 ok 回传会让前端在更新场景误报失败。
+        return json_response({"ok": True, "created": bool(created)})
 
     async def alias_delete(self):
         data = await self._body()

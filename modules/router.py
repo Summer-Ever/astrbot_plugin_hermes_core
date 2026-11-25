@@ -550,7 +550,10 @@ class ModelRouter:
         return len(self._cooldown_until)
 
     def clear_cooldowns(self) -> None:
+        # 内存和持久化必须一起清：否则配置页点了「清冷却」当下生效，
+        # 一重启 load_cooldowns() 又把旧冷却读回来，承诺等于没兑现。
         self._cooldown_until.clear()
+        self._persist_cooldowns()
 
     # ---------- 上下文预算 ----------
 
@@ -738,6 +741,8 @@ class ModelRouter:
                             f"[hermes_core] 调用成功 {purpose} model={pid} "
                             f"{(time.time() - started):.1f}s 输出{len(text)}字")
                     self._cooldown_until.pop(pid, None)
+                    # 同步落盘，避免重启后这个已恢复的模型又被旧冷却挡住。
+                    self._persist_cooldowns()
                     self.counters["ok"] += 1
                     if fallback_index > 0:
                         self.counters["fallback_ok"] += 1
@@ -816,6 +821,7 @@ class ModelRouter:
                 raise _EmptyResponse("模型返回空内容")
             self._log("连通性测试", pid, pid, 1, started, True, "", "")
             self._cooldown_until.pop(pid, None)
+            self._persist_cooldowns()
             return {"id": pid, "ok": True, "ms": ms, "reply": text[:80], "kind": "", "error": ""}
         except Exception as exc:
             ms = int((time.time() - started) * 1000)

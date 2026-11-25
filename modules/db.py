@@ -108,6 +108,16 @@ RESIDENT_BLOCKS = (
 RESIDENT_BLOCK_IDS = tuple(b for b, _ in RESIDENT_BLOCKS)
 RESIDENT_BLOCK_TITLES = dict(RESIDENT_BLOCKS)
 
+# 各词条在面板上的用途说明，与 update_resident 及归位提示词里的描述保持一致。
+RESIDENT_BLOCK_DESCS = {
+    "address": "怎么称呼对方",
+    "assistant": "助手要扮演的角色、性格",
+    "user": "身份、职业、设备、环境、长期状况",
+    "preference": "喜欢什么、不喜欢什么",
+    "style": "长短、格式、表情、语气",
+    "rules": "必须遵守的、绝不能做的",
+}
+
 
 # 场景键：私聊是 'private'，群是 'group:<gid>'。没有公共层——
 # 私聊说的不会出现在群里，群里说的也不会出现在私聊，这就是「私聊/群记忆
@@ -293,6 +303,7 @@ class HermesDB:
     # modules.*、按文件路径直接加载），只有类名是三者都拿得到的。
     RESIDENT_BLOCKS = RESIDENT_BLOCKS
     RESIDENT_BLOCK_TITLES = RESIDENT_BLOCK_TITLES
+    RESIDENT_BLOCK_DESCS = RESIDENT_BLOCK_DESCS
 
     def __init__(self, data_dir: str, db_name: str = "hermes.db"):
         os.makedirs(data_dir, exist_ok=True)

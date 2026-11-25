@@ -64,7 +64,7 @@
         "default": 30,
         "min": 10,
         "max": 2000,
-        "description": "常驻词条「称呼（怎么称呼用户）」的字符上限",
+        "description": "常驻词条「称呼（怎么称呼对方）」的字符上限",
         "hint": "词条是整段文本：改写时超过上限会被拒绝，注入时超过上限会被截断。空词条不注入、不占 token。六个词条彼此独立，改一个不影响其它"
     },
     "resident_chars_assistant": {
@@ -115,6 +115,7 @@
     "summarize_interval_minutes": {
         "type": "int",
         "default": 30,
+        "min": 5,
         "description": "总结检查间隔（分钟）。到点后逐个会话判断是否需要总结，不是到点就强制总结",
         "hint": "只是闹钟，真正触发条件见下面两项"
     },
@@ -294,7 +295,7 @@
     "llm_cooldown_seconds": {
         "type": "int",
         "default": 180,
-        "min": 30,
+        "min": 0,
         "max": 3600,
         "description": "模型失败后冷却多少秒（冷却期内跳过它，避免每轮总结都先撞坏模型）",
         "hint": "鉴权失败会自动按 4 倍冷却；0 = 不冷却"
