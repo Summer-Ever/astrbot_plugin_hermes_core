@@ -534,18 +534,26 @@
           </label>
         </div>
         <label class="field">
-          <span class="label">归属 ID（按用户时必填）</span>
-          <input type="text" id="madd-owner" placeholder="QQ 官方机器人填 user_openid" />
+          <span class="label">归属 ID 或群 ID（按用户/按群时必填）</span>
+          <input type="text" id="madd-owner" placeholder="按用户填 user_openid；按群填群号" />
         </label>`,
       okText: "写入",
       onOk: async (mask) => {
         const content = $("#madd-content", mask).value.trim();
         if (!content) throw new Error("内容不能为空");
+        const scope = $("#madd-scope", mask).value;
+        const ownerField = $("#madd-owner", mask).value.trim();
+        if (scope !== "global" && !ownerField) {
+          throw new Error(scope === "group" ? "按群记忆要填群 ID" : "按用户记忆要填归属 ID");
+        }
         await apiPost("memories/add", {
           content,
           kind: $("#madd-kind", mask).value,
-          scope: $("#madd-scope", mask).value,
-          owner_id: $("#madd-owner", mask).value.trim(),
+          scope,
+          // 面板只有一个归属输入框：按群时它装的是群 ID。
+          // 后端要求按群必须带 group_id，不能只传 owner_id。
+          owner_id: scope === "group" ? "" : ownerField,
+          group_id: scope === "group" ? ownerField : "",
         });
         toast("已写入");
         state.mem.offset = 0;

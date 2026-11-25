@@ -1858,10 +1858,8 @@ class HermesCore(Star):
         # 那会把用户已有画像静默删掉且不可恢复。
         missing = [t for b, t in HermesDB.RESIDENT_BLOCKS if b not in parsed]
         filled = []
-        skipped = []
         for b, t in HermesDB.RESIDENT_BLOCKS:
             if b not in parsed:
-                skipped.append(t)
                 continue
             v = _clean_resident_text(str(parsed.get(b) or ""))
             cap = int(limits.get(b, 0))
